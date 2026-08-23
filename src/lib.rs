@@ -10,6 +10,9 @@
 #[cfg(test)]
 extern crate std;
 
+#[cfg(test)]
+mod test_support;
+
 pub mod bus;
 pub mod control;
 pub mod data;
