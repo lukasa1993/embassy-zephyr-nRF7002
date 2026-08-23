@@ -47,12 +47,13 @@ pub trait Bus {
 }
 
 /// Static SPI framing settings.
+///
+/// Use [`SpiConfig::new`] for custom settings. The fields stay private so an
+/// invalid latency cannot create an out-of-bounds transfer slice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpiConfig {
-    /// Address bits ORed into every block transfer.
-    pub address_mask: u32,
-    /// Extra 32-bit latency words discarded after a fast-read header.
-    pub slave_latency_words: u8,
+    address_mask: u32,
+    slave_latency_words: u8,
 }
 
 impl SpiConfig {
@@ -71,6 +72,16 @@ impl SpiConfig {
             address_mask,
             slave_latency_words,
         })
+    }
+
+    /// Returns the address bits added to each block transfer.
+    pub const fn address_mask(self) -> u32 {
+        self.address_mask
+    }
+
+    /// Returns the number of 32-bit read-latency words.
+    pub const fn slave_latency_words(self) -> u8 {
+        self.slave_latency_words
     }
 }
 
@@ -189,8 +200,8 @@ mod tests {
 
     #[test]
     fn nordic_defaults_are_exact() {
-        assert_eq!(SpiConfig::NORDIC_DEFAULT.address_mask, 0x80_0000);
-        assert_eq!(SpiConfig::NORDIC_DEFAULT.slave_latency_words, 0);
+        assert_eq!(SpiConfig::NORDIC_DEFAULT.address_mask(), 0x80_0000);
+        assert_eq!(SpiConfig::NORDIC_DEFAULT.slave_latency_words(), 0);
     }
 
     #[test]
