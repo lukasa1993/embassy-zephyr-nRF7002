@@ -2,6 +2,63 @@
 
 #include "host_rpu_umac_if.h"
 
+_Static_assert(NRF_WIFI_HOST_RPU_MSG_TYPE_SYSTEM == 0,
+               "system message value changed");
+_Static_assert(NRF_WIFI_HOST_RPU_MSG_TYPE_SUPPLICANT == 1,
+               "supplicant message value changed");
+_Static_assert(NRF_WIFI_HOST_RPU_MSG_TYPE_DATA == 2,
+               "data message value changed");
+_Static_assert(NRF_WIFI_HOST_RPU_MSG_TYPE_UMAC == 3,
+               "UMAC message value changed");
+
+_Static_assert(NRF_WIFI_UMAC_CMD_TRIGGER_SCAN == 0,
+               "trigger-scan command value changed");
+_Static_assert(NRF_WIFI_UMAC_CMD_GET_SCAN_RESULTS == 1,
+               "get-scan-results command value changed");
+_Static_assert(NRF_WIFI_UMAC_CMD_DEAUTHENTICATE == 4,
+               "deauthenticate command value changed");
+_Static_assert(NRF_WIFI_UMAC_CMD_NEW_INTERFACE == 15,
+               "new-interface command value changed");
+
+_Static_assert(NRF_WIFI_UMAC_EVENT_TRIGGER_SCAN_START == 257,
+               "scan-start event value changed");
+_Static_assert(NRF_WIFI_UMAC_EVENT_SCAN_ABORTED == 258,
+               "scan-aborted event value changed");
+_Static_assert(NRF_WIFI_UMAC_EVENT_SCAN_DONE == 259,
+               "scan-done event value changed");
+_Static_assert(NRF_WIFI_UMAC_EVENT_SCAN_RESULT == 260,
+               "scan-result event value changed");
+_Static_assert(NRF_WIFI_UMAC_EVENT_DEAUTHENTICATE == 264,
+               "deauthenticate event value changed");
+_Static_assert(NRF_WIFI_UMAC_EVENT_DISCONNECT == 271,
+               "disconnect event value changed");
+_Static_assert(NRF_WIFI_UMAC_EVENT_NEW_INTERFACE == 281,
+               "new-interface event value changed");
+_Static_assert(NRF_WIFI_UMAC_EVENT_CMD_STATUS == 293,
+               "command-status event value changed");
+
+_Static_assert(NRF_WIFI_CMD_TX_BUFF == 1,
+               "TX command value changed");
+_Static_assert(NRF_WIFI_CMD_TX_BUFF_DONE == 2,
+               "TX-done event value changed");
+_Static_assert(NRF_WIFI_CMD_RX_BUFF == 3,
+               "RX event value changed");
+_Static_assert(NRF_WIFI_CMD_CARRIER_ON == 4,
+               "carrier-on event value changed");
+_Static_assert(NRF_WIFI_CMD_CARRIER_OFF == 5,
+               "carrier-off event value changed");
+
+_Static_assert(MAX_NRF_WIFI_UMAC_CMD_SIZE == 400,
+               "UMAC command fragment limit changed");
+_Static_assert(TX_BUF_HEADROOM == 52,
+               "TX buffer headroom changed");
+_Static_assert(RPU_MEM_TX_CMD_BASE == 0xB00000B8,
+               "TX command base changed");
+_Static_assert(RPU_MEM_PKT_BASE == 0xB0005000,
+               "packet RAM base changed");
+_Static_assert(RPU_DATA_CMD_SIZE_MAX_TX == 148,
+               "TX command slot size changed");
+
 _Static_assert(sizeof(struct host_rpu_msg_hdr) == 8,
                "host_rpu_msg_hdr size changed");
 _Static_assert(sizeof(struct host_rpu_msg) == 12,
