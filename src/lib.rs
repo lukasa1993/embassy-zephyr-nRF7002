@@ -11,6 +11,7 @@
 extern crate std;
 
 pub mod bus;
+pub mod control;
 pub mod data;
 pub mod device;
 pub mod firmware;
@@ -21,6 +22,10 @@ pub mod protocol;
 pub mod embassy;
 
 pub use bus::{Bus, SpiConfig, SpiTransport};
+pub use control::{
+    AssociationRequest, AssociationSecurity, AuthenticationRequest, AuthenticationType,
+    BssContext, ControlEvent, KeyConfig, KeyType, MfpMode, PowerSaveState,
+};
 pub use data::{DataPath, ReceivedFrame, RxEventRef};
 pub use device::Device;
 pub use firmware::{FirmwareBundle, FirmwareReport};
