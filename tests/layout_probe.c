@@ -15,8 +15,18 @@ _Static_assert(NRF_WIFI_UMAC_CMD_TRIGGER_SCAN == 0,
                "trigger-scan command value changed");
 _Static_assert(NRF_WIFI_UMAC_CMD_GET_SCAN_RESULTS == 1,
                "get-scan-results command value changed");
+_Static_assert(NRF_WIFI_UMAC_CMD_AUTHENTICATE == 2,
+               "authenticate command value changed");
+_Static_assert(NRF_WIFI_UMAC_CMD_ASSOCIATE == 3,
+               "associate command value changed");
 _Static_assert(NRF_WIFI_UMAC_CMD_DEAUTHENTICATE == 4,
                "deauthenticate command value changed");
+_Static_assert(NRF_WIFI_UMAC_CMD_NEW_KEY == 6,
+               "new-key command value changed");
+_Static_assert(NRF_WIFI_UMAC_CMD_DEL_KEY == 7,
+               "delete-key command value changed");
+_Static_assert(NRF_WIFI_UMAC_CMD_SET_KEY == 8,
+               "set-key command value changed");
 _Static_assert(NRF_WIFI_UMAC_CMD_NEW_INTERFACE == 15,
                "new-interface command value changed");
 
@@ -87,6 +97,38 @@ _Static_assert(sizeof(struct nrf_wifi_umac_add_vif_info) == 34,
                "nrf_wifi_umac_add_vif_info size changed");
 _Static_assert(sizeof(struct nrf_wifi_umac_cmd_add_vif) == 74,
                "nrf_wifi_umac_cmd_add_vif size changed");
+
+_Static_assert(sizeof(struct nrf_wifi_umac_key_info) == 535,
+               "nrf_wifi_umac_key_info size changed");
+_Static_assert(offsetof(struct nrf_wifi_umac_key_info, key_idx) == 534,
+               "nrf_wifi_umac_key_info.key_idx offset changed");
+_Static_assert(sizeof(struct nrf_wifi_umac_auth_info) == 1672,
+               "nrf_wifi_umac_auth_info size changed");
+_Static_assert(sizeof(struct nrf_wifi_umac_cmd_auth) == 1712,
+               "nrf_wifi_umac_cmd_auth size changed");
+_Static_assert(sizeof(struct nrf_wifi_connect_common_info) == 1563,
+               "nrf_wifi_connect_common_info size changed");
+_Static_assert(sizeof(struct nrf_wifi_umac_cmd_assoc) == 1609,
+               "nrf_wifi_umac_cmd_assoc size changed");
+_Static_assert(sizeof(struct nrf_wifi_umac_cmd_key) == 581,
+               "nrf_wifi_umac_cmd_key size changed");
+_Static_assert(sizeof(struct nrf_wifi_umac_cmd_set_key) == 571,
+               "nrf_wifi_umac_cmd_set_key size changed");
+_Static_assert(sizeof(struct nrf_wifi_cmd_req_set_reg) == 46,
+               "nrf_wifi_cmd_req_set_reg size changed");
+_Static_assert(sizeof(struct nrf_wifi_umac_cmd_chg_vif_state) == 41,
+               "nrf_wifi_umac_cmd_chg_vif_state size changed");
+_Static_assert(sizeof(struct nrf_wifi_umac_cmd_set_power_save) == 40,
+               "nrf_wifi_umac_cmd_set_power_save size changed");
+_Static_assert(sizeof(struct nrf_wifi_umac_event_mlme) == 475,
+               "nrf_wifi_umac_event_mlme size changed");
+_Static_assert(offsetof(struct nrf_wifi_umac_event_mlme, req_ie) == 475,
+               "nrf_wifi_umac_event_mlme.req_ie offset changed");
+_Static_assert(sizeof(struct nrf_wifi_umac_event_new_scan_results) == 106,
+               "nrf_wifi_umac_event_new_scan_results size changed");
+_Static_assert(offsetof(struct nrf_wifi_umac_event_new_scan_results, ies) == 106,
+               "nrf_wifi_umac_event_new_scan_results.ies offset changed");
+
 _Static_assert(sizeof(struct nrf_wifi_umac_head) == 8,
                "nrf_wifi_umac_head size changed");
 _Static_assert(sizeof(struct tx_mac_hdr_info) == 26,
