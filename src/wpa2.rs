@@ -12,9 +12,7 @@ use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use zeroize::Zeroize;
 
-use super::control::{
-    KeyConfig, KeyType, RSN_CIPHER_CCMP_128,
-};
+use super::control::{KeyConfig, KeyType, RSN_CIPHER_CCMP_128};
 
 /// Maximum complete EAPOL-Key frame retained by the supplicant.
 pub const MAX_EAPOL_FRAME_LEN: usize = 512;
@@ -136,12 +134,7 @@ impl Pmk {
             return Err(Wpa2Error::InvalidSsidLength);
         }
         let mut bytes = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha1>(
-            passphrase,
-            ssid,
-            WPA2_PBKDF2_ITERATIONS,
-            &mut bytes,
-        );
+        pbkdf2::pbkdf2_hmac::<Sha1>(passphrase, ssid, WPA2_PBKDF2_ITERATIONS, &mut bytes);
         Ok(Self(bytes))
     }
 
@@ -164,7 +157,7 @@ impl Pmk {
         let mut written = 0usize;
         let mut counter = 0u8;
         while written < bytes.len() {
-            let mut mac = Hmac::<Sha1>::new_from_slice(&self.0)
+            let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(&self.0)
                 .expect("a fixed WPA2 PMK length is valid for HMAC");
             mac.update(WPA2_PRF_LABEL);
             mac.update(&[0]);
@@ -524,9 +517,7 @@ impl Wpa2Supplicant {
             }
             return Err(Wpa2Error::NewPairwiseHandshakeRequiresNonce);
         }
-        if self.phase != Wpa2Phase::AwaitingMessage1
-            && self.phase != Wpa2Phase::AwaitingMessage3
-        {
+        if self.phase != Wpa2Phase::AwaitingMessage1 && self.phase != Wpa2Phase::AwaitingMessage3 {
             return self.fail(Wpa2Error::InvalidPhase);
         }
 
@@ -554,12 +545,10 @@ impl Wpa2Supplicant {
 
         self.authenticator_nonce = nonce;
         self.message1_replay = Some(replay);
-        self.ptk = Some(self.pmk.derive_ptk(
-            self.peer,
-            self.local,
-            nonce,
-            self.supplicant_nonce,
-        ));
+        self.ptk = Some(
+            self.pmk
+                .derive_ptk(self.peer, self.local, nonce, self.supplicant_nonce),
+        );
         self.phase = Wpa2Phase::AwaitingMessage3;
         let ptk = self.ptk.as_ref().ok_or(Wpa2Error::InvalidPhase)?;
         Ok(Wpa2Action::Transmit(build_message2(
@@ -865,7 +854,7 @@ impl<'a> EapolKeyFrame<'a> {
     }
 
     fn verify_mic(self, ptk: &Ptk) -> bool {
-        let mut mac = Hmac::<Sha1>::new_from_slice(ptk.kck())
+        let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(ptk.kck())
             .expect("a fixed WPA2 KCK length is valid for HMAC");
         mac.update(&self.bytes[..KEY_MIC_START]);
         mac.update(&[0; KEY_MIC_END - KEY_MIC_START]);
@@ -982,10 +971,7 @@ fn build_message4(
     build_response(
         peer,
         protocol_version,
-        KEY_DESCRIPTOR_VERSION_HMAC_SHA1_AES
-            | KEY_INFO_PAIRWISE
-            | KEY_INFO_MIC
-            | KEY_INFO_SECURE,
+        KEY_DESCRIPTOR_VERSION_HMAC_SHA1_AES | KEY_INFO_PAIRWISE | KEY_INFO_MIC | KEY_INFO_SECURE,
         key_length,
         replay_counter,
         [0; 32],
@@ -1050,7 +1036,7 @@ fn build_response(
         .copy_from_slice(&(key_data.len() as u16).to_be_bytes());
     frame.bytes[KEY_DATA_OFFSET..total].copy_from_slice(key_data);
 
-    let mut mac = Hmac::<Sha1>::new_from_slice(ptk.kck())
+    let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(ptk.kck())
         .expect("a fixed WPA2 KCK length is valid for HMAC");
     mac.update(&frame.bytes[..total]);
     let mic = mac.finalize().into_bytes();
@@ -1099,8 +1085,7 @@ mod tests {
     const SNONCE: [u8; 32] = [0x11; 32];
     const ANONCE: [u8; 32] = [0x22; 32];
     const RSN_IE: [u8; 22] = [
-        0x30, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0,
-        0x0f, 0xac, 2, 0, 0,
+        0x30, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
     ];
 
     #[test]
@@ -1109,9 +1094,9 @@ mod tests {
         assert_eq!(
             pmk.0,
             [
-                0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef, 0x9e, 0xbb, 0x4b, 0x90,
-                0xb3, 0x8a, 0x5f, 0x90, 0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2,
-                0x3a, 0xed, 0x76, 0x2e, 0x97, 0x10, 0xa1, 0x2e,
+                0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef, 0x9e, 0xbb, 0x4b, 0x90, 0xb3, 0x8a,
+                0x5f, 0x90, 0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2, 0x3a, 0xed, 0x76, 0x2e,
+                0x97, 0x10, 0xa1, 0x2e,
             ]
         );
     }
@@ -1119,20 +1104,20 @@ mod tests {
     #[test]
     fn unwraps_rfc3394_vector() {
         let kek = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
-            0x0c, 0x0d, 0x0e, 0x0f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
         ];
         let encrypted = [
-            0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47, 0xae, 0xf3, 0x4b, 0xd8,
-            0xfb, 0x5a, 0x7b, 0x82, 0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5,
+            0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47, 0xae, 0xf3, 0x4b, 0xd8, 0xfb, 0x5a,
+            0x7b, 0x82, 0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5,
         ];
         let mut plain = [0u8; 16];
         assert_eq!(aes_key_unwrap(&kek, &encrypted, &mut plain), Ok(16));
         assert_eq!(
             plain,
             [
-                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
-                0xcc, 0xdd, 0xee, 0xff,
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
             ]
         );
     }
@@ -1179,9 +1164,7 @@ mod tests {
             &encrypted,
             Some(ptk),
         );
-        let Wpa2Action::InstallKeys(request) =
-            supplicant.on_eapol(PEER, &message3).unwrap()
-        else {
+        let Wpa2Action::InstallKeys(request) = supplicant.on_eapol(PEER, &message3).unwrap() else {
             panic!("Message 3 must request atomic key installation");
         };
         assert_eq!(request.pairwise().key_config().key.len(), 16);
@@ -1200,10 +1183,10 @@ mod tests {
             &encrypted,
             Some(supplicant.ptk.as_ref().unwrap()),
         );
-        assert_eq!(
+        assert!(matches!(
             supplicant.on_eapol(PEER, &stale),
             Err(Wpa2Error::StaleReplayCounter)
-        );
+        ));
     }
 
     #[test]
@@ -1217,10 +1200,10 @@ mod tests {
             &[],
             None,
         );
-        assert_eq!(
+        assert!(matches!(
             supplicant.on_eapol([9; 6], &message1),
             Err(Wpa2Error::WrongPeer)
-        );
+        ));
         assert_eq!(supplicant.phase(), Wpa2Phase::Failed);
     }
 
@@ -1230,10 +1213,10 @@ mod tests {
         nonce: [u8; 32],
         key_data: &[u8],
         ptk: Option<&Ptk>,
-    ) -> [u8; MAX_EAPOL_FRAME_LEN] {
+    ) -> std::vec::Vec<u8> {
         let body_len = EAPOL_KEY_FIXED_BODY_LEN + key_data.len();
         let total = EAPOL_HEADER_LEN + body_len;
-        let mut bytes = [0u8; MAX_EAPOL_FRAME_LEN];
+        let mut bytes = std::vec![0u8; total];
         bytes[0] = 2;
         bytes[1] = EAPOL_PACKET_TYPE_KEY;
         bytes[2..4].copy_from_slice(&(body_len as u16).to_be_bytes());
@@ -1246,15 +1229,12 @@ mod tests {
             .copy_from_slice(&(key_data.len() as u16).to_be_bytes());
         bytes[KEY_DATA_OFFSET..total].copy_from_slice(key_data);
         if let Some(ptk) = ptk {
-            let mut mac = Hmac::<Sha1>::new_from_slice(ptk.kck()).unwrap();
-            mac.update(&bytes[..total]);
+            let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(ptk.kck()).unwrap();
+            mac.update(&bytes);
             let mic = mac.finalize().into_bytes();
             bytes[KEY_MIC_START..KEY_MIC_END].copy_from_slice(&mic[..16]);
         }
-        let mut exact = [0u8; MAX_EAPOL_FRAME_LEN];
-        exact[..total].copy_from_slice(&bytes[..total]);
-        exact[total..].fill(0);
-        exact
+        bytes
     }
 
     fn aes_key_wrap_for_test(kek: &[u8; 16], plain: &[u8]) -> [u8; 32] {

@@ -46,9 +46,8 @@ pub use system::{SystemEvent, SystemEventId};
 
 #[cfg(feature = "wpa2")]
 pub use wpa2::{
-    EapolTxFrame, GroupKeyInstall, PairwiseKeyInstall, Pmk, Wpa2Action,
-    Wpa2Error, Wpa2GroupKeyInstallRequest, Wpa2KeyInstallRequest, Wpa2Phase,
-    Wpa2Supplicant,
+    EapolTxFrame, GroupKeyInstall, PairwiseKeyInstall, Pmk, Wpa2Action, Wpa2Error,
+    Wpa2GroupKeyInstallRequest, Wpa2KeyInstallRequest, Wpa2Phase, Wpa2Supplicant,
 };
 
 /// Pinned host-driver source revision used for every packed interface value.
