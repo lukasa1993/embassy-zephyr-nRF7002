@@ -6,22 +6,29 @@ on:
     paths:
       - '.native-bootstrap/**'
       - '.github/workflows/native-bootstrap.yml'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: native-bootstrap-${{ github.ref }}
+  group: native-bootstrap-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   materialize:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    env:
+      TARGET_BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ env.TARGET_BRANCH }}
       - name: Rebuild and verify source archive
         run: |
           cat .native-bootstrap/part-* | base64 --decode > /tmp/native-bootstrap.tar.gz
@@ -37,4 +44,4 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add --all
           git commit -m 'Add native Embassy nRF7002 driver core'
-          git push origin HEAD:${GITHUB_REF_NAME}
+          git push origin HEAD:"${TARGET_BRANCH}"
