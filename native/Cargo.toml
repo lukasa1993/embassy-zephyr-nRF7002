@@ -1,0 +1,23 @@
+[package]
+name = "embassy-nrf7002-native"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Zephyr-free nRF7002 driver core for Embassy"
+repository = "https://github.com/lukasa1993/embassy-zephyr-nRF7002"
+keywords = ["embedded", "embassy", "wifi", "nrf7002", "no-std"]
+categories = ["embedded", "no-std", "network-programming"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+embassy-net-driver = "=0.2.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
