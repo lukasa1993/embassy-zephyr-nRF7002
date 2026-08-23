@@ -1,30 +1,69 @@
-# nRF7002 native port map
+# nRF7002 native board integration
 
-The Nordic bare-metal driver separates its Wi-Fi core from operating-system and bus services. The native Rust path uses the same separation, but it does not add a Zephyr shim.
+This crate contains a low-level driver core. It does not contain a complete board runner.
 
-| Nordic port need | Native Embassy implementation |
+## Service map
+
+| Board need | Crate API |
 |---|---|
-| RPU interrupt | GPIOTE or GPIO interrupt future |
-| Deferred tasklet | Embassy task and bounded channel |
-| Heap allocation | Fixed arrays, frame slots, and descriptor rings |
-| Linked lists | Checked ring cursors and fixed queues |
-| Sleep and delay | Embassy timer future |
-| Spin lock | Embassy mutex or critical-section raw mutex |
-| Timer callback | Embassy timer task |
-| Random data | Board RNG implementation |
-| SPI or QSPI transport | `Hardware` implementation using Embassy peripherals |
-| Firmware patch transfer | `Device::initialize` with checked `FirmwareImage` segments |
-| Ethernet integration | `EmbassyNetDevice` and `PacketIo` |
+| SPI device with chip select | `SpiTransport<SPI>` and the `Bus` trait |
+| RPU register and memory access | `Rpu<B>` |
+| Delay for reset, wake, and boot | `embedded_hal_async::delay::DelayNs` |
+| Firmware parse and boot | `FirmwareBundle::parse` and `firmware::load` |
+| Queue and interrupt control | `Device<B>` |
+| RX and TX packet RAM | `DataPath<RX, TX>` |
+| Embassy network queue | `NetworkState`, `NetworkDriver`, and `NetworkRunner` with the `embassy-net` feature |
+| Host interrupt wait | Board GPIO interrupt future or task |
+| Power, reset, and coexistence pins | Board code |
 
-## Required next hardware layer
+## Required board sequence
 
-The board-specific `Hardware` implementation must provide these exact operations:
+Use this order as the integration baseline:
 
-1. Power and reset sequencing for the board.
-2. RPU status-register reads and writes.
-3. QSPI reads and writes to the nRF7002 address space.
-4. Firmware entry-point release.
-5. Interrupt-line wait.
-6. Non-blocking delay.
+1. Apply the board power, reset, and coexistence GPIO sequence.
+2. Create an asynchronous `embedded-hal-async` SPI device that keeps chip select active for one transaction.
+3. Create `SpiTransport::new(spi)` and then `Rpu::new(transport)`.
+4. Use the RPU wake and status methods with a bounded delay policy.
+5. Parse the pinned Nordic firmware with `FirmwareBundle::parse`.
+6. Call `firmware::load` to reset both processors, write all four images, start LMAC and UMAC, and check their boot signatures.
+7. Move the bus into `Device::new`, then call `initialize_queues` and `enable_interrupts`.
+8. Create a `DataPath<RX, TX>` that matches the RX pool and frame sizes in `SystemInitConfig`.
+9. Send system initialization and wait for a successful firmware result before you post normal traffic.
+10. Add the station interface and post all RX descriptors.
+11. Start an interrupt task. After each host interrupt, call `try_read_event` until it returns `Ok(None)`.
+12. Decode UMAC and data events. Return completed TX tokens and deliver RX frames to `NetworkRunner`.
 
-The RPU ABI implementation must provide command, event, transmit, and receive rings. It must use the same Nordic firmware and host-interface version. A mismatched host ABI and firmware image is not accepted as a valid test configuration.
+## Event scratch buffer rule
+
+A fragmented event can continue after a later interrupt. Keep the same scratch buffer unchanged until `try_read_event` returns a complete event.
+
+If the buffer cannot stay in place, call `Device::discard_pending_event`. Later calls to `try_read_event` will remove the remaining fragments before they read a new event.
+
+Size the scratch buffer for the largest event that the application accepts. An event fragment is at most 1000 bytes for the pinned Nordic interface, but one complete event can use more than one fragment.
+
+## SPI rule
+
+Use 8 MHz or less for the wake status-register transaction. Use only a frequency that is qualified for the board for normal traffic.
+
+`SpiConfig` validates its 24-bit mask and slave-latency limit. Board code is still responsible for the SPI mode, frequency changes, chip-select timing, and power-state timing.
+
+## RX and TX configuration rule
+
+The `DataPath` sizes and counts must match the values sent in `SystemInitConfig`.
+
+The fixed TX command area ends when packet data starts. The crate limits TX tokens to the slots that fit before `RPU_MEM_PACKET_BASE`. Do not create another packet-RAM allocator for the same device.
+
+## Missing top-level work
+
+A production board runner still needs these parts:
+
+- authentication and association state;
+- key installation and EAPOL handling;
+- regulatory and channel control;
+- connection-state and disconnect handling;
+- power-save state;
+- watchdog and reset recovery;
+- bounded command-queue wait or retry policy; and
+- board hardware tests.
+
+See [`ABI_REQUIREMENTS.md`](ABI_REQUIREMENTS.md) and [`TEST_PLAN.md`](TEST_PLAN.md).
