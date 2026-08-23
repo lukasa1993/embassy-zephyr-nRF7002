@@ -426,7 +426,10 @@ where
 }
 
 const fn align4(len: usize) -> Option<usize> {
-    len.checked_add(3).map(|value| value & !3)
+    match len.checked_add(3) {
+        Some(value) => Some(value & !3),
+        None => None,
+    }
 }
 
 fn checked_range<E>(processor: Processor, address: u32, len: usize) -> Result<(), RpuError<E>> {
