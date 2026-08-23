@@ -34,9 +34,7 @@ pub use device::Device;
 pub use firmware::{FirmwareBundle, FirmwareReport};
 pub use memory::{Processor, Rpu};
 pub use protocol::{ScanRequest, SystemInitConfig};
-pub use runtime::{
-    DriverError, DriverEvent, DriverState, NativeDriver, Platform, RecoveryError,
-};
+pub use runtime::{DriverError, DriverEvent, DriverState, NativeDriver, Platform, RecoveryError};
 pub use station::{StationController, StationError, StationFault, StationState};
 pub use system::{SystemEvent, SystemEventId};
 

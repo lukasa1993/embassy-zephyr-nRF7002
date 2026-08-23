@@ -78,8 +78,8 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::protocol::{encode_host_message, parse_host_message};
+    use super::*;
 
     #[test]
     fn parses_init_done() {
@@ -87,7 +87,8 @@ mod tests {
         payload[0..4].copy_from_slice(&(SystemEventId::InitDone as u32).to_le_bytes());
         payload[4..8].copy_from_slice(&(SYSTEM_HEADER_LEN as u32).to_le_bytes());
         let mut message = [0u8; 32];
-        let len = encode_host_message(&mut message, HostMessageType::System, true, &payload).unwrap();
+        let len =
+            encode_host_message(&mut message, HostMessageType::System, true, &payload).unwrap();
         let parsed = parse_host_message(&message[..len]).unwrap();
         assert_eq!(parse_system_event(parsed), Ok(SystemEvent::InitDone));
     }

@@ -338,8 +338,8 @@ where
                             .map_err(DriverError::DataProtocol)?;
                     }
                     DataEvent::Receive => {
-                        let receive = RxEventRef::parse(message)
-                            .map_err(DriverError::DataProtocol)?;
+                        let receive =
+                            RxEventRef::parse(message).map_err(DriverError::DataProtocol)?;
                         return Ok(DriverEvent::Receive(receive));
                     }
                     _ => self.station.handle_data_event(event)?,
@@ -424,9 +424,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::protocol::{encode_host_message, parse_host_message};
     use super::super::system::{SYSTEM_HEADER_LEN, SystemEventId};
+    use super::*;
 
     #[test]
     fn init_done_moves_runtime_to_ready() {
@@ -440,6 +440,9 @@ mod tests {
         let message = parse_host_message(&bytes[..len]).unwrap();
         assert!(driver.dispatch_message(message).is_ok());
         assert_eq!(driver.state(), DriverState::Ready);
-        assert_eq!(driver.station.state(), super::super::station::StationState::Down);
+        assert_eq!(
+            driver.station.state(),
+            super::super::station::StationState::Down
+        );
     }
 }
