@@ -34,7 +34,9 @@ _Static_assert(NRF_WIFI_UMAC_EVENT_DISCONNECT == 271,
                "disconnect event value changed");
 _Static_assert(NRF_WIFI_UMAC_EVENT_NEW_INTERFACE == 281,
                "new-interface event value changed");
-_Static_assert(NRF_WIFI_UMAC_EVENT_CMD_STATUS == 293,
+_Static_assert(NRF_WIFI_UMAC_EVENT_SCAN_DISPLAY_RESULT == 291,
+               "scan-display event value changed");
+_Static_assert(NRF_WIFI_UMAC_EVENT_CMD_STATUS == 292,
                "command-status event value changed");
 
 _Static_assert(NRF_WIFI_CMD_TX_BUFF == 1,
