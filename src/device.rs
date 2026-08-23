@@ -175,6 +175,16 @@ impl<B> Device<B> {
         self.recovery_required = false;
     }
 
+    #[cfg(test)]
+    pub(crate) fn initialize_for_test(&mut self, queues: HpqmInfo, rx_command_base: u32) {
+        self.queues = Some(queues);
+        self.rx_command_base = rx_command_base;
+        self.tx_command_base = RPU_MEM_TX_CMD_BASE;
+        self.command_counter = RPU_COMMAND_COUNTER_START;
+        self.pending_event = None;
+        self.recovery_required = false;
+    }
+
     /// Sets command and event fragment limits.
     pub fn set_fragment_limits(
         &mut self,

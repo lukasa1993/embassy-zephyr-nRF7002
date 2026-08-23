@@ -587,3 +587,290 @@ impl Wpa2Runtime {
         Err(error)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+    use std::sync::Arc;
+    use std::task::Wake;
+    use std::vec::Vec;
+
+    use super::super::bus::Bus;
+    use super::super::control::{ControlEvent, RSN_CIPHER_CCMP_128};
+    use super::super::device::RPU_MEM_TX_CMD_BASE;
+    use super::super::protocol::{Hpq, HpqmInfo, UmacHeader};
+    use super::super::runtime::DriverState;
+    use super::super::wpa2::{Pmk, Wpa2Supplicant};
+    use super::*;
+
+    const LOCAL: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+    const PEER: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
+    const COMMAND_BUFFER: u32 = 0xb000_1000;
+    const COMMAND_BUFFER_HOST: u32 = 0x000c_1000;
+    const COMMAND_AVAILABLE_DEQUEUE: u32 = 0xa400_7000;
+    const RSN_IE: [u8; 22] = [
+        0x30, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
+    ];
+
+    #[derive(Default)]
+    struct TestBus {
+        commands: Vec<u32>,
+    }
+
+    impl Bus for TestBus {
+        type Error = ();
+
+        async fn read_status(&mut self, _opcode: u8) -> Result<u8, Self::Error> {
+            Ok(0)
+        }
+
+        async fn write_status(&mut self, _opcode: u8, _value: u8) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn read(&mut self, _address: u32, data: &mut [u8]) -> Result<(), Self::Error> {
+            data.fill(0);
+            if data.len() == 4 {
+                data.copy_from_slice(&COMMAND_BUFFER.to_le_bytes());
+            }
+            Ok(())
+        }
+
+        async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
+            if address == COMMAND_BUFFER_HOST
+                && data.len() >= 24
+                && u32::from_le_bytes([data[8], data[9], data[10], data[11]]) == 3
+            {
+                self.commands
+                    .push(u32::from_le_bytes([data[20], data[21], data[22], data[23]]));
+            }
+            Ok(())
+        }
+    }
+
+    struct NoDelay;
+
+    impl DelayNs for NoDelay {
+        async fn delay_ns(&mut self, _ns: u32) {}
+    }
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        let mut future = core::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    fn queues() -> HpqmInfo {
+        HpqmInfo {
+            event_busy: Hpq {
+                enqueue_address: 0xa400_6004,
+                dequeue_address: 0xa400_6000,
+            },
+            event_available: Hpq {
+                enqueue_address: 0xa400_6014,
+                dequeue_address: 0xa400_6010,
+            },
+            command_busy: Hpq {
+                enqueue_address: 0xa400_6024,
+                dequeue_address: 0xa400_6020,
+            },
+            command_available: Hpq {
+                enqueue_address: 0xa400_7004,
+                dequeue_address: COMMAND_AVAILABLE_DEQUEUE,
+            },
+            rx_buffer_busy: [
+                Hpq {
+                    enqueue_address: 0xa400_6034,
+                    dequeue_address: 0xa400_6030,
+                },
+                Hpq {
+                    enqueue_address: 0xa400_6044,
+                    dequeue_address: 0xa400_6040,
+                },
+                Hpq {
+                    enqueue_address: 0xa400_6054,
+                    dequeue_address: 0xa400_6050,
+                },
+            ],
+        }
+    }
+
+    fn supplicant() -> Wpa2Supplicant {
+        Wpa2Supplicant::new(
+            LOCAL,
+            PEER,
+            [0x11; 32],
+            Pmk::from_bytes([0x33; 32]),
+            &RSN_IE,
+        )
+        .unwrap()
+    }
+
+    fn driver() -> NativeDriver<TestBus, 1, 2> {
+        let mut driver = NativeDriver::new(TestBus::default(), 64, 600, 1, 0, 0).unwrap();
+        driver
+            .device_mut()
+            .initialize_for_test(queues(), 0xb700_1000);
+        driver.station_mut().prepare_security_for_test(PEER);
+        driver
+    }
+
+    fn command_status(command: UmacCommand, status: u32) -> ControlEvent<'static> {
+        ControlEvent::CommandStatus {
+            header: UmacHeader {
+                port_id: 0,
+                sequence: 1,
+                command_event: 292,
+                result: 0,
+                valid_ids: 0,
+                ifaceindex: 1,
+                wiphy_index: 0,
+                wdev_id: 0,
+            },
+            command: command as u32,
+            status,
+        }
+    }
+
+    #[test]
+    fn malformed_eapol_forces_driver_recovery() {
+        let mut runtime = Wpa2Runtime::new(supplicant(), 0);
+        let mut driver = driver();
+        let mut delay = NoDelay;
+        let result = block_on(runtime.on_ethernet_frame(&mut driver, &mut delay, &[0; 8]));
+        assert!(matches!(result, Err(Wpa2RuntimeError::FrameTooShort)));
+        assert_eq!(runtime.state(), Wpa2RuntimeState::Failed);
+        assert_eq!(driver.state(), DriverState::Recovering);
+    }
+
+    #[test]
+    fn command_mismatch_forces_driver_recovery() {
+        let mut runtime = Wpa2Runtime::new(supplicant(), 0);
+        runtime.state = Wpa2RuntimeState::AwaitingPairwiseKeyStatus;
+        let mut driver = driver();
+        let mut delay = NoDelay;
+        let result = block_on(runtime.on_control_event(
+            &mut driver,
+            &mut delay,
+            command_status(UmacCommand::SetKey, 0),
+        ));
+        assert!(matches!(
+            result,
+            Err(Wpa2RuntimeError::UnexpectedCommandStatus { .. })
+        ));
+        assert_eq!(runtime.state(), Wpa2RuntimeState::Failed);
+        assert_eq!(driver.state(), DriverState::Recovering);
+    }
+
+    #[test]
+    fn rejected_command_forces_driver_recovery() {
+        let mut runtime = Wpa2Runtime::new(supplicant(), 0);
+        runtime.state = Wpa2RuntimeState::AwaitingPairwiseKeyStatus;
+        let mut driver = driver();
+        let mut delay = NoDelay;
+        let result = block_on(runtime.on_control_event(
+            &mut driver,
+            &mut delay,
+            command_status(UmacCommand::NewKey, 7),
+        ));
+        assert!(matches!(
+            result,
+            Err(Wpa2RuntimeError::CommandRejected { status: 7, .. })
+        ));
+        assert_eq!(driver.state(), DriverState::Recovering);
+    }
+
+    #[test]
+    fn mismatched_tx_token_forces_driver_recovery() {
+        let mut runtime = Wpa2Runtime::new(supplicant(), 0);
+        runtime.state = Wpa2RuntimeState::AwaitingEapolTransmit {
+            token: 2,
+            purpose: EapolTransmitPurpose::Message4,
+        };
+        let mut driver = driver();
+        let mut delay = NoDelay;
+        let statuses = [0u8];
+        let result = block_on(runtime.on_transmit_done(
+            &mut driver,
+            &mut delay,
+            TxDoneEventRef {
+                token: 3,
+                statuses: &statuses,
+            },
+        ));
+        assert!(matches!(
+            result,
+            Err(Wpa2RuntimeError::TransmitCompletionMismatch { .. })
+        ));
+        assert_eq!(driver.state(), DriverState::Recovering);
+    }
+
+    #[test]
+    fn failed_message4_tx_forces_driver_recovery() {
+        let mut runtime = Wpa2Runtime::new(supplicant(), 0);
+        runtime.state = Wpa2RuntimeState::AwaitingEapolTransmit {
+            token: 2,
+            purpose: EapolTransmitPurpose::Message4,
+        };
+        let mut driver = driver();
+        let mut delay = NoDelay;
+        let statuses = [1u8];
+        let result = block_on(runtime.on_transmit_done(
+            &mut driver,
+            &mut delay,
+            TxDoneEventRef {
+                token: 2,
+                statuses: &statuses,
+            },
+        ));
+        assert!(matches!(result, Err(Wpa2RuntimeError::TransmitFailed)));
+        assert_eq!(driver.state(), DriverState::Recovering);
+    }
+
+    #[test]
+    fn authorization_starts_only_after_message4_tx_success() {
+        let mut runtime = Wpa2Runtime::new(supplicant(), 0);
+        runtime.state = Wpa2RuntimeState::AwaitingEapolTransmit {
+            token: 2,
+            purpose: EapolTransmitPurpose::Message4,
+        };
+        let mut driver = driver();
+        assert!(driver.device_mut().rpu_mut().bus_mut().commands.is_empty());
+        let mut delay = NoDelay;
+        let statuses = [0u8];
+        let progress = block_on(runtime.on_transmit_done(
+            &mut driver,
+            &mut delay,
+            TxDoneEventRef {
+                token: 2,
+                statuses: &statuses,
+            },
+        ))
+        .unwrap();
+        assert_eq!(progress, Wpa2Progress::AuthorizationSubmitted);
+        assert_eq!(
+            runtime.state(),
+            Wpa2RuntimeState::AwaitingAuthorizationStatus
+        );
+        assert_eq!(driver.station_mut().state(), StationState::Authorizing);
+        assert_eq!(
+            driver.device_mut().rpu_mut().bus_mut().commands,
+            [UmacCommand::SetStation as u32]
+        );
+        assert_eq!(RPU_MEM_TX_CMD_BASE, 0xb000_00b8);
+        assert_eq!(RSN_CIPHER_CCMP_128, 0x000f_ac04);
+    }
+}

@@ -134,6 +134,17 @@ impl StationController {
             )
     }
 
+    #[cfg(test)]
+    pub(crate) fn prepare_security_for_test(&mut self, peer: [u8; 6]) {
+        self.state = StationState::Securing;
+        self.last_fault = None;
+        self.peer = Some(peer);
+        self.secure_connection = true;
+        self.controlled_port_authorized = false;
+        self.carrier_on = false;
+        self.pending_command = None;
+    }
+
     /// Restores connected state after a successful group-key rekey.
     pub fn complete_group_rekey(&mut self) -> StationState {
         self.state = if self.secure_connection && self.controlled_port_authorized {
