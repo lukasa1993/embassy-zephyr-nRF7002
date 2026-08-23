@@ -30,12 +30,15 @@ pub mod embassy;
 #[cfg(feature = "wpa2")]
 pub mod wpa2;
 
+#[cfg(feature = "wpa2")]
+pub mod wpa2_runtime;
+
 pub use bus::{Bus, SpiConfig, SpiTransport};
 pub use control::{
     AssociationRequest, AssociationSecurity, AuthenticationRequest, AuthenticationType, BssContext,
     ControlEvent, KeyConfig, KeyType, MfpMode, PowerSaveState,
 };
-pub use data::{DataPath, ReceivedFrame, RxEventRef};
+pub use data::{DataPath, ReceivedFrame, RxEventRef, TxDoneEventRef};
 pub use device::Device;
 pub use firmware::{FirmwareBundle, FirmwareReport};
 pub use memory::{Processor, Rpu};
@@ -48,6 +51,11 @@ pub use system::{SystemEvent, SystemEventId};
 pub use wpa2::{
     EapolTxFrame, GroupKeyInstall, PairwiseKeyInstall, Pmk, Wpa2Action, Wpa2Error,
     Wpa2GroupKeyInstallRequest, Wpa2KeyInstallRequest, Wpa2Phase, Wpa2Supplicant,
+};
+
+#[cfg(feature = "wpa2")]
+pub use wpa2_runtime::{
+    EapolTransmitPurpose, Wpa2Progress, Wpa2Runtime, Wpa2RuntimeError, Wpa2RuntimeState,
 };
 
 /// Pinned host-driver source revision used for every packed interface value.
