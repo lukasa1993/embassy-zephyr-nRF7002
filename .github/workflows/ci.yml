@@ -1,4 +1,4 @@
-name: Rust and repository checks
+name: CI
 
 on:
   push:
@@ -8,64 +8,48 @@ on:
 permissions:
   contents: read
 
-jobs:
-  zephyr-boundary:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
-      - name: Check root formatting
-        run: rustup run 1.95.0 cargo fmt --all --check
-      - name: Test the existing safe Rust boundary
-        run: rustup run 1.95.0 cargo test --features embassy-net
-      - name: Check shell syntax
-        run: for script in scripts/*.sh; do sh -n "$script"; done
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
-  native-rust:
+jobs:
+  rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install pinned Rust toolchain
-        run: |
-          rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy
-          rustup target add --toolchain 1.95.0 thumbv8m.main-none-eabihf
-      - name: Check native formatting
-        run: rustup run 1.95.0 cargo fmt --manifest-path native/Cargo.toml --all --check
-      - name: Test native driver with all features
-        run: rustup run 1.95.0 cargo test --manifest-path native/Cargo.toml --all-features
-      - name: Lint native driver
-        run: rustup run 1.95.0 cargo clippy --manifest-path native/Cargo.toml --all-targets --all-features -- -D warnings
-      - name: Check no-std native core
-        run: rustup run 1.95.0 cargo check --manifest-path native/Cargo.toml --lib --no-default-features --target thumbv8m.main-none-eabihf
-      - name: Check no-std Embassy adapter
-        run: rustup run 1.95.0 cargo check --manifest-path native/Cargo.toml --lib --features embassy-net --target thumbv8m.main-none-eabihf
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy --target thumbv8m.main-none-eabihf
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Run host tests
+        run: cargo test --all-features
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Check the no-std core
+        run: cargo check --lib --no-default-features --target thumbv8m.main-none-eabihf
+      - name: Check the no-std Embassy adapter
+        run: cargo check --lib --features embassy-net --target thumbv8m.main-none-eabihf
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --all-features --no-deps
 
   nordic-layout:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch pinned Nordic host interface
+      - name: Fetch the pinned Nordic host interface
         run: |
           git init /tmp/nrf_wifi
           git -C /tmp/nrf_wifi remote add origin https://github.com/zephyrproject-rtos/nrf_wifi.git
           git -C /tmp/nrf_wifi fetch --depth 1 origin 5046744cb4c9640eb8b11cb92f1ea0b9554c20cf
           git -C /tmp/nrf_wifi checkout --detach FETCH_HEAD
-      - name: Check packed C interface sizes and offsets
+      - name: Check packed sizes and offsets
         run: |
           cc -std=c11 -Wall -Wextra -Werror \
             -I/tmp/nrf_wifi/fw_if/umac_if/inc \
             -I/tmp/nrf_wifi/fw_if/umac_if/inc/fw \
             -I/tmp/nrf_wifi/hw_if/hal/inc \
-            native/tests/layout_probe.c \
+            tests/layout_probe.c \
             -o /tmp/nrf7002-layout-probe
           /tmp/nrf7002-layout-probe
-      - name: Report station ABI sizes and offsets
-        run: |
-          cc -std=c11 -Wall -Wextra -Werror \
-            -I/tmp/nrf_wifi/fw_if/umac_if/inc \
-            -I/tmp/nrf_wifi/fw_if/umac_if/inc/fw \
-            -I/tmp/nrf_wifi/hw_if/hal/inc \
-            native/tests/layout_dump.c \
-            -o /tmp/nrf7002-layout-dump
-          /tmp/nrf7002-layout-dump

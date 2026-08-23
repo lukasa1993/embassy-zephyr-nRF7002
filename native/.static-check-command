@@ -1,4 +1,0 @@
-cargo fmt --manifest-path native/Cargo.toml --all -- --check
-cargo test --manifest-path native/Cargo.toml --all-features
-cargo clippy --manifest-path native/Cargo.toml --all-targets --all-features -- -D warnings
-cargo check --manifest-path native/Cargo.toml --no-default-features

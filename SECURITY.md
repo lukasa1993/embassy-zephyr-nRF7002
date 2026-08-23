@@ -1,8 +1,5 @@
 # Security
 
-Do not put Wi-Fi credentials, device secrets, tokens, or private keys in an
-issue, discussion, log attachment, firmware image, or foundation archive.
+Do not put Wi-Fi credentials, device secrets, tokens, private keys, or licensed firmware files in an issue, discussion, log, or test artifact.
 
-For a security-sensitive report, use GitHub's private vulnerability reporting
-for this repository. Include the affected tag, board/profile, and the smallest
-reproduction that does not contain real credentials.
+Use GitHub private vulnerability reporting for security-sensitive reports. Include the affected commit, board, firmware release, and the smallest reproduction that does not contain real credentials.
