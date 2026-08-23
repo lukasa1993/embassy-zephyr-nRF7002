@@ -16,6 +16,158 @@ env:
   NRF_WIFI_REVISION: 5046744cb4c9640eb8b11cb92f1ea0b9554c20cf
 
 jobs:
+  maintenance-patch:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/native-embassy-nrf7002'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the driver branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: native-embassy-nrf7002
+          persist-credentials: true
+
+      - name: Apply guarded source changes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          control_path = Path("src/control.rs")
+          control = control_path.read_text()
+          marker = "/// BSS metadata copied from a trusted scan result into authentication.\npub struct BssContext<'a> {"
+          assert marker in control
+          control = control.replace(
+              marker,
+              "/// BSS metadata copied from a trusted scan result into authentication.\n#[derive(Default)]\npub struct BssContext<'a> {",
+              1,
+          )
+          start = control.index("\nimpl Default for BssContext<'_> {")
+          end = control.index("\n\n/// Authentication command input.", start)
+          control = control[:start] + control[end:]
+
+          constants_marker = "const KEY_MAC_VALID: u32 = 1 << 0;\n"
+          assert constants_marker in control
+          control = control.replace(
+              constants_marker,
+              constants_marker
+              + "const SET_STATION_FLAGS_VALID: u32 = 1 << 12;\n"
+              + "const STATION_FLAG_AUTHORIZED: u32 = 1 << 1;\n"
+              + "const CHANGE_STATION_INFO_LEN: usize = 789;\n",
+              1,
+          )
+
+          function_marker = "\n/// Parses one UMAC control event.\n"
+          assert function_marker in control
+          station_function = r'''
+
+          /// Encodes `NRF_WIFI_UMAC_CMD_SET_STATION` for controlled-port authorization.
+          pub fn encode_station_authorized(
+              out: &mut [u8],
+              ifaceindex: i32,
+              peer: [u8; 6],
+              authorized: bool,
+          ) -> Result<usize, ProtocolError> {
+              encode_umac(
+                  out,
+                  UmacCommand::SetStation,
+                  ifaceindex,
+                  4 + CHANGE_STATION_INFO_LEN,
+                  |writer| {
+                      writer.u32(SET_STATION_FLAGS_VALID)?;
+                      writer.zeros(260)?;
+                      writer.u32(STATION_FLAG_AUTHORIZED)?;
+                      writer.u32(if authorized {
+                          STATION_FLAG_AUTHORIZED
+                      } else {
+                          0
+                      })?;
+                      writer.zeros(512)?;
+                      writer.bytes(&peer)?;
+                      writer.zeros(3)
+                  },
+              )
+          }
+          '''
+          control = control.replace(function_marker, station_function + function_marker, 1)
+          control_path.write_text(control)
+
+          device_path = Path("src/device.rs")
+          device = device_path.read_text()
+          import_marker = "use super::bus::Bus;\n"
+          assert import_marker in device
+          device = device.replace(
+              import_marker,
+              import_marker + "use super::control::MAX_STATION_MESSAGE_LEN;\n",
+              1,
+          )
+          old_send = '''        let queues = self.queues.ok_or(DeviceError::NotInitialized)?;
+                  let Some(address) = self.dequeue(queues.command_available).await? else {
+                      return Err(DeviceError::CommandQueueEmpty);
+                  };
+                  self.post_control_fragment(queues, address, message).await
+          '''
+          new_send = '''        let queues = self.queues.ok_or(DeviceError::NotInitialized)?;
+                  let address = match self.dequeue(queues.command_available).await {
+                      Ok(Some(value)) => value,
+                      Ok(None) => return Err(DeviceError::CommandQueueEmpty),
+                      Err(_) => return Err(self.mark_delivery_uncertain()),
+                  };
+                  self.post_control_fragment(queues, address, message).await
+          '''
+          assert old_send in device
+          device = device.replace(old_send, new_send, 1)
+          old_error_arms = '''                    Err(_) if posted_any => return Err(self.mark_delivery_uncertain()),
+                              Err(error) => return Err(error),
+          '''
+          assert old_error_arms in device
+          device = device.replace(
+              old_error_arms,
+              "                    Err(_) => return Err(self.mark_delivery_uncertain()),\n",
+              1,
+          )
+          old_limit = "message.len() > MAX_CONTROL_MESSAGE_LEN"
+          assert old_limit in device
+          device = device.replace(
+              old_limit,
+              "message.len() > MAX_STATION_MESSAGE_LEN",
+              1,
+          )
+          device_path.write_text(device)
+
+          layout_path = Path("tests/layout_probe.c")
+          layout = layout_path.read_text()
+          layout_marker = '''_Static_assert(sizeof(struct nrf_wifi_cmd_req_set_reg) == 46,
+                         "nrf_wifi_cmd_req_set_reg size changed");
+          '''
+          assert layout_marker in layout
+          layout = layout.replace(
+              layout_marker,
+              layout_marker
+              + '_Static_assert(sizeof(struct nrf_wifi_umac_cmd_chg_sta) == 829,\n'
+              + '               "nrf_wifi_umac_cmd_chg_sta size changed");\n',
+              1,
+          )
+          layout_path.write_text(layout)
+          PY
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy --target thumbv8m.main-none-eabihf
+
+      - name: Format and verify before commit
+        run: |
+          set -euxo pipefail
+          cargo +1.95.0 fmt --all
+          cargo +1.95.0 test --all-features
+          cargo +1.95.0 clippy --all-targets --all-features -- -D warnings
+          cargo +1.95.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src tests/layout_probe.c
+          git commit -m "Harden station control and transport"
+          git push origin HEAD:native-embassy-nrf7002
+
   rust:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
