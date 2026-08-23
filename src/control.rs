@@ -89,6 +89,9 @@ const KEY_SEQUENCE_VALID: u32 = 1 << 3;
 const KEY_CIPHER_VALID: u32 = 1 << 4;
 const KEY_FLAGS_VALID: u32 = 1 << 5;
 const KEY_MAC_VALID: u32 = 1 << 0;
+const SET_STATION_FLAGS_VALID: u32 = 1 << 12;
+const STATION_FLAG_AUTHORIZED: u32 = 1 << 1;
+const CHANGE_STATION_INFO_LEN: usize = 789;
 
 const EVENT_REGULATORY_CHANGE: u32 = 289;
 
@@ -163,6 +166,7 @@ impl<'a> KeyConfig<'a> {
 }
 
 /// BSS metadata copied from a trusted scan result into authentication.
+#[derive(Default)]
 pub struct BssContext<'a> {
     pub scan_width: i32,
     pub signal_dbm: i32,
@@ -171,20 +175,6 @@ pub struct BssContext<'a> {
     pub capability: u16,
     pub beacon_interval: u16,
     pub tsf: u64,
-}
-
-impl Default for BssContext<'_> {
-    fn default() -> Self {
-        Self {
-            scan_width: 0,
-            signal_dbm: 0,
-            from_beacon: false,
-            information_elements: &[],
-            capability: 0,
-            beacon_interval: 0,
-            tsf: 0,
-        }
-    }
 }
 
 /// Authentication command input.
@@ -557,6 +547,34 @@ pub fn encode_power_save_timeout(
         ifaceindex,
         4,
         |writer| writer.i32(timeout_ms),
+    )
+}
+
+/// Encodes `NRF_WIFI_UMAC_CMD_SET_STATION` for controlled-port authorization.
+pub fn encode_station_authorized(
+    out: &mut [u8],
+    ifaceindex: i32,
+    peer: [u8; 6],
+    authorized: bool,
+) -> Result<usize, ProtocolError> {
+    encode_umac(
+        out,
+        UmacCommand::SetStation,
+        ifaceindex,
+        4 + CHANGE_STATION_INFO_LEN,
+        |writer| {
+            writer.u32(SET_STATION_FLAGS_VALID)?;
+            writer.zeros(260)?;
+            writer.u32(STATION_FLAG_AUTHORIZED)?;
+            writer.u32(if authorized {
+                STATION_FLAG_AUTHORIZED
+            } else {
+                0
+            })?;
+            writer.zeros(512)?;
+            writer.bytes(&peer)?;
+            writer.zeros(3)
+        },
     )
 }
 

@@ -336,14 +336,10 @@ impl StationController {
         D: DelayNs,
     {
         self.require_one_of(&[StationState::Securing, StationState::Authorizing])?;
-        let peer = self.peer.ok_or(StationError::Fault(StationFault::PeerMismatch))?;
-        let len = encode_key_command(
-            &mut self.command,
-            self.ifaceindex,
-            command,
-            peer,
-            key,
-        )?;
+        let peer = self
+            .peer
+            .ok_or(StationError::Fault(StationFault::PeerMismatch))?;
+        let len = encode_key_command(&mut self.command, self.ifaceindex, command, peer, key)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
@@ -383,7 +379,9 @@ impl StationController {
         D: DelayNs,
     {
         self.require(StationState::Securing)?;
-        let peer = self.peer.ok_or(StationError::Fault(StationFault::PeerMismatch))?;
+        let peer = self
+            .peer
+            .ok_or(StationError::Fault(StationFault::PeerMismatch))?;
         let len = encode_station_authorized(&mut self.command, self.ifaceindex, peer, true)?;
         device
             .send_control_reliable(&self.command[..len], delay)
@@ -437,7 +435,9 @@ impl StationController {
             StationState::AwaitingCarrier,
             StationState::Connected,
         ])?;
-        let peer = self.peer.ok_or(StationError::Fault(StationFault::PeerMismatch))?;
+        let peer = self
+            .peer
+            .ok_or(StationError::Fault(StationFault::PeerMismatch))?;
         device
             .deauthenticate(self.ifaceindex, peer, reason_code, false)
             .await?;
@@ -675,9 +675,9 @@ fn mlme_status<E>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::control::MlmeEvent;
     use super::super::protocol::UmacHeader;
+    use super::*;
 
     fn header(event: UmacCommand) -> UmacHeader {
         UmacHeader {

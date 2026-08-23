@@ -3,6 +3,7 @@
 use embedded_hal_async::delay::DelayNs;
 
 use super::bus::Bus;
+use super::control::MAX_STATION_MESSAGE_LEN;
 use super::memory::{Processor, Rpu, RpuError};
 use super::protocol::{
     HOST_MESSAGE_HEADER_LEN, HPQM_INFO_LEN, HostMessageRef, HpqmInfo, ProtocolError, ScanReason,
@@ -297,8 +298,10 @@ where
             return Err(DeviceError::CommandNeedsWait);
         }
         let queues = self.queues.ok_or(DeviceError::NotInitialized)?;
-        let Some(address) = self.dequeue(queues.command_available).await? else {
-            return Err(DeviceError::CommandQueueEmpty);
+        let address = match self.dequeue(queues.command_available).await {
+            Ok(Some(value)) => value,
+            Ok(None) => return Err(DeviceError::CommandQueueEmpty),
+            Err(_) => return Err(self.mark_delivery_uncertain()),
         };
         self.post_control_fragment(queues, address, message).await
     }
@@ -335,8 +338,7 @@ where
                         break;
                     }
                     Ok(None) => delay.delay_ms(delay_ms).await,
-                    Err(_) if posted_any => return Err(self.mark_delivery_uncertain()),
-                    Err(error) => return Err(error),
+                    Err(_) => return Err(self.mark_delivery_uncertain()),
                 }
             }
 
@@ -682,7 +684,7 @@ fn queue_map_is_valid(queues: &HpqmInfo) -> bool {
 }
 
 fn validate_complete_message<E>(message: &[u8]) -> Result<(), DeviceError<E>> {
-    if message.len() < HOST_MESSAGE_HEADER_LEN || message.len() > MAX_CONTROL_MESSAGE_LEN {
+    if message.len() < HOST_MESSAGE_HEADER_LEN || message.len() > MAX_STATION_MESSAGE_LEN {
         return Err(DeviceError::Protocol(ProtocolError::InvalidLength));
     }
     let declared = u32::from_le_bytes([message[0], message[1], message[2], message[3]]) as usize;

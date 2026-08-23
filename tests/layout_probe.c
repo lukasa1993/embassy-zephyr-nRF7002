@@ -116,6 +116,8 @@ _Static_assert(sizeof(struct nrf_wifi_umac_cmd_set_key) == 571,
                "nrf_wifi_umac_cmd_set_key size changed");
 _Static_assert(sizeof(struct nrf_wifi_cmd_req_set_reg) == 46,
                "nrf_wifi_cmd_req_set_reg size changed");
+_Static_assert(sizeof(struct nrf_wifi_umac_cmd_chg_sta) == 829,
+               "nrf_wifi_umac_cmd_chg_sta size changed");
 _Static_assert(sizeof(struct nrf_wifi_umac_cmd_chg_vif_state) == 41,
                "nrf_wifi_umac_cmd_chg_vif_state size changed");
 _Static_assert(sizeof(struct nrf_wifi_umac_cmd_set_power_save) == 40,
