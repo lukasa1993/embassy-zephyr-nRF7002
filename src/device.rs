@@ -1,5 +1,7 @@
 //! Native RPU queue, command, event, and interrupt controller.
 
+use embedded_hal_async::delay::DelayNs;
+
 use super::bus::Bus;
 use super::memory::{Processor, Rpu, RpuError};
 use super::protocol::{
@@ -29,17 +31,21 @@ pub const RPU_INTERRUPT_ROOT_BIT: u32 = 1 << 17;
 pub const RPU_INTERRUPT_MCU_BIT: u32 = 1 << 31;
 /// Command counter synchronization value used by Nordic's HAL.
 pub const RPU_COMMAND_COUNTER_START: u32 = 0xdead;
-/// Nordic's default command-buffer fragment limit.
+/// Nordic's command-buffer fragment limit.
 pub const DEFAULT_CONTROL_FRAGMENT_LEN: usize = 400;
 /// Largest event fragment in Nordic's pinned host interface.
 pub const MAX_EVENT_FRAGMENT_LEN: usize = 1000;
 /// Nordic's default event-pool fragment limit.
 pub const DEFAULT_EVENT_FRAGMENT_LEN: usize = MAX_EVENT_FRAGMENT_LEN;
+/// Default command-buffer polls before a timeout.
+pub const DEFAULT_COMMAND_WAIT_ATTEMPTS: u16 = 1000;
+/// Delay between command-buffer polls.
+pub const DEFAULT_COMMAND_WAIT_DELAY_MS: u32 = 1;
 
 /// Native queue-controller failure.
 #[derive(Debug)]
 pub enum DeviceError<E> {
-    /// The bus or RPU memory operation failed.
+    /// The bus or RPU memory operation failed before ownership changed.
     Rpu(RpuError<E>),
     /// A packed command or event is invalid.
     Protocol(ProtocolError),
@@ -49,6 +55,14 @@ pub enum DeviceError<E> {
     InvalidQueueMap,
     /// No command buffer is currently available.
     CommandQueueEmpty,
+    /// A multi-fragment command needs the bounded-wait API.
+    CommandNeedsWait,
+    /// No command buffer became available before the bounded wait ended.
+    CommandQueueTimeout,
+    /// Command ownership changed and delivery can no longer be proved.
+    CommandDeliveryUncertain,
+    /// The RPU must be reset and queues must be initialized again.
+    RecoveryRequired,
     /// A caller changed the scratch buffer during fragmented-event assembly.
     EventBufferChanged,
     /// The event is larger than caller storage.
@@ -90,6 +104,7 @@ pub struct Device<B> {
     command_fragment_len: usize,
     event_fragment_len: usize,
     pending_event: Option<PendingEvent>,
+    recovery_required: bool,
 }
 
 impl<B> Device<B> {
@@ -104,6 +119,7 @@ impl<B> Device<B> {
             command_fragment_len: DEFAULT_CONTROL_FRAGMENT_LEN,
             event_fragment_len: DEFAULT_EVENT_FRAGMENT_LEN,
             pending_event: None,
+            recovery_required: false,
         }
     }
 
@@ -140,13 +156,31 @@ impl<B> Device<B> {
         }
     }
 
+    /// Reports whether the RPU must be reset before more queue operations.
+    pub const fn recovery_required(&self) -> bool {
+        self.recovery_required
+    }
+
+    /// Invalidates all queue metadata after a confirmed RPU reset.
+    ///
+    /// Call this after hardware reset and before firmware load. A later
+    /// [`Device::initialize_queues`] call makes the device usable again.
+    pub fn reset_queue_state(&mut self) {
+        self.queues = None;
+        self.rx_command_base = 0;
+        self.tx_command_base = 0;
+        self.command_counter = RPU_COMMAND_COUNTER_START;
+        self.pending_event = None;
+        self.recovery_required = false;
+    }
+
     /// Sets command and event fragment limits.
     pub fn set_fragment_limits(
         &mut self,
         command_len: usize,
         event_len: usize,
     ) -> Result<(), FragmentLimitError> {
-        if !(HOST_MESSAGE_HEADER_LEN..=MAX_CONTROL_MESSAGE_LEN).contains(&command_len)
+        if !(HOST_MESSAGE_HEADER_LEN..=DEFAULT_CONTROL_FRAGMENT_LEN).contains(&command_len)
             || !(HOST_MESSAGE_HEADER_LEN..=MAX_EVENT_FRAGMENT_LEN).contains(&event_len)
         {
             return Err(FragmentLimitError);
@@ -169,6 +203,19 @@ impl<B> Device<B> {
         self.pending_event = Some(pending);
         true
     }
+
+    fn ensure_operational<E>(&self) -> Result<(), DeviceError<E>> {
+        if self.recovery_required {
+            Err(DeviceError::RecoveryRequired)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn mark_delivery_uncertain<E>(&mut self) -> DeviceError<E> {
+        self.recovery_required = true;
+        DeviceError::CommandDeliveryUncertain
+    }
 }
 
 impl<B> Device<B>
@@ -190,7 +237,7 @@ where
             .rpu
             .read_u32(Processor::Lmac, RPU_MEM_RX_CMD_BASE)
             .await?;
-        if rx_command_base == 0 {
+        if rx_command_base == 0 || rx_command_base == 0xaaaa_aaaa {
             return Err(DeviceError::InvalidQueueMap);
         }
 
@@ -201,11 +248,13 @@ where
         self.tx_command_base = RPU_MEM_TX_CMD_BASE;
         self.command_counter = RPU_COMMAND_COUNTER_START;
         self.pending_event = None;
+        self.recovery_required = false;
         Ok(queues)
     }
 
     /// Enables the root and UMAC interrupt lines.
     pub async fn enable_interrupts(&mut self) -> Result<(), DeviceError<B::Error>> {
+        self.ensure_operational()?;
         let root = self.rpu.read_register(RPU_REG_INT_FROM_RPU_CTRL).await?;
         self.rpu
             .write_register(RPU_REG_INT_FROM_RPU_CTRL, root | RPU_INTERRUPT_ROOT_BIT)
@@ -236,19 +285,117 @@ where
         Ok(())
     }
 
-    /// Sends one complete host/RPU command, with Nordic-compatible fragmentation.
+    /// Sends one command that fits one firmware command buffer.
+    ///
+    /// Use [`Device::send_control_with_wait`] for a command that needs more
+    /// than one fragment. This rule prevents a normal queue-empty result after
+    /// firmware already received the first part of a command.
     pub async fn send_control(&mut self, message: &[u8]) -> Result<(), DeviceError<B::Error>> {
         validate_complete_message(message)?;
+        self.ensure_operational()?;
+        if message.len() > self.command_fragment_len {
+            return Err(DeviceError::CommandNeedsWait);
+        }
         let queues = self.queues.ok_or(DeviceError::NotInitialized)?;
+        let Some(address) = self.dequeue(queues.command_available).await? else {
+            return Err(DeviceError::CommandQueueEmpty);
+        };
+        self.post_control_fragment(queues, address, message).await
+    }
+
+    /// Sends a complete command with a bounded wait for each command buffer.
+    ///
+    /// If a timeout or bus error occurs after ownership changes, the method
+    /// marks the device for recovery. Reset the RPU and initialize the queues
+    /// before more commands are sent.
+    pub async fn send_control_with_wait<D>(
+        &mut self,
+        message: &[u8],
+        delay: &mut D,
+        attempts: u16,
+        delay_ms: u32,
+    ) -> Result<(), DeviceError<B::Error>>
+    where
+        D: DelayNs,
+    {
+        validate_complete_message(message)?;
+        self.ensure_operational()?;
+        if attempts == 0 {
+            return Err(DeviceError::CommandQueueTimeout);
+        }
+        let queues = self.queues.ok_or(DeviceError::NotInitialized)?;
+        let mut posted_any = false;
 
         for fragment in message.chunks(self.command_fragment_len) {
-            let address = self
-                .dequeue(queues.command_available)
-                .await?
-                .ok_or(DeviceError::CommandQueueEmpty)?;
-            self.rpu.write(Processor::Umac, address, fragment).await?;
-            self.enqueue(queues.command_busy, address).await?;
-            self.trigger_command().await?;
+            let mut address = None;
+            for _ in 0..attempts {
+                match self.dequeue(queues.command_available).await {
+                    Ok(Some(value)) => {
+                        address = Some(value);
+                        break;
+                    }
+                    Ok(None) => delay.delay_ms(delay_ms).await,
+                    Err(_) if posted_any => return Err(self.mark_delivery_uncertain()),
+                    Err(error) => return Err(error),
+                }
+            }
+
+            let Some(address) = address else {
+                if posted_any {
+                    return Err(self.mark_delivery_uncertain());
+                }
+                return Err(DeviceError::CommandQueueTimeout);
+            };
+
+            match self.post_control_fragment(queues, address, fragment).await {
+                Ok(()) => posted_any = true,
+                Err(DeviceError::CommandDeliveryUncertain) => {
+                    self.recovery_required = true;
+                    return Err(DeviceError::CommandDeliveryUncertain);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Sends a complete command with the default one-second queue wait.
+    pub async fn send_control_reliable<D>(
+        &mut self,
+        message: &[u8],
+        delay: &mut D,
+    ) -> Result<(), DeviceError<B::Error>>
+    where
+        D: DelayNs,
+    {
+        self.send_control_with_wait(
+            message,
+            delay,
+            DEFAULT_COMMAND_WAIT_ATTEMPTS,
+            DEFAULT_COMMAND_WAIT_DELAY_MS,
+        )
+        .await
+    }
+
+    async fn post_control_fragment(
+        &mut self,
+        queues: HpqmInfo,
+        address: u32,
+        fragment: &[u8],
+    ) -> Result<(), DeviceError<B::Error>> {
+        if self
+            .rpu
+            .write(Processor::Umac, address, fragment)
+            .await
+            .is_err()
+        {
+            return Err(self.mark_delivery_uncertain());
+        }
+        if self.enqueue(queues.command_busy, address).await.is_err() {
+            return Err(self.mark_delivery_uncertain());
+        }
+        if self.trigger_command().await.is_err() {
+            return Err(self.mark_delivery_uncertain());
         }
         Ok(())
     }
@@ -282,6 +429,9 @@ where
     }
 
     /// Starts one firmware scan.
+    ///
+    /// The scan command is larger than one Nordic command buffer. Use
+    /// [`Device::start_scan_reliable`] for normal operation.
     pub async fn start_scan(
         &mut self,
         ifaceindex: i32,
@@ -290,6 +440,21 @@ where
         let mut message = [0u8; MAX_CONTROL_MESSAGE_LEN];
         let len = encode_scan(&mut message, ifaceindex, request)?;
         self.send_control(&message[..len]).await
+    }
+
+    /// Starts one firmware scan with bounded command-buffer waits.
+    pub async fn start_scan_reliable<D>(
+        &mut self,
+        ifaceindex: i32,
+        request: &ScanRequest<'_>,
+        delay: &mut D,
+    ) -> Result<(), DeviceError<B::Error>>
+    where
+        D: DelayNs,
+    {
+        let mut message = [0u8; MAX_CONTROL_MESSAGE_LEN];
+        let len = encode_scan(&mut message, ifaceindex, request)?;
+        self.send_control_reliable(&message[..len], delay).await
     }
 
     /// Requests results after a scan-done event.
@@ -336,8 +501,8 @@ where
         &mut self,
         scratch: &'a mut [u8],
     ) -> Result<Option<HostMessageRef<'a>>, DeviceError<B::Error>> {
+        self.ensure_operational()?;
         let queues = self.queues.ok_or(DeviceError::NotInitialized)?;
-
         loop {
             if let Some(mut pending) = self.pending_event {
                 if !pending.discard
@@ -478,6 +643,9 @@ where
         if value == 0 {
             return Ok(None);
         }
+        if value == 0xaaaa_aaaa {
+            return Err(DeviceError::InvalidQueueMap);
+        }
         self.rpu
             .write_register(queue.dequeue_address, value)
             .await?;
@@ -506,13 +674,15 @@ fn queue_map_is_valid(queues: &HpqmInfo) -> bool {
     all.into_iter().all(|queue| {
         queue.enqueue_address != 0
             && queue.dequeue_address != 0
+            && queue.enqueue_address != 0xaaaa_aaaa
+            && queue.dequeue_address != 0xaaaa_aaaa
             && queue.enqueue_address & 3 == 0
             && queue.dequeue_address & 3 == 0
     })
 }
 
 fn validate_complete_message<E>(message: &[u8]) -> Result<(), DeviceError<E>> {
-    if message.len() < HOST_MESSAGE_HEADER_LEN || message.len() > u32::MAX as usize {
+    if message.len() < HOST_MESSAGE_HEADER_LEN || message.len() > MAX_CONTROL_MESSAGE_LEN {
         return Err(DeviceError::Protocol(ProtocolError::InvalidLength));
     }
     let declared = u32::from_le_bytes([message[0], message[1], message[2], message[3]]) as usize;
@@ -528,7 +698,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn queue_validation_rejects_zero_or_unaligned_addresses() {
+    fn queue_validation_rejects_zero_unaligned_and_sentinel_addresses() {
         let valid = HpqmInfo {
             event_busy: Hpq {
                 enqueue_address: 4,
@@ -567,6 +737,8 @@ mod tests {
         assert!(!queue_map_is_valid(&invalid));
         invalid.event_busy.enqueue_address = 5;
         assert!(!queue_map_is_valid(&invalid));
+        invalid.event_busy.enqueue_address = 0xaaaa_aaaa;
+        assert!(!queue_map_is_valid(&invalid));
     }
 
     #[test]
@@ -578,12 +750,17 @@ mod tests {
     }
 
     #[test]
-    fn event_fragment_limit_matches_nordic_pool() {
+    fn fragment_limits_match_the_pinned_nordic_interface() {
         let mut device = Device::new(());
         assert!(
             device
                 .set_fragment_limits(DEFAULT_CONTROL_FRAGMENT_LEN, MAX_EVENT_FRAGMENT_LEN)
                 .is_ok()
+        );
+        assert!(
+            device
+                .set_fragment_limits(DEFAULT_CONTROL_FRAGMENT_LEN + 1, MAX_EVENT_FRAGMENT_LEN)
+                .is_err()
         );
         assert!(
             device
@@ -604,6 +781,16 @@ mod tests {
         });
         assert!(device.discard_pending_event());
         assert!(device.pending_event.unwrap().discard);
+    }
+
+    #[test]
+    fn reset_clears_recovery_and_queue_state() {
+        let mut device = Device::new(());
+        device.recovery_required = true;
+        device.tx_command_base = RPU_MEM_TX_CMD_BASE;
+        device.reset_queue_state();
+        assert!(!device.recovery_required());
+        assert_eq!(device.tx_command_base(), None);
     }
 
     #[test]
