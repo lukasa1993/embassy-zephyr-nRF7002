@@ -171,7 +171,10 @@ impl Wpa2Runtime {
         B: Bus,
         D: DelayNs,
     {
-        let payload = self.validate_ethernet_frame(frame)?;
+        let payload = match self.validate_ethernet_frame(frame) {
+            Ok(payload) => payload,
+            Err(error) => return self.fail(driver, error),
+        };
         if matches!(
             self.state,
             Wpa2RuntimeState::AwaitingEapolTransmit { .. }
@@ -191,8 +194,8 @@ impl Wpa2Runtime {
             Ok(action) => action,
             Err(error) => return self.fail(driver, Wpa2RuntimeError::Wpa2(error)),
         };
-        match action {
-            Wpa2Action::None => Ok(Wpa2Progress::NoChange),
+        let result = match action {
+            Wpa2Action::None => return Ok(Wpa2Progress::NoChange),
             Wpa2Action::Transmit(response) => {
                 let purpose = if was_complete {
                     EapolTransmitPurpose::Retransmission
@@ -215,6 +218,10 @@ impl Wpa2Runtime {
                 self.group_install = Some(request);
                 self.submit_group_rekey(driver, delay).await
             }
+        };
+        match result {
+            Ok(progress) => Ok(progress),
+            Err(error) => self.fail(driver, error),
         }
     }
 
@@ -247,50 +254,75 @@ impl Wpa2Runtime {
             );
         }
 
-        match self.state {
+        let result = match self.state {
             Wpa2RuntimeState::AwaitingPairwiseKeyStatus => {
-                self.require_command(UmacCommand::NewKey, command)?;
+                if let Err(error) = self.require_command(UmacCommand::NewKey, command) {
+                    return self.fail(driver, error);
+                }
                 self.submit_group_key(driver, delay).await
             }
             Wpa2RuntimeState::AwaitingGroupKeyStatus => {
-                self.require_command(UmacCommand::NewKey, command)?;
+                if let Err(error) = self.require_command(UmacCommand::NewKey, command) {
+                    return self.fail(driver, error);
+                }
                 self.submit_default_group_key(driver, delay).await
             }
             Wpa2RuntimeState::AwaitingDefaultGroupKeyStatus => {
-                self.require_command(UmacCommand::SetKey, command)?;
-                let request = self
-                    .pairwise_install
-                    .take()
-                    .ok_or(Wpa2RuntimeError::MissingInstallRequest)?;
-                let response = self.supplicant.complete_key_install(request, true)?;
+                if let Err(error) = self.require_command(UmacCommand::SetKey, command) {
+                    return self.fail(driver, error);
+                }
+                let Some(request) = self.pairwise_install.take() else {
+                    return self.fail(driver, Wpa2RuntimeError::MissingInstallRequest);
+                };
+                let response = match self.supplicant.complete_key_install(request, true) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return self.fail(driver, Wpa2RuntimeError::Wpa2(error));
+                    }
+                };
                 self.submit_eapol(driver, response, EapolTransmitPurpose::Message4)
                     .await
             }
             Wpa2RuntimeState::AwaitingAuthorizationStatus => {
-                self.require_command(UmacCommand::SetStation, command)?;
+                if let Err(error) = self.require_command(UmacCommand::SetStation, command) {
+                    return self.fail(driver, error);
+                }
                 if driver.station_mut().state() == StationState::Connected {
                     self.state = Wpa2RuntimeState::Complete;
-                    Ok(Wpa2Progress::Complete)
-                } else {
-                    self.state = Wpa2RuntimeState::AwaitingCarrier;
-                    Ok(Wpa2Progress::AwaitingCarrier)
+                    return Ok(Wpa2Progress::Complete);
                 }
+                self.state = Wpa2RuntimeState::AwaitingCarrier;
+                return Ok(Wpa2Progress::AwaitingCarrier);
             }
             Wpa2RuntimeState::AwaitingGroupRekeyStatus => {
-                self.require_command(UmacCommand::NewKey, command)?;
+                if let Err(error) = self.require_command(UmacCommand::NewKey, command) {
+                    return self.fail(driver, error);
+                }
                 self.submit_default_group_rekey(driver, delay).await
             }
             Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus => {
-                self.require_command(UmacCommand::SetKey, command)?;
-                let request = self
-                    .group_install
-                    .take()
-                    .ok_or(Wpa2RuntimeError::MissingInstallRequest)?;
-                let response = self.supplicant.complete_group_key_install(request, true)?;
+                if let Err(error) = self.require_command(UmacCommand::SetKey, command) {
+                    return self.fail(driver, error);
+                }
+                let Some(request) = self.group_install.take() else {
+                    return self.fail(driver, Wpa2RuntimeError::MissingInstallRequest);
+                };
+                let response = match self.supplicant.complete_group_key_install(request, true) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return self.fail(driver, Wpa2RuntimeError::Wpa2(error));
+                    }
+                };
                 self.submit_eapol(driver, response, EapolTransmitPurpose::GroupMessage2)
                     .await
             }
-            _ => self.fail(driver, Wpa2RuntimeError::UnexpectedState(self.state)),
+            _ => {
+                return self.fail(driver, Wpa2RuntimeError::UnexpectedState(self.state));
+            }
+        };
+        match result {
+            Ok(progress) => Ok(progress),
+            Err(error) => self.fail(driver, error),
         }
     }
 
@@ -327,13 +359,22 @@ impl Wpa2Runtime {
                 Ok(Wpa2Progress::NoChange)
             }
             EapolTransmitPurpose::Message4 => {
-                let (device, station) = driver.security_parts_mut();
-                station.authorize(device, delay).await?;
-                self.state = Wpa2RuntimeState::AwaitingAuthorizationStatus;
-                Ok(Wpa2Progress::AuthorizationSubmitted)
+                let result = {
+                    let (device, station) = driver.security_parts_mut();
+                    station.authorize(device, delay).await
+                };
+                match result {
+                    Ok(()) => {
+                        self.state = Wpa2RuntimeState::AwaitingAuthorizationStatus;
+                        Ok(Wpa2Progress::AuthorizationSubmitted)
+                    }
+                    Err(error) => self.fail(driver, Wpa2RuntimeError::Station(error)),
+                }
             }
             EapolTransmitPurpose::GroupMessage2 => {
-                driver.station_mut().complete_group_rekey();
+                if driver.station_mut().complete_group_rekey() == StationState::Fault {
+                    return self.fail(driver, Wpa2RuntimeError::UnexpectedState(self.state));
+                }
                 self.state = Wpa2RuntimeState::Complete;
                 Ok(Wpa2Progress::Complete)
             }
