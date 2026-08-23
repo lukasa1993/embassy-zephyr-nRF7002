@@ -88,7 +88,10 @@ pub enum DataError<E> {
     QueueOwnershipUncertain(DeviceError<E>),
     NoTransmitToken,
     ReceiveDescriptorBusy(u16),
-    OutputTooSmall { needed: usize, capacity: usize },
+    OutputTooSmall {
+        needed: usize,
+        capacity: usize,
+    },
 }
 
 impl<E> From<DeviceError<E>> for DataError<E> {
