@@ -16,6 +16,136 @@ env:
   NRF_WIFI_REVISION: 5046744cb4c9640eb8b11cb92f1ea0b9554c20cf
 
 jobs:
+  wpa2-patch:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/native-embassy-nrf7002'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the driver branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: native-embassy-nrf7002
+          persist-credentials: true
+
+      - name: Correct guarded WPA2 tests
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/wpa2.rs")
+          text = path.read_text()
+          text = text.replace(
+          '''        assert_eq!(
+                      supplicant.on_eapol(PEER, &stale),
+                      Err(Wpa2Error::StaleReplayCounter)
+                  );
+          ''',
+          '''        assert!(matches!(
+                      supplicant.on_eapol(PEER, &stale),
+                      Err(Wpa2Error::StaleReplayCounter)
+                  ));
+          ''', 1)
+          text = text.replace(
+          '''        assert_eq!(
+                      supplicant.on_eapol([9; 6], &message1),
+                      Err(Wpa2Error::WrongPeer)
+                  );
+          ''',
+          '''        assert!(matches!(
+                      supplicant.on_eapol([9; 6], &message1),
+                      Err(Wpa2Error::WrongPeer)
+                  ));
+          ''', 1)
+          old = '''    fn build_authenticator_frame(
+                  key_info: u16,
+                  replay: u64,
+                  nonce: [u8; 32],
+                  key_data: &[u8],
+                  ptk: Option<&Ptk>,
+              ) -> [u8; MAX_EAPOL_FRAME_LEN] {
+                  let body_len = EAPOL_KEY_FIXED_BODY_LEN + key_data.len();
+                  let total = EAPOL_HEADER_LEN + body_len;
+                  let mut bytes = [0u8; MAX_EAPOL_FRAME_LEN];
+                  bytes[0] = 2;
+                  bytes[1] = EAPOL_PACKET_TYPE_KEY;
+                  bytes[2..4].copy_from_slice(&(body_len as u16).to_be_bytes());
+                  bytes[4] = RSN_KEY_DESCRIPTOR_TYPE;
+                  bytes[5..7].copy_from_slice(&key_info.to_be_bytes());
+                  bytes[7..9].copy_from_slice(&(CCMP_KEY_LEN as u16).to_be_bytes());
+                  bytes[9..17].copy_from_slice(&replay.to_be_bytes());
+                  bytes[17..49].copy_from_slice(&nonce);
+                  bytes[KEY_DATA_LENGTH_OFFSET..KEY_DATA_OFFSET]
+                      .copy_from_slice(&(key_data.len() as u16).to_be_bytes());
+                  bytes[KEY_DATA_OFFSET..total].copy_from_slice(key_data);
+                  if let Some(ptk) = ptk {
+                      let mut mac = Hmac::<Sha1>::new_from_slice(ptk.kck()).unwrap();
+                      mac.update(&bytes[..total]);
+                      let mic = mac.finalize().into_bytes();
+                      bytes[KEY_MIC_START..KEY_MIC_END].copy_from_slice(&mic[..16]);
+                  }
+                  let mut exact = [0u8; MAX_EAPOL_FRAME_LEN];
+                  exact[..total].copy_from_slice(&bytes[..total]);
+                  exact[total..].fill(0);
+                  exact
+              }
+          '''
+          new = '''    fn build_authenticator_frame(
+                  key_info: u16,
+                  replay: u64,
+                  nonce: [u8; 32],
+                  key_data: &[u8],
+                  ptk: Option<&Ptk>,
+              ) -> std::vec::Vec<u8> {
+                  let body_len = EAPOL_KEY_FIXED_BODY_LEN + key_data.len();
+                  let total = EAPOL_HEADER_LEN + body_len;
+                  let mut bytes = std::vec![0u8; total];
+                  bytes[0] = 2;
+                  bytes[1] = EAPOL_PACKET_TYPE_KEY;
+                  bytes[2..4].copy_from_slice(&(body_len as u16).to_be_bytes());
+                  bytes[4] = RSN_KEY_DESCRIPTOR_TYPE;
+                  bytes[5..7].copy_from_slice(&key_info.to_be_bytes());
+                  bytes[7..9].copy_from_slice(&(CCMP_KEY_LEN as u16).to_be_bytes());
+                  bytes[9..17].copy_from_slice(&replay.to_be_bytes());
+                  bytes[17..49].copy_from_slice(&nonce);
+                  bytes[KEY_DATA_LENGTH_OFFSET..KEY_DATA_OFFSET]
+                      .copy_from_slice(&(key_data.len() as u16).to_be_bytes());
+                  bytes[KEY_DATA_OFFSET..total].copy_from_slice(key_data);
+                  if let Some(ptk) = ptk {
+                      let mut mac = Hmac::<Sha1>::new_from_slice(ptk.kck()).unwrap();
+                      mac.update(&bytes);
+                      let mic = mac.finalize().into_bytes();
+                      bytes[KEY_MIC_START..KEY_MIC_END].copy_from_slice(&mic[..16]);
+                  }
+                  bytes
+              }
+          '''
+          assert old in text
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+
+      - name: Install Rust toolchains
+        run: |
+          set -euxo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy --target thumbv8m.main-none-eabihf
+          rustup toolchain install 1.85.0 --profile minimal --target thumbv8m.main-none-eabihf
+
+      - name: Format and verify WPA2
+        run: |
+          set -euxo pipefail
+          cargo +1.95.0 fmt --all
+          cargo +1.95.0 test --all-features
+          cargo +1.95.0 clippy --all-targets --all-features -- -D warnings
+          cargo +1.95.0 check --lib --features wpa2 --target thumbv8m.main-none-eabihf
+          cargo +1.85.0 check --lib --features wpa2 --target thumbv8m.main-none-eabihf
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src Cargo.toml
+          git commit -m "Verify and format WPA2 supplicant"
+          git push origin HEAD:native-embassy-nrf7002
+
   rust:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
