@@ -17,6 +17,7 @@ pub mod device;
 pub mod firmware;
 pub mod memory;
 pub mod protocol;
+pub mod station;
 
 #[cfg(feature = "embassy-net")]
 pub mod embassy;
@@ -31,6 +32,7 @@ pub use device::Device;
 pub use firmware::{FirmwareBundle, FirmwareReport};
 pub use memory::{Processor, Rpu};
 pub use protocol::{ScanRequest, SystemInitConfig};
+pub use station::{StationController, StationError, StationFault, StationState};
 
 /// Pinned host-driver source revision used for every packed interface value.
 pub const NRF_WIFI_SOURCE_REVISION: &str = "5046744cb4c9640eb8b11cb92f1ea0b9554c20cf";
