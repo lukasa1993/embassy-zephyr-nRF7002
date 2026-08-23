@@ -322,7 +322,10 @@ impl<const RX: usize, const TX: usize> DataPath<RX, TX> {
     }
 
     /// Posts every RX descriptor to firmware pool zero.
-    pub async fn post_all_rx<B>(&mut self, device: &mut Device<B>) -> Result<(), DataError<B::Error>>
+    pub async fn post_all_rx<B>(
+        &mut self,
+        device: &mut Device<B>,
+    ) -> Result<(), DataError<B::Error>>
     where
         B: Bus,
     {
@@ -353,7 +356,9 @@ impl<const RX: usize, const TX: usize> DataPath<RX, TX> {
         if self.rx_posted[index] {
             return Err(DataError::ReceiveDescriptorBusy(descriptor));
         }
-        let queues = device.queues().ok_or(DataError::Device(DeviceError::NotInitialized))?;
+        let queues = device
+            .queues()
+            .ok_or(DataError::Device(DeviceError::NotInitialized))?;
         if pool_id >= queues.rx_buffer_busy.len() {
             return Err(DataError::Protocol(DataProtocolError::InvalidDescriptor(
                 descriptor,
@@ -470,9 +475,11 @@ impl<const RX: usize, const TX: usize> DataPath<RX, TX> {
             return Err(DataError::Protocol(DataProtocolError::FrameTooLarge));
         }
         let token = self.reserve_tx().ok_or(DataError::NoTransmitToken)?;
-        let packet_address = self.tx_slot_address(token as usize).ok_or(
-            DataError::Protocol(DataProtocolError::InvalidDescriptor(token as u16)),
-        )?;
+        let packet_address = self
+            .tx_slot_address(token as usize)
+            .ok_or(DataError::Protocol(DataProtocolError::InvalidDescriptor(
+                token as u16,
+            )))?;
 
         if let Err(error) = write_packet(device, packet_address, frame).await {
             self.tx_in_flight[token as usize] = false;
@@ -482,7 +489,9 @@ impl<const RX: usize, const TX: usize> DataPath<RX, TX> {
         let command_base = device
             .tx_command_base()
             .ok_or(DataError::Device(DeviceError::NotInitialized))?;
-        let queues = device.queues().ok_or(DataError::Device(DeviceError::NotInitialized))?;
+        let queues = device
+            .queues()
+            .ok_or(DataError::Device(DeviceError::NotInitialized))?;
         let command_address = command_base + TX_COMMAND_SLOT_SIZE * token as u32;
         let command = encode_tx_command(
             wdev_id,
@@ -754,15 +763,18 @@ fn put_i32(bytes: &mut [u8], offset: usize, value: i32) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::protocol::{HostMessageType, encode_host_message, parse_host_message};
+    use super::*;
 
     #[test]
     fn packet_ram_layout_does_not_overlap() {
         let layout = DataPath::<8, 4>::new(1600, 1514).unwrap();
         let tx_end = layout.tx_slot_address(3).unwrap() + layout.tx_stride as u32;
         assert!(tx_end <= layout.rx_base);
-        assert_eq!(layout.rx_slot_address(7).unwrap() + layout.rx_stride as u32, RPU_MEM_PACKET_END + 1);
+        assert_eq!(
+            layout.rx_slot_address(7).unwrap() + layout.rx_stride as u32,
+            RPU_MEM_PACKET_END + 1
+        );
     }
 
     #[test]
@@ -807,7 +819,10 @@ mod tests {
         let mut message = [0u8; 32];
         let len = encode_host_message(&mut message, HostMessageType::Data, true, &payload).unwrap();
         let parsed = parse_host_message(&message[..len]).unwrap();
-        assert_eq!(classify_data_event(parsed), Ok(DataEvent::CarrierOn { wdev_id: 1 }));
+        assert_eq!(
+            classify_data_event(parsed),
+            Ok(DataEvent::CarrierOn { wdev_id: 1 })
+        );
     }
 
     #[test]

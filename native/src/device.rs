@@ -197,7 +197,9 @@ where
         self.rpu
             .write_register(RPU_REG_INT_FROM_RPU_CTRL, root & !RPU_INTERRUPT_ROOT_BIT)
             .await?;
-        self.rpu.write_register(RPU_REG_INT_FROM_MCU_CTRL, 0).await?;
+        self.rpu
+            .write_register(RPU_REG_INT_FROM_MCU_CTRL, 0)
+            .await?;
         Ok(())
     }
 
@@ -316,12 +318,14 @@ where
         let resubmit = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) != 0;
 
         if declared < HOST_MESSAGE_HEADER_LEN {
-            self.release_event_fragment(queues, event_address, resubmit).await?;
+            self.release_event_fragment(queues, event_address, resubmit)
+                .await?;
             self.acknowledge_interrupt().await?;
             return Err(DeviceError::Protocol(ProtocolError::InvalidLength));
         }
         if declared > scratch.len() {
-            self.release_event_fragment(queues, event_address, resubmit).await?;
+            self.release_event_fragment(queues, event_address, resubmit)
+                .await?;
             self.acknowledge_interrupt().await?;
             return Err(DeviceError::EventTooLarge {
                 declared,
@@ -339,7 +343,8 @@ where
                     &mut scratch[copied..copied + count],
                 )
                 .await?;
-            self.release_event_fragment(queues, event_address, resubmit).await?;
+            self.release_event_fragment(queues, event_address, resubmit)
+                .await?;
             copied += count;
             if copied < declared {
                 let Some(next) = self.dequeue(queues.event_busy).await? else {
@@ -371,7 +376,9 @@ where
         queue: super::protocol::Hpq,
         value: u32,
     ) -> Result<(), DeviceError<B::Error>> {
-        self.rpu.write_register(queue.enqueue_address, value).await?;
+        self.rpu
+            .write_register(queue.enqueue_address, value)
+            .await?;
         Ok(())
     }
 
@@ -391,10 +398,7 @@ where
 
     pub(crate) async fn trigger_command(&mut self) -> Result<(), DeviceError<B::Error>> {
         self.rpu
-            .write_register(
-                RPU_REG_INT_TO_MCU_CTRL,
-                self.command_counter | 0x7fff_0000,
-            )
+            .write_register(RPU_REG_INT_TO_MCU_CTRL, self.command_counter | 0x7fff_0000)
             .await?;
         self.command_counter = self.command_counter.wrapping_add(1);
         Ok(())
@@ -432,20 +436,41 @@ fn validate_complete_message<E>(message: &[u8]) -> Result<(), DeviceError<E>> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::protocol::{HostMessageType, Hpq, encode_host_message};
     use super::*;
-    use super::super::protocol::{Hpq, HostMessageType, encode_host_message};
 
     #[test]
     fn queue_validation_rejects_zero_or_unaligned_addresses() {
         let valid = HpqmInfo {
-            event_busy: Hpq { enqueue_address: 4, dequeue_address: 8 },
-            event_available: Hpq { enqueue_address: 12, dequeue_address: 16 },
-            command_busy: Hpq { enqueue_address: 20, dequeue_address: 24 },
-            command_available: Hpq { enqueue_address: 28, dequeue_address: 32 },
+            event_busy: Hpq {
+                enqueue_address: 4,
+                dequeue_address: 8,
+            },
+            event_available: Hpq {
+                enqueue_address: 12,
+                dequeue_address: 16,
+            },
+            command_busy: Hpq {
+                enqueue_address: 20,
+                dequeue_address: 24,
+            },
+            command_available: Hpq {
+                enqueue_address: 28,
+                dequeue_address: 32,
+            },
             rx_buffer_busy: [
-                Hpq { enqueue_address: 36, dequeue_address: 40 },
-                Hpq { enqueue_address: 44, dequeue_address: 48 },
-                Hpq { enqueue_address: 52, dequeue_address: 56 },
+                Hpq {
+                    enqueue_address: 36,
+                    dequeue_address: 40,
+                },
+                Hpq {
+                    enqueue_address: 44,
+                    dequeue_address: 48,
+                },
+                Hpq {
+                    enqueue_address: 52,
+                    dequeue_address: 56,
+                },
             ],
         };
         assert!(queue_map_is_valid(&valid));

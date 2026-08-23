@@ -324,9 +324,7 @@ pub fn encode_umac_command(
 }
 
 /// Parses a UMAC event and returns its body after the 36-byte header.
-pub fn parse_umac_event(
-    message: HostMessageRef<'_>,
-) -> Result<(UmacHeader, &[u8]), ProtocolError> {
+pub fn parse_umac_event(message: HostMessageRef<'_>) -> Result<(UmacHeader, &[u8]), ProtocolError> {
     if message.message_type != HostMessageType::Umac {
         return Err(ProtocolError::WrongMessageType);
     }
@@ -976,13 +974,8 @@ mod tests {
     #[test]
     fn host_message_round_trip() {
         let mut bytes = [0u8; 32];
-        let len = encode_host_message(
-            &mut bytes,
-            HostMessageType::Umac,
-            true,
-            &[1, 2, 3, 4],
-        )
-        .unwrap();
+        let len =
+            encode_host_message(&mut bytes, HostMessageType::Umac, true, &[1, 2, 3, 4]).unwrap();
         assert_eq!(len, 16);
         let parsed = parse_host_message(&bytes[..len]).unwrap();
         assert_eq!(parsed.message_type, HostMessageType::Umac);
@@ -997,7 +990,13 @@ mod tests {
             chunk.copy_from_slice(&(index as u32).to_le_bytes());
         }
         let hpqm = HpqmInfo::parse(&bytes).unwrap();
-        assert_eq!(hpqm.event_busy, Hpq { enqueue_address: 0, dequeue_address: 1 });
+        assert_eq!(
+            hpqm.event_busy,
+            Hpq {
+                enqueue_address: 0,
+                dequeue_address: 1
+            }
+        );
         assert_eq!(hpqm.command_available.dequeue_address, 7);
         assert_eq!(hpqm.rx_buffer_busy[2].dequeue_address, 13);
     }

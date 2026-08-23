@@ -316,10 +316,7 @@ where
             let mut tail = [0u8; 4];
             tail[..tail_len].copy_from_slice(&data[aligned_len..]);
             let offset = host_offset(processor, address + aligned_len as u32)?;
-            self.bus
-                .write(offset, &tail)
-                .await
-                .map_err(RpuError::Bus)?;
+            self.bus.write(offset, &tail).await.map_err(RpuError::Bus)?;
         }
         Ok(())
     }
@@ -432,17 +429,12 @@ const fn align4(len: usize) -> Option<usize> {
     len.checked_add(3).map(|value| value & !3)
 }
 
-fn checked_range<E>(
-    processor: Processor,
-    address: u32,
-    len: usize,
-) -> Result<(), RpuError<E>> {
+fn checked_range<E>(processor: Processor, address: u32, len: usize) -> Result<(), RpuError<E>> {
     if len == 0 {
         host_offset(processor, address)?;
         return Ok(());
     }
-    let span = u32::try_from(len - 1)
-        .map_err(|_| RpuError::Address(AddressError::Range))?;
+    let span = u32::try_from(len - 1).map_err(|_| RpuError::Address(AddressError::Range))?;
     let end = address
         .checked_add(span)
         .ok_or(RpuError::Address(AddressError::Range))?;
@@ -460,30 +452,12 @@ mod tests {
 
     #[test]
     fn maps_all_public_regions() {
-        assert_eq!(
-            host_offset(Processor::Lmac, 0xa400_1234),
-            Ok(0x001234)
-        );
-        assert_eq!(
-            host_offset(Processor::Lmac, 0xa500_1234),
-            Ok(0x041234)
-        );
-        assert_eq!(
-            host_offset(Processor::Lmac, 0xb700_1234),
-            Ok(0x081234)
-        );
-        assert_eq!(
-            host_offset(Processor::Lmac, 0xb000_5000),
-            Ok(0x0c5000)
-        );
-        assert_eq!(
-            host_offset(Processor::Lmac, 0x8004_3a80),
-            Ok(0x143a80)
-        );
-        assert_eq!(
-            host_offset(Processor::Umac, 0x8008_c000),
-            Ok(0x28c000)
-        );
+        assert_eq!(host_offset(Processor::Lmac, 0xa400_1234), Ok(0x001234));
+        assert_eq!(host_offset(Processor::Lmac, 0xa500_1234), Ok(0x041234));
+        assert_eq!(host_offset(Processor::Lmac, 0xb700_1234), Ok(0x081234));
+        assert_eq!(host_offset(Processor::Lmac, 0xb000_5000), Ok(0x0c5000));
+        assert_eq!(host_offset(Processor::Lmac, 0x8004_3a80), Ok(0x143a80));
+        assert_eq!(host_offset(Processor::Umac, 0x8008_c000), Ok(0x28c000));
     }
 
     #[test]

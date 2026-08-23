@@ -5,8 +5,8 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use core::task::Context;
 
 use embassy_net_driver::{
-    Capabilities, Driver as EmbassyDriver, HardwareAddress, LinkState,
-    RxToken as EmbassyRxToken, TxToken as EmbassyTxToken,
+    Capabilities, Driver as EmbassyDriver, HardwareAddress, LinkState, RxToken as EmbassyRxToken,
+    TxToken as EmbassyTxToken,
 };
 use embassy_sync::waitqueue::AtomicWaker;
 
@@ -241,7 +241,10 @@ impl<const FRAME_SIZE: usize> EmbassyTxToken for TxToken<'_, FRAME_SIZE> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        assert!(len <= FRAME_SIZE, "embassy-net requested an oversized frame");
+        assert!(
+            len <= FRAME_SIZE,
+            "embassy-net requested an oversized frame"
+        );
         // The CLIENT state gives this token exclusive mutable access.
         let result = unsafe { f(&mut (&mut *self.state.tx.get())[..len]) };
         self.state.tx_len.store(len, Ordering::Relaxed);

@@ -34,10 +34,8 @@ pub const RPU_REG_UCC_SLEEP_CTRL_DATA_1: u32 = 0xa400_2c30;
 pub const RPU_REG_MIPS_MCU_CONTROL: u32 = 0xa400_0000;
 pub const RPU_REG_MIPS_MCU2_CONTROL: u32 = 0xa400_0100;
 
-const LMAC_BOOT_VECTOR_REGISTERS: [u32; 4] =
-    [0xa400_0050, 0xa400_0054, 0xa400_0058, 0xa400_005c];
-const UMAC_BOOT_VECTOR_REGISTERS: [u32; 4] =
-    [0xa400_0150, 0xa400_0154, 0xa400_0158, 0xa400_015c];
+const LMAC_BOOT_VECTOR_REGISTERS: [u32; 4] = [0xa400_0050, 0xa400_0054, 0xa400_0058, 0xa400_005c];
+const UMAC_BOOT_VECTOR_REGISTERS: [u32; 4] = [0xa400_0150, 0xa400_0154, 0xa400_0158, 0xa400_015c];
 const BOOT_VECTOR_VALUES: [u32; 4] = [0x3c1a_8000, 0x275a_0000, 0x0340_0008, 0];
 
 /// Structural or compatibility failure in a firmware bundle.
@@ -390,14 +388,8 @@ mod tests {
         let bytes = bundle_bytes();
         let bundle = FirmwareBundle::parse(&bytes).unwrap();
         bundle.verify_hash().unwrap();
-        assert_eq!(
-            bundle.image(ImageKind::UmacPrimary).unwrap().data,
-            &[0]
-        );
-        assert_eq!(
-            bundle.image(ImageKind::LmacSecondary).unwrap().data,
-            &[3]
-        );
+        assert_eq!(bundle.image(ImageKind::UmacPrimary).unwrap().data, &[0]);
+        assert_eq!(bundle.image(ImageKind::LmacSecondary).unwrap().data, &[3]);
     }
 
     #[test]

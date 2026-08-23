@@ -64,9 +64,7 @@ impl SpiConfig {
 
     /// Creates validated settings.
     pub const fn new(address_mask: u32, slave_latency_words: u8) -> Option<Self> {
-        if address_mask > 0x00ff_ffff
-            || slave_latency_words as usize > MAX_SLAVE_LATENCY_WORDS
-        {
+        if address_mask > 0x00ff_ffff || slave_latency_words as usize > MAX_SLAVE_LATENCY_WORDS {
             return None;
         }
         Some(Self {
