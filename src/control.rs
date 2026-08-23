@@ -299,39 +299,45 @@ pub fn encode_authenticate(
         validate_key(key)?;
     }
 
-    encode_umac(out, UmacCommand::Authenticate, ifaceindex, AUTH_BODY_LEN, |writer| {
-        let mut valid = AUTH_BSSID_VALID | AUTH_FREQUENCY_VALID | AUTH_SSID_VALID;
-        if request.key.is_some() {
-            valid |= AUTH_KEY_INFO_VALID;
-        }
-        if !request.information_elements.is_empty() {
-            valid |= AUTH_IE_VALID;
-        }
-        if !request.sae_data.is_empty() {
-            valid |= AUTH_SAE_VALID;
-        }
-        writer.u32(valid)?;
-        writer.u32(request.frequency_mhz)?;
-        writer.u16(if request.local_state_change {
-            AUTH_LOCAL_STATE_CHANGE
-        } else {
-            0
-        })?;
-        writer.i32(request.auth_type as i32)?;
-        write_key_info(writer, request.key)?;
-        writer.ssid(request.ssid)?;
-        writer.ie(request.information_elements)?;
-        writer.i32(request.sae_data.len() as i32)?;
-        writer.fixed(request.sae_data, MAX_SAE_LEN)?;
-        writer.bytes(&request.bssid)?;
-        writer.i32(request.bss.scan_width)?;
-        writer.i32(request.bss.signal_dbm)?;
-        writer.i32(if request.bss.from_beacon { 1 } else { 0 })?;
-        writer.ie(request.bss.information_elements)?;
-        writer.u16(request.bss.capability)?;
-        writer.u16(request.bss.beacon_interval)?;
-        writer.u64(request.bss.tsf)
-    })
+    encode_umac(
+        out,
+        UmacCommand::Authenticate,
+        ifaceindex,
+        AUTH_BODY_LEN,
+        |writer| {
+            let mut valid = AUTH_BSSID_VALID | AUTH_FREQUENCY_VALID | AUTH_SSID_VALID;
+            if request.key.is_some() {
+                valid |= AUTH_KEY_INFO_VALID;
+            }
+            if !request.information_elements.is_empty() {
+                valid |= AUTH_IE_VALID;
+            }
+            if !request.sae_data.is_empty() {
+                valid |= AUTH_SAE_VALID;
+            }
+            writer.u32(valid)?;
+            writer.u32(request.frequency_mhz)?;
+            writer.u16(if request.local_state_change {
+                AUTH_LOCAL_STATE_CHANGE
+            } else {
+                0
+            })?;
+            writer.i32(request.auth_type as i32)?;
+            write_key_info(writer, request.key)?;
+            writer.ssid(request.ssid)?;
+            writer.ie(request.information_elements)?;
+            writer.i32(request.sae_data.len() as i32)?;
+            writer.fixed(request.sae_data, MAX_SAE_LEN)?;
+            writer.bytes(&request.bssid)?;
+            writer.i32(request.bss.scan_width)?;
+            writer.i32(request.bss.signal_dbm)?;
+            writer.i32(if request.bss.from_beacon { 1 } else { 0 })?;
+            writer.ie(request.bss.information_elements)?;
+            writer.u16(request.bss.capability)?;
+            writer.u16(request.bss.beacon_interval)?;
+            writer.u64(request.bss.tsf)
+        },
+    )
 }
 
 /// Encodes `NRF_WIFI_UMAC_CMD_ASSOCIATE`.
@@ -352,88 +358,96 @@ pub fn encode_associate(
         }
     }
 
-    encode_umac(out, UmacCommand::Associate, ifaceindex, ASSOC_BODY_LEN, |writer| {
-        writer.u32(if request.previous_bssid.is_some() {
-            ASSOC_PREVIOUS_BSSID_VALID
-        } else {
-            0
-        })?;
+    encode_umac(
+        out,
+        UmacCommand::Associate,
+        ifaceindex,
+        ASSOC_BODY_LEN,
+        |writer| {
+            writer.u32(if request.previous_bssid.is_some() {
+                ASSOC_PREVIOUS_BSSID_VALID
+            } else {
+                0
+            })?;
 
-        let mut valid = CONNECT_MAC_VALID
-            | CONNECT_FREQUENCY_VALID
-            | CONNECT_SSID_VALID
-            | CONNECT_CONTROL_PORT_ETHERTYPE_VALID
-            | CONNECT_CONTROL_PORT_NO_ENCRYPT_VALID;
-        if request.background_scan_period_s != 0 {
-            valid |= CONNECT_BG_SCAN_VALID;
-        }
-        if request.previous_bssid.is_some() {
-            valid |= CONNECT_PREVIOUS_BSSID_VALID;
-        }
-        if request.security.is_some() {
-            valid |= CONNECT_WPA_IE_VALID
-                | CONNECT_WPA_VERSIONS_VALID
-                | CONNECT_PAIRWISE_VALID
-                | CONNECT_GROUP_VALID
-                | CONNECT_AKM_VALID
-                | CONNECT_MFP_VALID
-                | CONNECT_SECURITY_VALID;
-        }
-        writer.u32(valid)?;
-        writer.u32(request.frequency_mhz)?;
-        writer.u32(0)?;
-        writer.u32(if request.security.is_some() { WPA_VERSION_2 } else { 0 })?;
+            let mut valid = CONNECT_MAC_VALID
+                | CONNECT_FREQUENCY_VALID
+                | CONNECT_SSID_VALID
+                | CONNECT_CONTROL_PORT_ETHERTYPE_VALID
+                | CONNECT_CONTROL_PORT_NO_ENCRYPT_VALID;
+            if request.background_scan_period_s != 0 {
+                valid |= CONNECT_BG_SCAN_VALID;
+            }
+            if request.previous_bssid.is_some() {
+                valid |= CONNECT_PREVIOUS_BSSID_VALID;
+            }
+            if request.security.is_some() {
+                valid |= CONNECT_WPA_IE_VALID
+                    | CONNECT_WPA_VERSIONS_VALID
+                    | CONNECT_PAIRWISE_VALID
+                    | CONNECT_GROUP_VALID
+                    | CONNECT_AKM_VALID
+                    | CONNECT_MFP_VALID
+                    | CONNECT_SECURITY_VALID;
+            }
+            writer.u32(valid)?;
+            writer.u32(request.frequency_mhz)?;
+            writer.u32(0)?;
+            writer.u32(if request.security.is_some() {
+                WPA_VERSION_2
+            } else {
+                0
+            })?;
 
-        let pairwise = request
-            .security
-            .as_ref()
-            .map(|value| value.pairwise_ciphers)
-            .unwrap_or(&[]);
-        writer.i32(pairwise.len() as i32)?;
-        writer.fixed_u32(pairwise, MAX_PAIRWISE_CIPHERS)?;
-        writer.u32(
-            request
+            let pairwise = request
                 .security
                 .as_ref()
-                .map(|value| value.group_cipher)
-                .unwrap_or(0),
-        )?;
-        let akm = request
-            .security
-            .as_ref()
-            .map(|value| value.akm_suites)
-            .unwrap_or(&[]);
-        writer.u32(akm.len() as u32)?;
-        writer.fixed_u32(akm, MAX_AKM_SUITES)?;
-        writer.i32(
-            request
+                .map(|value| value.pairwise_ciphers)
+                .unwrap_or(&[]);
+            writer.i32(pairwise.len() as i32)?;
+            writer.fixed_u32(pairwise, MAX_PAIRWISE_CIPHERS)?;
+            writer.u32(
+                request
+                    .security
+                    .as_ref()
+                    .map(|value| value.group_cipher)
+                    .unwrap_or(0),
+            )?;
+            let akm = request
                 .security
                 .as_ref()
-                .map(|value| value.mfp as i32)
-                .unwrap_or(MfpMode::Disabled as i32),
-        )?;
-        writer.u32(0)?;
-        writer.u16(request.background_scan_period_s)?;
-        writer.bytes(&request.bssid)?;
-        writer.bytes(&[0; 6])?;
-        writer.ssid(request.ssid)?;
-        writer.ie(
-            request
+                .map(|value| value.akm_suites)
+                .unwrap_or(&[]);
+            writer.u32(akm.len() as u32)?;
+            writer.fixed_u32(akm, MAX_AKM_SUITES)?;
+            writer.i32(
+                request
+                    .security
+                    .as_ref()
+                    .map(|value| value.mfp as i32)
+                    .unwrap_or(MfpMode::Disabled as i32),
+            )?;
+            writer.u32(0)?;
+            writer.u16(request.background_scan_period_s)?;
+            writer.bytes(&request.bssid)?;
+            writer.bytes(&[0; 6])?;
+            writer.ssid(request.ssid)?;
+            writer.ie(request
                 .security
                 .as_ref()
                 .map(|value| value.rsn_information_element)
-                .unwrap_or(&[]),
-        )?;
-        writer.u32(0)?;
-        writer.u16(0)?;
-        writer.zeros(4 * 256)?;
-        writer.u16(EAPOL_ETHERTYPE)?;
-        writer.u8(1)?;
-        writer.u8(1)?;
-        writer.bytes(&request.previous_bssid.unwrap_or([0; 6]))?;
-        writer.u16(request.bss_max_idle_s)?;
-        writer.bytes(&request.previous_bssid.unwrap_or([0; 6]))
-    })
+                .unwrap_or(&[]))?;
+            writer.u32(0)?;
+            writer.u16(0)?;
+            writer.zeros(4 * 256)?;
+            writer.u16(EAPOL_ETHERTYPE)?;
+            writer.u8(1)?;
+            writer.u8(1)?;
+            writer.bytes(&request.previous_bssid.unwrap_or([0; 6]))?;
+            writer.u16(request.bss_max_idle_s)?;
+            writer.bytes(&request.previous_bssid.unwrap_or([0; 6]))
+        },
+    )
 }
 
 /// Encodes `NRF_WIFI_UMAC_CMD_NEW_KEY` or `NRF_WIFI_UMAC_CMD_DEL_KEY`.
@@ -462,9 +476,13 @@ pub fn encode_set_key(
     key: &KeyConfig<'_>,
 ) -> Result<usize, ProtocolError> {
     validate_key(key)?;
-    encode_umac(out, UmacCommand::SetKey, ifaceindex, KEY_INFO_LEN, |writer| {
-        write_key_info(writer, Some(key))
-    })
+    encode_umac(
+        out,
+        UmacCommand::SetKey,
+        ifaceindex,
+        KEY_INFO_LEN,
+        |writer| write_key_info(writer, Some(key)),
+    )
 }
 
 /// Encodes `NRF_WIFI_UMAC_CMD_SET_IFFLAGS`.
@@ -474,10 +492,16 @@ pub fn encode_interface_state(
     up: bool,
     firmware_index: i8,
 ) -> Result<usize, ProtocolError> {
-    encode_umac(out, UmacCommand::SetInterfaceFlags, ifaceindex, 5, |writer| {
-        writer.i32(if up { 1 } else { 0 })?;
-        writer.u8(firmware_index as u8)
-    })
+    encode_umac(
+        out,
+        UmacCommand::SetInterfaceFlags,
+        ifaceindex,
+        5,
+        |writer| {
+            writer.i32(if up { 1 } else { 0 })?;
+            writer.u8(firmware_index as u8)
+        },
+    )
 }
 
 /// Encodes `NRF_WIFI_UMAC_CMD_REQ_SET_REG`.
@@ -489,17 +513,25 @@ pub fn encode_set_regulatory(
     force: bool,
 ) -> Result<usize, ProtocolError> {
     if !country.iter().all(|value| value.is_ascii_alphabetic()) {
-        return Err(ProtocolError::InvalidValue(u16::from_be_bytes(country) as u32));
+        return Err(ProtocolError::InvalidValue(
+            u16::from_be_bytes(country) as u32
+        ));
     }
-    encode_umac(out, UmacCommand::RequestSetRegulatory, ifaceindex, 10, |writer| {
-        let mut valid = 1 | (1 << 1);
-        if force {
-            valid |= 1 << 2;
-        }
-        writer.u32(valid)?;
-        writer.u32(user_hint_type)?;
-        writer.bytes(&country)
-    })
+    encode_umac(
+        out,
+        UmacCommand::RequestSetRegulatory,
+        ifaceindex,
+        10,
+        |writer| {
+            let mut valid = 1 | (1 << 1);
+            if force {
+                valid |= 1 << 2;
+            }
+            writer.u32(valid)?;
+            writer.u32(user_hint_type)?;
+            writer.bytes(&country)
+        },
+    )
 }
 
 /// Encodes `NRF_WIFI_UMAC_CMD_SET_POWER_SAVE`.
@@ -599,7 +631,9 @@ fn parse_mlme<'a>(header: UmacHeader, body: &'a [u8]) -> Result<MlmeEvent<'a>, P
         signal_dbm: read_i32(body, 8),
         flags: read_u32(body, 12),
         cookie: read_u64(body, 16),
-        bssid: body[428..434].try_into().map_err(|_| ProtocolError::InvalidLength)?,
+        bssid: body[428..434]
+            .try_into()
+            .map_err(|_| ProtocolError::InvalidLength)?,
         frame: &body[28..28 + frame_len as usize],
         request_information_elements: &body[MLME_FIXED_BODY_LEN..required],
     })
@@ -634,7 +668,9 @@ fn parse_scan_result<'a>(
         seen_ms_ago: read_u32(body, 16),
         status: read_i32(body, 24),
         signal,
-        bssid: body[56..62].try_into().map_err(|_| ProtocolError::InvalidLength)?,
+        bssid: body[56..62]
+            .try_into()
+            .map_err(|_| ProtocolError::InvalidLength)?,
         beacon_interval: read_u16(body, 44),
         capability: read_u16(body, 46),
         information_elements: &body[SCAN_RESULT_FIXED_BODY_LEN..ies_end],
@@ -702,7 +738,10 @@ fn validate_key(key: &KeyConfig<'_>) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-fn write_key_info(writer: &mut Writer<'_>, key: Option<&KeyConfig<'_>>) -> Result<(), ProtocolError> {
+fn write_key_info(
+    writer: &mut Writer<'_>,
+    key: Option<&KeyConfig<'_>>,
+) -> Result<(), ProtocolError> {
     let Some(key) = key else {
         return writer.zeros(KEY_INFO_LEN);
     };
@@ -865,8 +904,8 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::protocol::{HostMessageType, encode_host_message};
     use super::*;
-    use super::super::protocol::{encode_host_message, HostMessageType};
 
     #[test]
     fn auth_and_assoc_lengths_match_the_packed_abi() {
@@ -882,7 +921,10 @@ mod tests {
             bss: BssContext::default(),
         };
         let mut bytes = [0u8; MAX_STATION_MESSAGE_LEN];
-        assert_eq!(encode_authenticate(&mut bytes, 1, &auth).unwrap(), AUTH_MESSAGE_LEN);
+        assert_eq!(
+            encode_authenticate(&mut bytes, 1, &auth).unwrap(),
+            AUTH_MESSAGE_LEN
+        );
 
         let assoc = AssociationRequest {
             frequency_mhz: 2412,
@@ -893,7 +935,10 @@ mod tests {
             previous_bssid: None,
             bss_max_idle_s: 0,
         };
-        assert_eq!(encode_associate(&mut bytes, 1, &assoc).unwrap(), ASSOC_MESSAGE_LEN);
+        assert_eq!(
+            encode_associate(&mut bytes, 1, &assoc).unwrap(),
+            ASSOC_MESSAGE_LEN
+        );
     }
 
     #[test]
@@ -901,14 +946,8 @@ mod tests {
         let key = KeyConfig::pairwise(RSN_CIPHER_CCMP_128, 0, &[0x55; 16]);
         let mut bytes = [0u8; MAX_STATION_MESSAGE_LEN];
         assert_eq!(
-            encode_key_command(
-                &mut bytes,
-                1,
-                UmacCommand::NewKey,
-                [1, 2, 3, 4, 5, 6],
-                &key,
-            )
-            .unwrap(),
+            encode_key_command(&mut bytes, 1, UmacCommand::NewKey, [1, 2, 3, 4, 5, 6], &key,)
+                .unwrap(),
             KEY_MESSAGE_LEN
         );
     }
@@ -921,11 +960,16 @@ mod tests {
             .copy_from_slice(&(UmacCommand::Associate as u32).to_le_bytes());
         payload[UMAC_HEADER_LEN + 4..].copy_from_slice(&7u32.to_le_bytes());
         let mut message = [0u8; HOST_HEADER_LEN + UMAC_HEADER_LEN + 8];
-        let len = encode_host_message(&mut message, HostMessageType::Umac, false, &payload).unwrap();
+        let len =
+            encode_host_message(&mut message, HostMessageType::Umac, false, &payload).unwrap();
         let parsed = super::super::protocol::parse_host_message(&message[..len]).unwrap();
         assert!(matches!(
             parse_control_event(parsed).unwrap(),
-            ControlEvent::CommandStatus { command: 3, status: 7, .. }
+            ControlEvent::CommandStatus {
+                command: 3,
+                status: 7,
+                ..
+            }
         ));
     }
 }

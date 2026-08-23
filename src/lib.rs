@@ -23,8 +23,8 @@ pub mod embassy;
 
 pub use bus::{Bus, SpiConfig, SpiTransport};
 pub use control::{
-    AssociationRequest, AssociationSecurity, AuthenticationRequest, AuthenticationType,
-    BssContext, ControlEvent, KeyConfig, KeyType, MfpMode, PowerSaveState,
+    AssociationRequest, AssociationSecurity, AuthenticationRequest, AuthenticationType, BssContext,
+    ControlEvent, KeyConfig, KeyType, MfpMode, PowerSaveState,
 };
 pub use data::{DataPath, ReceivedFrame, RxEventRef};
 pub use device::Device;
