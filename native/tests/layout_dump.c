@@ -31,11 +31,9 @@ int main(void)
     OFFSET(struct nrf_wifi_umac_auth_info, ssid);
     OFFSET(struct nrf_wifi_umac_auth_info, ie);
     OFFSET(struct nrf_wifi_umac_auth_info, sae);
-    OFFSET(struct nrf_wifi_umac_auth_info, bssid);
     OFFSET(struct nrf_wifi_umac_auth_info, tsf);
     OFFSET(struct nrf_wifi_umac_cmd_assoc, valid_fields);
     OFFSET(struct nrf_wifi_umac_cmd_assoc, connect_common_info);
-    OFFSET(struct nrf_wifi_umac_cmd_assoc, prev_bssid);
     OFFSET(struct nrf_wifi_connect_common_info, ssid);
     OFFSET(struct nrf_wifi_connect_common_info, wpa_ie);
     OFFSET(struct nrf_wifi_connect_common_info, ht_vht_capabilities);
