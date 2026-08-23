@@ -414,7 +414,8 @@ mod tests {
         let state = NetworkState::<8>::new([2, 0, 0, 0, 0, 1]);
         state.tx_len.store(1, Ordering::Relaxed);
         state.tx_state.store(READY, Ordering::Release);
-        let lease = state.runner().take_tx().unwrap();
+        let runner = state.runner();
+        let lease = runner.take_tx().unwrap();
         assert_eq!(lease.as_slice(), &[0]);
         lease.report(TxOutcome::Dropped);
         assert_eq!(state.tx_state.load(Ordering::Acquire), FREE);
