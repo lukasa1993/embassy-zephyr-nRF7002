@@ -23,229 +23,28 @@ jobs:
         with:
           ref: native-embassy-nrf7002
           persist-credentials: true
+          fetch-depth: 2
 
-      - name: Add mandatory external firmware trust
+      - name: Reuse the guarded firmware trust patch
         run: |
+          set -euxo pipefail
+          git show HEAD^:.github/workflows/ci.yml > /tmp/previous-ci.yml
           python3 - <<'PY'
           from pathlib import Path
 
-          firmware_path = Path("src/firmware.rs")
-          firmware = firmware_path.read_text()
-
-          marker = "const BOOT_VECTOR_VALUES: [u32; 4] = [0x3c1a_8000, 0x275a_0000, 0x0340_0008, 0];\n"
-          addition = r'''
-
-          /// External policy that authorizes one complete firmware file.
-          ///
-          /// The policy is separate from the digest stored inside the bundle.
-          /// Thus, an attacker cannot replace both the firmware bytes and the
-          /// bundle-owned digest and still pass authorization.
-          pub trait FirmwareTrustPolicy {
-              /// Authorizes the exact complete file supplied to the parser.
-              fn verify(&self, bundle: &FirmwareBundle<'_>) -> Result<(), FirmwareError>;
-          }
-
-          /// Trust policy for one externally pinned complete-file SHA-256 value.
-          #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-          pub struct PinnedFirmwareSha256 {
-              expected: [u8; 32],
-          }
-
-          impl PinnedFirmwareSha256 {
-              /// Creates a policy from a digest stored outside `nrf70.bin`.
-              pub const fn new(expected: [u8; 32]) -> Self {
-                  Self { expected }
-              }
-
-              /// Returns the configured complete-file digest.
-              pub const fn expected(&self) -> [u8; 32] {
-                  self.expected
-              }
-          }
-
-          impl FirmwareTrustPolicy for PinnedFirmwareSha256 {
-              fn verify(&self, bundle: &FirmwareBundle<'_>) -> Result<(), FirmwareError> {
-                  let actual = bundle.full_sha256();
-                  let mut difference = 0u8;
-                  for index in 0..actual.len() {
-                      difference |= actual[index] ^ self.expected[index];
-                  }
-                  if difference == 0 {
-                      Ok(())
-                  } else {
-                      Err(FirmwareError::UntrustedImage)
-                  }
-              }
-          }
-          '''
-          assert marker in firmware
-          firmware = firmware.replace(marker, marker + addition, 1)
-
-          marker = '''    /// SHA-256 integrity verification failed.
-              HashMismatch,
-          '''
-          replacement = '''    /// SHA-256 integrity verification failed.
-              HashMismatch,
-              /// The complete file did not match the external trust policy.
-              UntrustedImage,
-          '''
-          assert marker in firmware
-          firmware = firmware.replace(marker, replacement, 1)
-
-          marker = '''    /// Returns fixed metadata.
-              pub const fn header(&self) -> FirmwareHeader {
-                  self.header
-              }
-          '''
-          replacement = '''    /// Returns fixed metadata.
-              pub const fn header(&self) -> FirmwareHeader {
-                  self.header
-              }
-
-              /// Returns the exact complete file supplied to the parser.
-              pub const fn as_bytes(&self) -> &'a [u8] {
-                  self.bytes
-              }
-
-              /// Computes SHA-256 over the exact complete file.
-              pub fn full_sha256(&self) -> [u8; 32] {
-                  let digest = Sha256::digest(self.bytes);
-                  let mut output = [0u8; 32];
-                  output.copy_from_slice(&digest);
-                  output
-              }
-          '''
-          assert marker in firmware
-          firmware = firmware.replace(marker, replacement, 1)
-
-          old = '''pub async fn load<B, D>(
-              rpu: &mut Rpu<B>,
-              delay: &mut D,
-              bundle: &FirmwareBundle<'_>,
-          ) -> Result<FirmwareReport, LoadError<B::Error>>
-          where
-              B: Bus,
-              D: DelayNs,
-          {
-              bundle.verify_hash()?;
-          '''
-          new = '''pub async fn load<B, D, T>(
-              rpu: &mut Rpu<B>,
-              delay: &mut D,
-              bundle: &FirmwareBundle<'_>,
-              trust: &T,
-          ) -> Result<FirmwareReport, LoadError<B::Error>>
-          where
-              B: Bus,
-              D: DelayNs,
-              T: FirmwareTrustPolicy + ?Sized,
-          {
-              trust.verify(bundle)?;
-              bundle.verify_hash()?;
-          '''
-          assert old in firmware
-          firmware = firmware.replace(old, new, 1)
-
-          tests = r'''
-
-              #[test]
-              fn externally_pinned_digest_accepts_exact_file() {
-                  let bytes = bundle_bytes();
-                  let bundle = FirmwareBundle::parse(&bytes).unwrap();
-                  let policy = PinnedFirmwareSha256::new(bundle.full_sha256());
-                  assert_eq!(policy.verify(&bundle), Ok(()));
-              }
-
-              #[test]
-              fn external_digest_covers_header_not_only_payload() {
-                  let original = bundle_bytes();
-                  let original_bundle = FirmwareBundle::parse(&original).unwrap();
-                  let policy = PinnedFirmwareSha256::new(original_bundle.full_sha256());
-
-                  let mut substituted = original;
-                  substituted[12..16].copy_from_slice(&FEATURE_SYSTEM_WITH_RAW.to_le_bytes());
-                  let substituted_bundle = FirmwareBundle::parse(&substituted).unwrap();
-                  substituted_bundle.verify_hash().unwrap();
-                  assert_eq!(
-                      policy.verify(&substituted_bundle),
-                      Err(FirmwareError::UntrustedImage)
-                  );
-              }
-          '''
-          end = firmware.rfind("\n}")
-          assert end != -1
-          firmware = firmware[:end] + tests + firmware[end:]
-          firmware_path.write_text(firmware)
-
-          runtime_path = Path("src/runtime.rs")
-          runtime = runtime_path.read_text()
-          old = "use super::firmware::{self, FirmwareBundle, FirmwareReport, LoadError};\n"
-          new = "use super::firmware::{\n    self, FirmwareBundle, FirmwareReport, FirmwareTrustPolicy, LoadError,\n};\n"
-          assert old in runtime
-          runtime = runtime.replace(old, new, 1)
-
-          old = '''    pub async fn recover<P, D>(
-                  &mut self,
-                  platform: &mut P,
-                  delay: &mut D,
-                  bundle: &FirmwareBundle<'_>,
-                  config: &SystemInitConfig,
-              ) -> Result<FirmwareReport, RecoveryError<B::Error, P::Error>>
-              where
-                  P: Platform,
-                  D: DelayNs,
-          '''
-          new = '''    pub async fn recover<P, D, T>(
-                  &mut self,
-                  platform: &mut P,
-                  delay: &mut D,
-                  bundle: &FirmwareBundle<'_>,
-                  trust: &T,
-                  config: &SystemInitConfig,
-              ) -> Result<FirmwareReport, RecoveryError<B::Error, P::Error>>
-              where
-                  P: Platform,
-                  D: DelayNs,
-                  T: FirmwareTrustPolicy + ?Sized,
-          '''
-          assert old in runtime
-          runtime = runtime.replace(old, new, 1)
-          old = "            let report = firmware::load(self.device.rpu_mut(), delay, bundle)\n"
-          new = "            let report = firmware::load(self.device.rpu_mut(), delay, bundle, trust)\n"
-          assert old in runtime
-          runtime = runtime.replace(old, new, 1)
-          runtime_path.write_text(runtime)
-
-          lib_path = Path("src/lib.rs")
-          lib = lib_path.read_text()
-          old = "pub use firmware::{FirmwareBundle, FirmwareReport};\n"
-          new = "pub use firmware::{\n    FirmwareBundle, FirmwareReport, FirmwareTrustPolicy, PinnedFirmwareSha256,\n};\n"
-          assert old in lib
-          lib = lib.replace(old, new, 1)
-          lib_path.write_text(lib)
-
-          readme_path = Path("README.md")
-          readme = readme_path.read_text()
-          old = "The bundle SHA-256 value is an integrity check. It is not a digital signature. Get the firmware from a trusted Nordic package and protect it as part of the application image.\n"
-          new = "The bundle-owned SHA-256 value checks payload integrity. It does not authorize the file. Production boot requires a `FirmwareTrustPolicy`. Use `PinnedFirmwareSha256` with a complete-file digest stored outside `nrf70.bin`. Get the firmware from a trusted Nordic package and protect the external digest as part of the signed application image.\n"
-          assert old in readme
-          readme = readme.replace(old, new, 1)
-          readme_path.write_text(readme)
-
-          porting_path = Path("docs/PORTING.md")
-          porting = porting_path.read_text()
-          porting = porting.replace(
-              "| Firmware parse and boot | `FirmwareBundle::parse` and `firmware::load` |",
-              "| Firmware parse, trust, and boot | `FirmwareBundle::parse`, `PinnedFirmwareSha256`, and `firmware::load` |",
-              1,
+          workflow = Path('/tmp/previous-ci.yml').read_text()
+          start_marker = "          python3 - <<'PY'\n"
+          end_marker = "          PY\n\n      - name: Install Rust toolchains"
+          start = workflow.index(start_marker) + len(start_marker)
+          end = workflow.index(end_marker, start)
+          script = workflow[start:end]
+          script = '\n'.join(
+              line[10:] if line.startswith('          ') else line
+              for line in script.splitlines()
           )
-          porting = porting.replace(
-              "5. Parse the pinned Nordic firmware with `FirmwareBundle::parse`.\n6. Call `firmware::load` to reset both processors, write all four images, start LMAC and UMAC, and check their boot signatures.",
-              "5. Parse the pinned Nordic firmware with `FirmwareBundle::parse`.\n6. Create a `PinnedFirmwareSha256` value from a complete-file digest stored outside the firmware file.\n7. Call `firmware::load` with the trust policy to reset both processors, write all four images, start LMAC and UMAC, and check their boot signatures.",
-              1,
-          )
-          porting_path.write_text(porting)
+          Path('/tmp/apply_firmware_trust.py').write_text(script + '\n')
           PY
+          python3 /tmp/apply_firmware_trust.py
 
       - name: Install Rust toolchains
         run: |
@@ -256,7 +55,7 @@ jobs:
       - name: Format and verify
         run: |
           set -euxo pipefail
-          cargo +1.95.0 fmt --all
+          cargo +1.95.0 fmt --all -- --emit files
           cargo +1.95.0 test --all-features
           cargo +1.95.0 clippy --all-targets --all-features -- -D warnings
           cargo +1.95.0 check --lib --features embassy-net,wpa2 --target thumbv8m.main-none-eabihf
