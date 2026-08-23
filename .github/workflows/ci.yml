@@ -12,44 +12,88 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  NRF_WIFI_REVISION: 5046744cb4c9640eb8b11cb92f1ea0b9554c20cf
+
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the driver
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
       - name: Install the pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy --target thumbv8m.main-none-eabihf
+        run: |
+          set -euxo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy --target thumbv8m.main-none-eabihf
+
       - name: Check formatting
         run: cargo fmt --all --check
+
       - name: Run host tests
         run: cargo test --all-features
+
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
       - name: Check the no-std core
         run: cargo check --lib --no-default-features --target thumbv8m.main-none-eabihf
+
       - name: Check the no-std Embassy adapter
         run: cargo check --lib --features embassy-net --target thumbv8m.main-none-eabihf
+
       - name: Check documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --all-features --no-deps
+        run: cargo doc --lib --all-features --no-deps
+
+  msrv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the driver
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        run: |
+          set -euxo pipefail
+          rustup toolchain install 1.85.0 --profile minimal --target thumbv8m.main-none-eabihf
+
+      - name: Check the core at the minimum Rust version
+        run: cargo +1.85.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
+
+      - name: Check the Embassy adapter at the minimum Rust version
+        run: cargo +1.85.0 check --lib --features embassy-net --target thumbv8m.main-none-eabihf
 
   nordic-layout:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - name: Fetch the pinned Nordic host interface
-        run: |
-          git init /tmp/nrf_wifi
-          git -C /tmp/nrf_wifi remote add origin https://github.com/zephyrproject-rtos/nrf_wifi.git
-          git -C /tmp/nrf_wifi fetch --depth 1 origin 5046744cb4c9640eb8b11cb92f1ea0b9554c20cf
-          git -C /tmp/nrf_wifi checkout --detach FETCH_HEAD
+      - name: Check out the driver
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check out the pinned Nordic host interface
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: zephyrproject-rtos/nrf_wifi
+          ref: ${{ env.NRF_WIFI_REVISION }}
+          path: nrf_wifi
+          persist-credentials: false
+
       - name: Check packed sizes and offsets
         run: |
+          set -euxo pipefail
           cc -std=c11 -Wall -Wextra -Werror \
-            -I/tmp/nrf_wifi/fw_if/umac_if/inc \
-            -I/tmp/nrf_wifi/fw_if/umac_if/inc/fw \
-            -I/tmp/nrf_wifi/hw_if/hal/inc \
+            -I nrf_wifi/fw_if/umac_if/inc \
+            -I nrf_wifi/fw_if/umac_if/inc/fw \
+            -I nrf_wifi/hw_if/hal/inc \
             tests/layout_probe.c \
             -o /tmp/nrf7002-layout-probe
           /tmp/nrf7002-layout-probe
