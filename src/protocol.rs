@@ -291,12 +291,12 @@ pub enum UmacEvent {
     NewInterface = 281,
     GetInterfaceHardwareAddress = 283,
     GetRegulatory = 284,
-    ScanDisplayResult = 292,
-    CommandStatus = 293,
-    BssInfo = 294,
-    TwtConfigured = 295,
-    TwtTornDown = 296,
-    TwtSleep = 297,
+    ScanDisplayResult = 291,
+    CommandStatus = 292,
+    BssInfo = 293,
+    TwtConfigured = 294,
+    TwtTornDown = 295,
+    TwtSleep = 296,
 }
 
 /// Encodes a raw UMAC command body behind the fixed header.
@@ -802,7 +802,7 @@ pub fn encode_deauthenticate(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum DataCommand {
-    ManagementConfiguration = 0,
+    ManagementBufferConfig = 0,
     TransmitBuffer = 1,
     TransmitDone = 2,
     ReceiveBuffer = 3,
