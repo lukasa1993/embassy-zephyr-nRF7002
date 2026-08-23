@@ -31,7 +31,13 @@ jobs:
           ref: ${{ env.TARGET_BRANCH }}
       - name: Rebuild and verify source archive
         run: |
-          cat .native-bootstrap/part-* | base64 --decode > /tmp/native-bootstrap.tar.gz
+          cat \
+            .native-bootstrap/part-00 \
+            .native-bootstrap/part-01 \
+            .native-bootstrap/part-02 \
+            .native-bootstrap/part-03 \
+            .native-bootstrap/part-04 \
+            | base64 --decode > /tmp/native-bootstrap.tar.gz
           echo '8d8d79c3ff5cda36f470792af0bd5e9629b4547779b5fb3a411d087969736c01  /tmp/native-bootstrap.tar.gz' | sha256sum --check
           tar -tzf /tmp/native-bootstrap.tar.gz
       - name: Materialize normal repository files
