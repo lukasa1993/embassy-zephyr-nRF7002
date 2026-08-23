@@ -9,7 +9,7 @@ This crate contains a low-level driver core. It does not contain a complete boar
 | SPI device with chip select | `SpiTransport<SPI>` and the `Bus` trait |
 | RPU register and memory access | `Rpu<B>` |
 | Delay for reset, wake, and boot | `embedded_hal_async::delay::DelayNs` |
-| Firmware parse and boot | `FirmwareBundle::parse` and `firmware::load` |
+| Firmware parse, trust, and boot | `FirmwareBundle::parse`, `PinnedFirmwareSha256`, and `firmware::load` |
 | Queue and interrupt control | `Device<B>` |
 | RX and TX packet RAM | `DataPath<RX, TX>` |
 | Embassy network queue | `NetworkState`, `NetworkDriver`, and `NetworkRunner` with the `embassy-net` feature |
@@ -25,7 +25,8 @@ Use this order as the integration baseline:
 3. Create `SpiTransport::new(spi)` and then `Rpu::new(transport)`.
 4. Use the RPU wake and status methods with a bounded delay policy.
 5. Parse the pinned Nordic firmware with `FirmwareBundle::parse`.
-6. Call `firmware::load` to reset both processors, write all four images, start LMAC and UMAC, and check their boot signatures.
+6. Create a `PinnedFirmwareSha256` value from a complete-file digest stored outside the firmware file.
+7. Call `firmware::load` with the trust policy to reset both processors, write all four images, start LMAC and UMAC, and check their boot signatures.
 7. Move the bus into `Device::new`, then call `initialize_queues` and `enable_interrupts`.
 8. Create a `DataPath<RX, TX>` that matches the RX pool and frame sizes in `SystemInitConfig`.
 9. Send system initialization and wait for a successful firmware result before you post normal traffic.

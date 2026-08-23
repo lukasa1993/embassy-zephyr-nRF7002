@@ -51,7 +51,7 @@ nrf_wifi/bin/zephyr/default/nrf70.bin
 
 The path name comes from the Nordic firmware package. The driver does not use Zephyr. The firmware file is not stored in this repository. The application can include it after it accepts the Nordic firmware license.
 
-The bundle SHA-256 value is an integrity check. It is not a digital signature. Get the firmware from a trusted Nordic package and protect it as part of the application image.
+The bundle-owned SHA-256 value checks payload integrity. It does not authorize the file. Production boot requires a `FirmwareTrustPolicy`. Use `PinnedFirmwareSha256` with a complete-file digest stored outside `nrf70.bin`. Get the firmware from a trusted Nordic package and protect the external digest as part of the signed application image.
 
 ## Board contract
 

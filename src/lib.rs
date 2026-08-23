@@ -40,7 +40,7 @@ pub use control::{
 };
 pub use data::{DataPath, ReceivedFrame, RxEventRef, TxDoneEventRef};
 pub use device::Device;
-pub use firmware::{FirmwareBundle, FirmwareReport};
+pub use firmware::{FirmwareBundle, FirmwareReport, FirmwareTrustPolicy, PinnedFirmwareSha256};
 pub use memory::{Processor, Rpu};
 pub use protocol::{ScanRequest, SystemInitConfig};
 pub use runtime::{DriverError, DriverEvent, DriverState, NativeDriver, Platform, RecoveryError};

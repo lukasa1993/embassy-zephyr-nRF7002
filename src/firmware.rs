@@ -38,6 +38,49 @@ const LMAC_BOOT_VECTOR_REGISTERS: [u32; 4] = [0xa400_0050, 0xa400_0054, 0xa400_0
 const UMAC_BOOT_VECTOR_REGISTERS: [u32; 4] = [0xa400_0150, 0xa400_0154, 0xa400_0158, 0xa400_015c];
 const BOOT_VECTOR_VALUES: [u32; 4] = [0x3c1a_8000, 0x275a_0000, 0x0340_0008, 0];
 
+/// External policy that authorizes one complete firmware file.
+///
+/// The policy is separate from the digest stored inside the bundle.
+/// Thus, an attacker cannot replace both the firmware bytes and the
+/// bundle-owned digest and still pass authorization.
+pub trait FirmwareTrustPolicy {
+    /// Authorizes the exact complete file supplied to the parser.
+    fn verify(&self, bundle: &FirmwareBundle<'_>) -> Result<(), FirmwareError>;
+}
+
+/// Trust policy for one externally pinned complete-file SHA-256 value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinnedFirmwareSha256 {
+    expected: [u8; 32],
+}
+
+impl PinnedFirmwareSha256 {
+    /// Creates a policy from a digest stored outside `nrf70.bin`.
+    pub const fn new(expected: [u8; 32]) -> Self {
+        Self { expected }
+    }
+
+    /// Returns the configured complete-file digest.
+    pub const fn expected(&self) -> [u8; 32] {
+        self.expected
+    }
+}
+
+impl FirmwareTrustPolicy for PinnedFirmwareSha256 {
+    fn verify(&self, bundle: &FirmwareBundle<'_>) -> Result<(), FirmwareError> {
+        let actual = bundle.full_sha256();
+        let mut difference = 0u8;
+        for (actual_byte, expected_byte) in actual.iter().zip(self.expected.iter()) {
+            difference |= *actual_byte ^ *expected_byte;
+        }
+        if difference == 0 {
+            Ok(())
+        } else {
+            Err(FirmwareError::UntrustedImage)
+        }
+    }
+}
+
 /// Structural or compatibility failure in a firmware bundle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FirmwareError {
@@ -61,6 +104,8 @@ pub enum FirmwareError {
     LengthMismatch,
     /// SHA-256 integrity verification failed.
     HashMismatch,
+    /// The complete file did not match the external trust policy.
+    UntrustedImage,
 }
 
 /// Failure while downloading or starting firmware.
@@ -200,6 +245,19 @@ impl<'a> FirmwareBundle<'a> {
         self.header
     }
 
+    /// Returns the exact complete file supplied to the parser.
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Computes SHA-256 over the exact complete file.
+    pub fn full_sha256(&self) -> [u8; 32] {
+        let digest = Sha256::digest(self.bytes);
+        let mut output = [0u8; 32];
+        output.copy_from_slice(&digest);
+        output
+    }
+
     /// Verifies the SHA-256 digest stored in the bundle.
     pub fn verify_hash(&self) -> Result<(), FirmwareError> {
         let digest = Sha256::digest(&self.bytes[PATCH_HEADER_LEN..self.payload_end]);
@@ -273,15 +331,18 @@ pub struct FirmwareReport {
 }
 
 /// Resets both processors, downloads all images, boots LMAC then UMAC, and checks signatures.
-pub async fn load<B, D>(
+pub async fn load<B, D, T>(
     rpu: &mut Rpu<B>,
     delay: &mut D,
     bundle: &FirmwareBundle<'_>,
+    trust: &T,
 ) -> Result<FirmwareReport, LoadError<B::Error>>
 where
     B: Bus,
     D: DelayNs,
+    T: FirmwareTrustPolicy + ?Sized,
 {
+    trust.verify(bundle)?;
     bundle.verify_hash()?;
     rpu.reset_processor(Processor::Lmac, delay).await?;
     rpu.reset_processor(Processor::Umac, delay).await?;
@@ -398,5 +459,29 @@ mod tests {
         bytes[PATCH_HEADER_LEN + IMAGE_HEADER_LEN] ^= 0x80;
         let bundle = FirmwareBundle::parse(&bytes).unwrap();
         assert_eq!(bundle.verify_hash(), Err(FirmwareError::HashMismatch));
+    }
+
+    #[test]
+    fn externally_pinned_digest_accepts_exact_file() {
+        let bytes = bundle_bytes();
+        let bundle = FirmwareBundle::parse(&bytes).unwrap();
+        let policy = PinnedFirmwareSha256::new(bundle.full_sha256());
+        assert_eq!(policy.verify(&bundle), Ok(()));
+    }
+
+    #[test]
+    fn external_digest_covers_header_not_only_payload() {
+        let original = bundle_bytes();
+        let original_bundle = FirmwareBundle::parse(&original).unwrap();
+        let policy = PinnedFirmwareSha256::new(original_bundle.full_sha256());
+
+        let mut substituted = original;
+        substituted[12..16].copy_from_slice(&FEATURE_SYSTEM_WITH_RAW.to_le_bytes());
+        let substituted_bundle = FirmwareBundle::parse(&substituted).unwrap();
+        substituted_bundle.verify_hash().unwrap();
+        assert_eq!(
+            policy.verify(&substituted_bundle),
+            Err(FirmwareError::UntrustedImage)
+        );
     }
 }

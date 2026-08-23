@@ -9,7 +9,7 @@ use super::data::{
     TxDoneEventRef, classify_data_event,
 };
 use super::device::{Device, DeviceError};
-use super::firmware::{self, FirmwareBundle, FirmwareReport, LoadError};
+use super::firmware::{self, FirmwareBundle, FirmwareReport, FirmwareTrustPolicy, LoadError};
 use super::protocol::{HostMessageRef, HostMessageType, ProtocolError, SystemInitConfig};
 use super::station::{StationController, StationError};
 use super::system::{SystemEvent, parse_system_event};
@@ -198,16 +198,18 @@ where
     ///
     /// The driver enters [`DriverState::WaitingForSystemInit`]. It becomes
     /// ready only after [`SystemEvent::InitDone`] is received and dispatched.
-    pub async fn recover<P, D>(
+    pub async fn recover<P, D, T>(
         &mut self,
         platform: &mut P,
         delay: &mut D,
         bundle: &FirmwareBundle<'_>,
+        trust: &T,
         config: &SystemInitConfig,
     ) -> Result<FirmwareReport, RecoveryError<B::Error, P::Error>>
     where
         P: Platform,
         D: DelayNs,
+        T: FirmwareTrustPolicy + ?Sized,
     {
         self.state = DriverState::Recovering;
         self.station.begin_recovery();
@@ -236,7 +238,7 @@ where
                 .await
                 .map_err(RecoveryError::Platform)?;
 
-            let report = firmware::load(self.device.rpu_mut(), delay, bundle)
+            let report = firmware::load(self.device.rpu_mut(), delay, bundle, trust)
                 .await
                 .map_err(DriverError::from)?;
             self.device
