@@ -13,7 +13,7 @@ use super::protocol::{InterfaceType, MAX_CONTROL_MESSAGE_LEN, SYSTEM_INIT_LEN};
 pub const RPU_MEM_HPQ_INFO: u32 = 0xb000_0024;
 /// LMAC RX command-slot base pointer.
 pub const RPU_MEM_RX_CMD_BASE: u32 = 0xb700_0d58;
-/// UMAC TX command-slot base pointer.
+/// Fixed UMAC TX command-slot base.
 pub const RPU_MEM_TX_CMD_BASE: u32 = 0xb000_00b8;
 /// Root interrupt mask register.
 pub const RPU_REG_INT_FROM_RPU_CTRL: u32 = 0xa400_0400;
@@ -29,10 +29,12 @@ pub const RPU_INTERRUPT_ROOT_BIT: u32 = 1 << 17;
 pub const RPU_INTERRUPT_MCU_BIT: u32 = 1 << 31;
 /// Command counter synchronization value used by Nordic's HAL.
 pub const RPU_COMMAND_COUNTER_START: u32 = 0xdead;
-/// Nordic's default command/event fragment limit.
+/// Nordic's default command-buffer fragment limit.
 pub const DEFAULT_CONTROL_FRAGMENT_LEN: usize = 400;
+/// Largest event fragment in Nordic's pinned host interface.
+pub const MAX_EVENT_FRAGMENT_LEN: usize = 1000;
 /// Nordic's default event-pool fragment limit.
-pub const DEFAULT_EVENT_FRAGMENT_LEN: usize = 1000;
+pub const DEFAULT_EVENT_FRAGMENT_LEN: usize = MAX_EVENT_FRAGMENT_LEN;
 
 /// Native queue-controller failure.
 #[derive(Debug)]
@@ -47,8 +49,8 @@ pub enum DeviceError<E> {
     InvalidQueueMap,
     /// No command buffer is currently available.
     CommandQueueEmpty,
-    /// An event started but not all fragments were present.
-    IncompleteEvent,
+    /// A caller changed the scratch buffer during fragmented-event assembly.
+    EventBufferChanged,
     /// The event is larger than caller storage.
     EventTooLarge { declared: usize, capacity: usize },
 }
@@ -69,6 +71,15 @@ impl<E> From<ProtocolError> for DeviceError<E> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FragmentLimitError;
 
+#[derive(Clone, Copy, Debug)]
+struct PendingEvent {
+    declared: usize,
+    copied: usize,
+    resubmit: bool,
+    scratch_address: usize,
+    discard: bool,
+}
+
 /// Owns the direct RPU access path and firmware-published hardware queues.
 pub struct Device<B> {
     rpu: Rpu<B>,
@@ -78,6 +89,7 @@ pub struct Device<B> {
     command_counter: u32,
     command_fragment_len: usize,
     event_fragment_len: usize,
+    pending_event: Option<PendingEvent>,
 }
 
 impl<B> Device<B> {
@@ -91,6 +103,7 @@ impl<B> Device<B> {
             command_counter: RPU_COMMAND_COUNTER_START,
             command_fragment_len: DEFAULT_CONTROL_FRAGMENT_LEN,
             event_fragment_len: DEFAULT_EVENT_FRAGMENT_LEN,
+            pending_event: None,
         }
     }
 
@@ -118,7 +131,7 @@ impl<B> Device<B> {
         }
     }
 
-    /// Returns the UMAC TX command-slot base.
+    /// Returns the fixed UMAC TX command-slot base after initialization.
     pub const fn tx_command_base(&self) -> Option<u32> {
         if self.tx_command_base == 0 {
             None
@@ -134,13 +147,27 @@ impl<B> Device<B> {
         event_len: usize,
     ) -> Result<(), FragmentLimitError> {
         if !(HOST_MESSAGE_HEADER_LEN..=MAX_CONTROL_MESSAGE_LEN).contains(&command_len)
-            || event_len < HOST_MESSAGE_HEADER_LEN
+            || !(HOST_MESSAGE_HEADER_LEN..=MAX_EVENT_FRAGMENT_LEN).contains(&event_len)
         {
             return Err(FragmentLimitError);
         }
         self.command_fragment_len = command_len;
         self.event_fragment_len = event_len;
         Ok(())
+    }
+
+    /// Marks a partly assembled event for discard.
+    ///
+    /// The next calls to [`Device::try_read_event`] remove its remaining
+    /// fragments before they read a new event.
+    pub fn discard_pending_event(&mut self) -> bool {
+        let Some(mut pending) = self.pending_event else {
+            return false;
+        };
+        pending.discard = true;
+        pending.scratch_address = 0;
+        self.pending_event = Some(pending);
+        true
     }
 }
 
@@ -163,18 +190,17 @@ where
             .rpu
             .read_u32(Processor::Lmac, RPU_MEM_RX_CMD_BASE)
             .await?;
-        let tx_command_base = self
-            .rpu
-            .read_u32(Processor::Umac, RPU_MEM_TX_CMD_BASE)
-            .await?;
-        if rx_command_base == 0 || tx_command_base == 0 {
+        if rx_command_base == 0 {
             return Err(DeviceError::InvalidQueueMap);
         }
 
+        // Nordic's pinned HAL uses RPU_MEM_TX_CMD_BASE as the command area
+        // itself. It does not read a pointer from that address.
         self.queues = Some(queues);
         self.rx_command_base = rx_command_base;
-        self.tx_command_base = tx_command_base;
+        self.tx_command_base = RPU_MEM_TX_CMD_BASE;
         self.command_counter = RPU_COMMAND_COUNTER_START;
+        self.pending_event = None;
         Ok(queues)
     }
 
@@ -298,64 +324,133 @@ where
 
     /// Reads and reassembles one queued event into caller storage.
     ///
-    /// `Ok(None)` means that the event queue was empty. After the first
-    /// fragment is removed, every remaining fragment must already be queued.
+    /// `Ok(None)` means that no complete event is available. It can also mean
+    /// that a fragmented event is waiting for its next fragment. Keep the same
+    /// scratch buffer unchanged until that event completes. If the buffer must
+    /// change, call [`Device::discard_pending_event`] first.
+    ///
+    /// An oversized event is removed over this call and later calls. The first
+    /// call returns [`DeviceError::EventTooLarge`]. Later calls discard the
+    /// remaining fragments before they read a new event.
     pub async fn try_read_event<'a>(
         &mut self,
         scratch: &'a mut [u8],
     ) -> Result<Option<HostMessageRef<'a>>, DeviceError<B::Error>> {
         let queues = self.queues.ok_or(DeviceError::NotInitialized)?;
-        let Some(mut event_address) = self.dequeue(queues.event_busy).await? else {
-            return Ok(None);
-        };
 
-        let mut header = [0u8; HOST_MESSAGE_HEADER_LEN];
-        self.rpu
-            .read(Processor::Umac, event_address, &mut header)
-            .await?;
-        let declared = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        let resubmit = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) != 0;
+        loop {
+            if let Some(mut pending) = self.pending_event {
+                if !pending.discard
+                    && (pending.scratch_address != scratch.as_mut_ptr() as usize
+                        || scratch.len() < pending.declared)
+                {
+                    pending.discard = true;
+                    pending.scratch_address = 0;
+                    self.pending_event = Some(pending);
+                    return Err(DeviceError::EventBufferChanged);
+                }
 
-        if declared < HOST_MESSAGE_HEADER_LEN {
-            self.release_event_fragment(queues, event_address, resubmit)
+                let mut removed_fragment = false;
+                while pending.copied < pending.declared {
+                    let Some(event_address) = self.dequeue(queues.event_busy).await? else {
+                        self.pending_event = Some(pending);
+                        if removed_fragment {
+                            self.acknowledge_interrupt().await?;
+                        }
+                        return Ok(None);
+                    };
+                    let count = core::cmp::min(
+                        self.event_fragment_len,
+                        pending.declared - pending.copied,
+                    );
+                    if !pending.discard {
+                        self.rpu
+                            .read(
+                                Processor::Umac,
+                                event_address,
+                                &mut scratch[pending.copied..pending.copied + count],
+                            )
+                            .await?;
+                    }
+                    self.release_event_fragment(queues, event_address, pending.resubmit)
+                        .await?;
+                    pending.copied += count;
+                    removed_fragment = true;
+                }
+
+                self.pending_event = None;
+                if removed_fragment {
+                    self.acknowledge_interrupt().await?;
+                }
+                if pending.discard {
+                    continue;
+                }
+                return Ok(Some(parse_host_message(&scratch[..pending.declared])?));
+            }
+
+            let Some(event_address) = self.dequeue(queues.event_busy).await? else {
+                return Ok(None);
+            };
+
+            let mut header = [0u8; HOST_MESSAGE_HEADER_LEN];
+            self.rpu
+                .read(Processor::Umac, event_address, &mut header)
                 .await?;
-            self.acknowledge_interrupt().await?;
-            return Err(DeviceError::Protocol(ProtocolError::InvalidLength));
-        }
-        if declared > scratch.len() {
-            self.release_event_fragment(queues, event_address, resubmit)
-                .await?;
-            self.acknowledge_interrupt().await?;
-            return Err(DeviceError::EventTooLarge {
-                declared,
-                capacity: scratch.len(),
-            });
-        }
+            let declared =
+                u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+            let resubmit = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) != 0;
 
-        let mut copied = 0usize;
-        while copied < declared {
-            let count = core::cmp::min(self.event_fragment_len, declared - copied);
+            if declared < HOST_MESSAGE_HEADER_LEN {
+                self.release_event_fragment(queues, event_address, resubmit)
+                    .await?;
+                self.acknowledge_interrupt().await?;
+                return Err(DeviceError::Protocol(ProtocolError::InvalidLength));
+            }
+
+            let first_count = core::cmp::min(self.event_fragment_len, declared);
+            if declared > scratch.len() {
+                self.release_event_fragment(queues, event_address, resubmit)
+                    .await?;
+                if first_count < declared {
+                    self.pending_event = Some(PendingEvent {
+                        declared,
+                        copied: first_count,
+                        resubmit,
+                        scratch_address: 0,
+                        discard: true,
+                    });
+                }
+                self.acknowledge_interrupt().await?;
+                return Err(DeviceError::EventTooLarge {
+                    declared,
+                    capacity: scratch.len(),
+                });
+            }
+
             self.rpu
                 .read(
                     Processor::Umac,
                     event_address,
-                    &mut scratch[copied..copied + count],
+                    &mut scratch[..first_count],
                 )
                 .await?;
             self.release_event_fragment(queues, event_address, resubmit)
                 .await?;
-            copied += count;
-            if copied < declared {
-                let Some(next) = self.dequeue(queues.event_busy).await? else {
-                    self.acknowledge_interrupt().await?;
-                    return Err(DeviceError::IncompleteEvent);
-                };
-                event_address = next;
-            }
-        }
+            self.acknowledge_interrupt().await?;
 
-        self.acknowledge_interrupt().await?;
-        Ok(Some(parse_host_message(&scratch[..declared])?))
+            if first_count == declared {
+                return Ok(Some(parse_host_message(&scratch[..declared])?));
+            }
+
+            self.pending_event = Some(PendingEvent {
+                declared,
+                copied: first_count,
+                resubmit,
+                scratch_address: scratch.as_mut_ptr() as usize,
+                discard: false,
+            });
+            return Ok(None);
+        }
     }
 
     async fn release_event_fragment(
@@ -486,5 +581,39 @@ mod tests {
         let len = encode_host_message(&mut bytes, HostMessageType::System, false, &[1, 2]).unwrap();
         assert!(validate_complete_message::<()>(&bytes[..len]).is_ok());
         assert!(validate_complete_message::<()>(&bytes[..len - 1]).is_err());
+    }
+
+    #[test]
+    fn event_fragment_limit_matches_nordic_pool() {
+        let mut device = Device::new(());
+        assert!(
+            device
+                .set_fragment_limits(DEFAULT_CONTROL_FRAGMENT_LEN, MAX_EVENT_FRAGMENT_LEN)
+                .is_ok()
+        );
+        assert!(
+            device
+                .set_fragment_limits(DEFAULT_CONTROL_FRAGMENT_LEN, MAX_EVENT_FRAGMENT_LEN + 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pending_event_can_be_changed_to_discard() {
+        let mut device = Device::new(());
+        device.pending_event = Some(PendingEvent {
+            declared: 2000,
+            copied: 1000,
+            resubmit: true,
+            scratch_address: 1,
+            discard: false,
+        });
+        assert!(device.discard_pending_event());
+        assert!(device.pending_event.unwrap().discard);
+    }
+
+    #[test]
+    fn tx_command_area_is_a_fixed_address() {
+        assert_eq!(RPU_MEM_TX_CMD_BASE, 0xb000_00b8);
     }
 }
