@@ -1,7 +1,7 @@
 //! Native packet-RAM allocator and nRF70 data descriptors.
 
 use super::bus::Bus;
-use super::device::{Device, DeviceError};
+use super::device::{Device, DeviceError, RPU_MEM_TX_CMD_BASE};
 use super::memory::{Processor, RPU_ADDR_MASK_OFFSET, RPU_MCU_CORE_INDIRECT_BASE, RpuError};
 use super::protocol::{HOST_MESSAGE_HEADER_LEN, HostMessageRef, HostMessageType};
 
@@ -19,6 +19,9 @@ pub const TX_BUFFER_HEADROOM: usize = 52;
 pub const RX_COMMAND_SLOT_SIZE: u32 = 8;
 /// Bytes between UMAC TX command slots.
 pub const TX_COMMAND_SLOT_SIZE: u32 = 148;
+/// Maximum number of TX command slots before packet data starts.
+pub const MAX_TX_TOKENS: usize =
+    ((RPU_MEM_PACKET_BASE - RPU_MEM_TX_CMD_BASE) / TX_COMMAND_SLOT_SIZE) as usize;
 /// Ethernet header bytes.
 pub const ETHERNET_HEADER_LEN: usize = 14;
 /// EAPOL EtherType.
@@ -69,7 +72,7 @@ impl RxPayloadType {
 /// Data-path configuration error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataLayoutError {
-    /// A pool has zero capacity or exceeds a wire field.
+    /// A pool has zero capacity or exceeds a wire or command-area limit.
     InvalidCapacity,
     /// Configured TX and RX storage overlap in packet RAM.
     PacketRamExhausted,
@@ -257,7 +260,7 @@ impl<const RX: usize, const TX: usize> DataPath<RX, TX> {
         if RX == 0
             || TX == 0
             || RX > u16::MAX as usize
-            || TX > u8::MAX as usize
+            || TX > MAX_TX_TOKENS
             || rx_buffer_size == 0
             || tx_buffer_size < ETHERNET_HEADER_LEN
             || rx_buffer_size > u16::MAX as usize
@@ -678,7 +681,7 @@ fn ieee80211_addresses(
             }
             let mut address4 = [0u8; 6];
             address4.copy_from_slice(&frame[24..30]);
-            Ok((address1, address4))
+            Ok((address3, address4))
         }
         (false, true) => Ok((address1, address3)),
         (true, false) => Ok((address3, address2)),
@@ -778,6 +781,16 @@ mod tests {
     }
 
     #[test]
+    fn tx_command_slots_stop_before_packet_data() {
+        assert_eq!(MAX_TX_TOKENS, 137);
+        assert!(DataPath::<137, 137>::new(1, ETHERNET_HEADER_LEN).is_ok());
+        assert_eq!(
+            DataPath::<1, 138>::new(1, ETHERNET_HEADER_LEN).err(),
+            Some(DataLayoutError::InvalidCapacity)
+        );
+    }
+
+    #[test]
     fn tx_command_has_exact_packed_layout() {
         let mut frame = [0u8; ETHERNET_HEADER_LEN];
         frame[0..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
@@ -806,6 +819,24 @@ mod tests {
         assert_eq!(len, 18);
         assert_eq!(&frame[0..6], &[1; 6]);
         assert_eq!(&frame[6..12], &[3; 6]);
+        assert_eq!(&frame[12..14], &[0x08, 0x00]);
+        assert_eq!(&frame[14..18], &[9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn converts_four_address_mpdu_to_ethernet() {
+        let mut frame = [0u8; 64];
+        frame[0..2].copy_from_slice(&0x0308u16.to_le_bytes());
+        frame[4..10].copy_from_slice(&[1; 6]);
+        frame[10..16].copy_from_slice(&[2; 6]);
+        frame[16..22].copy_from_slice(&[3; 6]);
+        frame[24..30].copy_from_slice(&[4; 6]);
+        frame[30..38].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x08, 0x00]);
+        frame[38..42].copy_from_slice(&[9, 8, 7, 6]);
+        let len = convert_mpdu(&mut frame[..42], 30).unwrap();
+        assert_eq!(len, 18);
+        assert_eq!(&frame[0..6], &[3; 6]);
+        assert_eq!(&frame[6..12], &[4; 6]);
         assert_eq!(&frame[12..14], &[0x08, 0x00]);
         assert_eq!(&frame[14..18], &[9, 8, 7, 6]);
     }
