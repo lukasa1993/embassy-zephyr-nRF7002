@@ -424,6 +424,11 @@ impl Wpa2Supplicant {
         self.phase
     }
 
+    /// Returns the configured supplicant address.
+    pub const fn local(&self) -> [u8; 6] {
+        self.local
+    }
+
     /// Returns the configured authenticator address.
     pub const fn peer(&self) -> [u8; 6] {
         self.peer

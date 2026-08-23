@@ -134,6 +134,20 @@ impl StationController {
             )
     }
 
+    /// Restores connected state after a successful group-key rekey.
+    pub fn complete_group_rekey(&mut self) -> StationState {
+        self.state = if self.secure_connection && self.controlled_port_authorized {
+            if self.carrier_on {
+                StationState::Connected
+            } else {
+                StationState::AwaitingCarrier
+            }
+        } else {
+            StationState::Fault
+        };
+        self.state
+    }
+
     /// Enters recovery and clears all connection ownership.
     pub fn begin_recovery(&mut self) {
         self.state = StationState::Recovering;
@@ -335,7 +349,11 @@ impl StationController {
         B: Bus,
         D: DelayNs,
     {
-        self.require_one_of(&[StationState::Securing, StationState::Authorizing])?;
+        self.require_one_of(&[
+            StationState::Securing,
+            StationState::Authorizing,
+            StationState::Connected,
+        ])?;
         let peer = self
             .peer
             .ok_or(StationError::Fault(StationFault::PeerMismatch))?;

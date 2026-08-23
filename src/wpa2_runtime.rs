@@ -152,7 +152,7 @@ impl Wpa2Runtime {
     }
 
     /// Starts a new pairwise handshake with a fresh CSPRNG nonce.
-    pub fn restart_pairwise(&mut self, supplicant_nonce: [u8; 32]) -> Result<(), Wpa2RuntimeError<()>> {
+    pub fn restart_pairwise(&mut self, supplicant_nonce: [u8; 32]) -> Result<(), Wpa2Error> {
         self.supplicant.restart_pairwise(supplicant_nonce)?;
         self.pairwise_install = None;
         self.group_install = None;
@@ -186,7 +186,12 @@ impl Wpa2Runtime {
         }
 
         let was_complete = self.supplicant.phase() == Wpa2Phase::Complete;
-        match self.supplicant.on_eapol(self.supplicant.peer(), payload)? {
+        let peer = self.supplicant.peer();
+        let action = match self.supplicant.on_eapol(peer, payload) {
+            Ok(action) => action,
+            Err(error) => return self.fail(driver, Wpa2RuntimeError::Wpa2(error)),
+        };
+        match action {
             Wpa2Action::None => Ok(Wpa2Progress::NoChange),
             Wpa2Action::Transmit(response) => {
                 let purpose = if was_complete {
@@ -327,7 +332,12 @@ impl Wpa2Runtime {
                 self.state = Wpa2RuntimeState::AwaitingAuthorizationStatus;
                 Ok(Wpa2Progress::AuthorizationSubmitted)
             }
-            EapolTransmitPurpose::GroupMessage2 | EapolTransmitPurpose::Retransmission => {
+            EapolTransmitPurpose::GroupMessage2 => {
+                driver.station_mut().complete_group_rekey();
+                self.state = Wpa2RuntimeState::Complete;
+                Ok(Wpa2Progress::Complete)
+            }
+            EapolTransmitPurpose::Retransmission => {
                 self.state = Wpa2RuntimeState::Complete;
                 Ok(Wpa2Progress::Complete)
             }
@@ -521,7 +531,10 @@ impl Wpa2Runtime {
         &mut self,
         driver: &mut NativeDriver<B, RX, TX>,
         error: Wpa2RuntimeError<B::Error>,
-    ) -> Result<T, Wpa2RuntimeError<B::Error>> {
+    ) -> Result<T, Wpa2RuntimeError<B::Error>>
+    where
+        B: Bus,
+    {
         if let Some(request) = self.pairwise_install.take() {
             let _ = self.supplicant.complete_key_install(request, false);
         }

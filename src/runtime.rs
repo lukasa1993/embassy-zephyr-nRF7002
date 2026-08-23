@@ -6,7 +6,7 @@ use super::bus::Bus;
 use super::control::{ControlEvent, parse_control_event};
 use super::data::{
     DataError, DataEvent, DataLayoutError, DataPath, DataProtocolError, ReceivedFrame, RxEventRef,
-    classify_data_event,
+    TxDoneEventRef, classify_data_event,
 };
 use super::device::{Device, DeviceError};
 use super::firmware::{self, FirmwareBundle, FirmwareReport, LoadError};
@@ -43,6 +43,7 @@ pub enum DriverEvent<'a> {
     System(SystemEvent<'a>),
     Control(ControlEvent<'a>),
     Data(DataEvent),
+    TransmitDone(TxDoneEventRef<'a>),
     Receive(RxEventRef<'a>),
     Supplicant(&'a [u8]),
 }
@@ -170,6 +171,17 @@ impl<B, const RX: usize, const TX: usize> NativeDriver<B, RX, TX> {
     /// Borrows the station state machine.
     pub fn station_mut(&mut self) -> &mut StationController {
         &mut self.station
+    }
+
+    /// Splits the device and station fields for an in-crate security coordinator.
+    pub(crate) fn security_parts_mut(&mut self) -> (&mut Device<B>, &mut StationController) {
+        (&mut self.device, &mut self.station)
+    }
+
+    /// Moves the complete runtime into recovery.
+    pub(crate) fn enter_recovery(&mut self) {
+        self.station.begin_recovery();
+        self.state = DriverState::Recovering;
     }
 
     /// Releases the low-level bus.
@@ -326,23 +338,34 @@ where
             }
             HostMessageType::Umac => {
                 let event = parse_control_event(message)?;
-                self.station.handle_control_event(event)?;
+                if let Err(error) = self.station.handle_control_event(event) {
+                    self.enter_recovery();
+                    return Err(DriverError::Station(error));
+                }
                 Ok(DriverEvent::Control(event))
             }
             HostMessageType::Data => {
                 let event = classify_data_event(message).map_err(DriverError::DataProtocol)?;
                 match event {
-                    DataEvent::TransmitDone { token, .. } => {
+                    DataEvent::TransmitDone { .. } => {
+                        let transmit_done =
+                            TxDoneEventRef::parse(message).map_err(DriverError::DataProtocol)?;
                         self.data
-                            .complete_tx(token)
+                            .complete_tx(transmit_done.token)
                             .map_err(DriverError::DataProtocol)?;
+                        return Ok(DriverEvent::TransmitDone(transmit_done));
                     }
                     DataEvent::Receive => {
                         let receive =
                             RxEventRef::parse(message).map_err(DriverError::DataProtocol)?;
                         return Ok(DriverEvent::Receive(receive));
                     }
-                    _ => self.station.handle_data_event(event)?,
+                    _ => {
+                        if let Err(error) = self.station.handle_data_event(event) {
+                            self.enter_recovery();
+                            return Err(DriverError::Station(error));
+                        }
+                    }
                 }
                 Ok(DriverEvent::Data(event))
             }

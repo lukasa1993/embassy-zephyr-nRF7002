@@ -30,6 +30,7 @@ pub const EAPOL_ETHERTYPE: u16 = 0x888e;
 
 const RX_EVENT_FIXED_LEN: usize = 20;
 const RX_INFO_LEN: usize = 17;
+const TX_DONE_FIXED_LEN: usize = 22;
 const TX_COMMAND_PAYLOAD_LEN: usize = 47;
 const TX_COMMAND_TOTAL_LEN: usize = HOST_MESSAGE_HEADER_LEN + TX_COMMAND_PAYLOAD_LEN;
 
@@ -180,6 +181,49 @@ impl<'a> RxEventRef<'a> {
     }
 }
 
+/// Borrowed view of one firmware TX-done event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TxDoneEventRef<'a> {
+    /// Descriptor token released by firmware.
+    pub token: u8,
+    /// Per-packet firmware status bytes. Zero means success.
+    pub statuses: &'a [u8],
+}
+
+impl<'a> TxDoneEventRef<'a> {
+    /// Parses `NRF_WIFI_CMD_TX_BUFF_DONE` and validates its status array.
+    pub fn parse(message: HostMessageRef<'a>) -> Result<Self, DataProtocolError> {
+        if message.message_type != HostMessageType::Data {
+            return Err(DataProtocolError::WrongMessageType);
+        }
+        let payload = message.payload;
+        if payload.len() < TX_DONE_FIXED_LEN {
+            return Err(DataProtocolError::InvalidLength);
+        }
+        let command = read_u32(payload, 0);
+        if command != DataCommand::TransmitDone as u32 {
+            return Err(DataProtocolError::InvalidCommand(command));
+        }
+        let declared = read_u32(payload, 4) as usize;
+        let status_count = payload[9] as usize;
+        let required = TX_DONE_FIXED_LEN
+            .checked_add(status_count)
+            .ok_or(DataProtocolError::InvalidLength)?;
+        if declared != required || declared > payload.len() {
+            return Err(DataProtocolError::InvalidLength);
+        }
+        Ok(Self {
+            token: payload[8],
+            statuses: &payload[TX_DONE_FIXED_LEN..required],
+        })
+    }
+
+    /// Returns true only when all packet status bytes report success.
+    pub fn all_succeeded(&self) -> bool {
+        !self.statuses.is_empty() && self.statuses.iter().all(|status| *status == 0)
+    }
+}
+
 /// Data event category that does not require an RX-packet parser.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataEvent {
@@ -205,12 +249,10 @@ pub fn classify_data_event(message: HostMessageRef<'_>) -> Result<DataEvent, Dat
     }
     match command {
         value if value == DataCommand::TransmitDone as u32 => {
-            if declared < 10 {
-                return Err(DataProtocolError::InvalidLength);
-            }
+            let event = TxDoneEventRef::parse(message)?;
             Ok(DataEvent::TransmitDone {
-                token: message.payload[8],
-                status_count: message.payload[9],
+                token: event.token,
+                status_count: event.statuses.len() as u8,
             })
         }
         value if value == DataCommand::ReceiveBuffer as u32 => Ok(DataEvent::Receive),
@@ -876,6 +918,23 @@ mod tests {
             classify_data_event(parsed),
             Ok(DataEvent::CarrierOn { wdev_id: 1 })
         );
+    }
+
+    #[test]
+    fn tx_done_status_array_is_validated() {
+        let mut payload = [0u8; TX_DONE_FIXED_LEN + 1];
+        put_u32(&mut payload, 0, DataCommand::TransmitDone as u32);
+        let payload_len = payload.len() as u32;
+        put_u32(&mut payload, 4, payload_len);
+        payload[8] = 3;
+        payload[9] = 1;
+        payload[TX_DONE_FIXED_LEN] = 0;
+        let mut message = [0u8; 64];
+        let len = encode_host_message(&mut message, HostMessageType::Data, true, &payload).unwrap();
+        let parsed = parse_host_message(&message[..len]).unwrap();
+        let event = TxDoneEventRef::parse(parsed).unwrap();
+        assert_eq!(event.token, 3);
+        assert!(event.all_succeeded());
     }
 
     #[test]
