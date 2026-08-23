@@ -1,0 +1,14 @@
+# All Zephyr state is disposable or reproducible from west.yml and the
+# checked-in application/configuration closure. Keep it out of Git.
+.workspace/
+.build/
+artifacts/
+.tools/
+target/
+release/
+
+# Local Docker output and editor state.
+*.log
+.DS_Store
+.idea/
+.vscode/

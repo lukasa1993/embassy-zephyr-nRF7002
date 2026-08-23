@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# This is an application-owned west manifest. It imports the complete NCS
+# v3.4.0 manifest at an immutable peeled commit and adds the exact zephyr-lang-rust
+# revision used by the Rust proof. The local manifest is copied to
+# .workspace/manifest by scripts/bootstrap.sh; keeping the west workspace
+# there prevents SDK checkouts from leaking into the repository root.
+
+manifest:
+  version: "0.13"
+
+  remotes:
+    - name: ncs
+      url-base: https://github.com/nrfconnect
+    - name: zephyrproject
+      url-base: https://github.com/zephyrproject-rtos
+
+  defaults:
+    remote: ncs
+
+  projects:
+    # 995530... is the peeled commit for the signed/tagged v3.4.0 sdk-nrf
+    # release. The release name is
+    # retained in userdata so verification can report both identity forms.
+    - name: nrf
+      repo-path: sdk-nrf
+      revision: 99553055607b2e9885fbc80ccd11fa9da81c2df0
+      path: nrf
+      import: true
+      userdata:
+        release: v3.4.0
+
+    # This project is not part of the NCS manifest. Its path is the standard
+    # Zephyr module location consumed by find_package(Zephyr).
+    - name: zephyr-lang-rust
+      repo-path: zephyr-lang-rust
+      remote: zephyrproject
+      revision: dd73abc242e995784da62352fe8c70d9a6c7ac2e
+      path: modules/lang/rust
+      userdata:
+        compatibility: ncs-v3.4.0
+
+  # The checked-in manifest is a local west project. bootstrap.sh puts it at
+  # .workspace/manifest, so all imported projects stay below .workspace.
+  self:
+    path: manifest

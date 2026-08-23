@@ -1,0 +1,18 @@
+# The image is a toolchain image. Workspace checkouts, build output, and
+# artifacts are bind-mounted at run time so they survive image rebuilds.
+.git
+.workspace
+.build
+artifacts
+target
+release
+.tools
+
+# The application is mounted at run time and must never become part of the
+# toolchain image layer.
+app
+include
+rust
+
+*.log
+.DS_Store

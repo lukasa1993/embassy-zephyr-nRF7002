@@ -1,0 +1,23 @@
+name: Rust and repository checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+      - name: Check formatting
+        run: rustup run 1.95.0 cargo fmt --all --check
+      - name: Test safe Rust boundary
+        run: rustup run 1.95.0 cargo test --features embassy-net
+      - name: Check shell syntax
+        run: for script in scripts/*.sh; do sh -n "$script"; done
