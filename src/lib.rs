@@ -27,6 +27,9 @@ pub mod system;
 #[cfg(feature = "embassy-net")]
 pub mod embassy;
 
+#[cfg(feature = "wpa2")]
+pub mod wpa2;
+
 pub use bus::{Bus, SpiConfig, SpiTransport};
 pub use control::{
     AssociationRequest, AssociationSecurity, AuthenticationRequest, AuthenticationType, BssContext,
@@ -40,6 +43,13 @@ pub use protocol::{ScanRequest, SystemInitConfig};
 pub use runtime::{DriverError, DriverEvent, DriverState, NativeDriver, Platform, RecoveryError};
 pub use station::{StationController, StationError, StationFault, StationState};
 pub use system::{SystemEvent, SystemEventId};
+
+#[cfg(feature = "wpa2")]
+pub use wpa2::{
+    EapolTxFrame, GroupKeyInstall, PairwiseKeyInstall, Pmk, Wpa2Action,
+    Wpa2Error, Wpa2GroupKeyInstallRequest, Wpa2KeyInstallRequest, Wpa2Phase,
+    Wpa2Supplicant,
+};
 
 /// Pinned host-driver source revision used for every packed interface value.
 pub const NRF_WIFI_SOURCE_REVISION: &str = "5046744cb4c9640eb8b11cb92f1ea0b9554c20cf";
