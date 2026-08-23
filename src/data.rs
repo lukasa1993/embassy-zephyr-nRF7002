@@ -3,6 +3,7 @@
 use super::bus::Bus;
 use super::device::{Device, DeviceError, RPU_MEM_TX_CMD_BASE};
 use super::memory::{Processor, RPU_ADDR_MASK_OFFSET, RPU_MCU_CORE_INDIRECT_BASE, RpuError};
+pub use super::protocol::DataCommand;
 use super::protocol::{HOST_MESSAGE_HEADER_LEN, HostMessageRef, HostMessageType};
 
 /// First packet byte available to the host driver.
@@ -31,20 +32,6 @@ const RX_EVENT_FIXED_LEN: usize = 20;
 const RX_INFO_LEN: usize = 17;
 const TX_COMMAND_PAYLOAD_LEN: usize = 47;
 const TX_COMMAND_TOTAL_LEN: usize = HOST_MESSAGE_HEADER_LEN + TX_COMMAND_PAYLOAD_LEN;
-
-/// Packet data command or event identifiers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum DataCommand {
-    ManagementBufferConfig = 0,
-    TransmitBuffer = 1,
-    TransmitDone = 2,
-    ReceiveBuffer = 3,
-    CarrierOn = 4,
-    CarrierOff = 5,
-    PowerManagementMode = 6,
-    PowerSaveGetFrames = 7,
-}
 
 /// RX payload representation selected by firmware.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +84,8 @@ pub enum DataError<E> {
     Device(DeviceError<E>),
     Rpu(RpuError<E>),
     Protocol(DataProtocolError),
+    /// A queue write failed after firmware ownership could have changed.
+    QueueOwnershipUncertain(DeviceError<E>),
     NoTransmitToken,
     ReceiveDescriptorBusy(u16),
     OutputTooSmall { needed: usize, capacity: usize },
@@ -324,6 +313,16 @@ impl<const RX: usize, const TX: usize> DataPath<RX, TX> {
         (token < TX).then_some(RPU_MEM_PACKET_BASE + token as u32 * self.tx_stride as u32)
     }
 
+    /// Releases local ownership state after a confirmed RPU reset.
+    ///
+    /// Call this only after the RPU can no longer access packet RAM and after
+    /// its hardware queues are reset. RX descriptors must be posted again.
+    pub fn reset_after_rpu_reset(&mut self) {
+        self.tx_in_flight.fill(false);
+        self.rx_posted.fill(false);
+        self.next_tx = 0;
+    }
+
     /// Posts every RX descriptor to firmware pool zero.
     pub async fn post_all_rx<B>(
         &mut self,
@@ -386,10 +385,17 @@ impl<const RX: usize, const TX: usize> DataPath<RX, TX> {
             .rpu_mut()
             .write_indirect(Processor::Lmac, indirect, &dma_pointer.to_le_bytes())
             .await?;
-        device
-            .enqueue(queues.rx_buffer_busy[pool_id], command_address)
-            .await?;
+
+        // A bus error during the queue write does not prove that the write did
+        // not reach hardware. Keep the descriptor unavailable until an RPU
+        // reset confirms that firmware cannot own it.
         self.rx_posted[index] = true;
+        if let Err(error) = device
+            .enqueue(queues.rx_buffer_busy[pool_id], command_address)
+            .await
+        {
+            return Err(DataError::QueueOwnershipUncertain(error));
+        }
         Ok(())
     }
 
@@ -511,13 +517,14 @@ impl<const RX: usize, const TX: usize> DataPath<RX, TX> {
             self.tx_in_flight[token as usize] = false;
             return Err(DataError::Rpu(error));
         }
+
+        // After the command is written, a queue or trigger bus error can leave
+        // firmware ownership uncertain. Do not release the token for reuse.
         if let Err(error) = device.enqueue(queues.command_busy, command_address).await {
-            self.tx_in_flight[token as usize] = false;
-            return Err(DataError::Device(error));
+            return Err(DataError::QueueOwnershipUncertain(error));
         }
         if let Err(error) = device.trigger_command().await {
-            self.tx_in_flight[token as usize] = false;
-            return Err(DataError::Device(error));
+            return Err(DataError::QueueOwnershipUncertain(error));
         }
         Ok(token)
     }
@@ -788,6 +795,18 @@ mod tests {
             DataPath::<1, 138>::new(1, ETHERNET_HEADER_LEN).err(),
             Some(DataLayoutError::InvalidCapacity)
         );
+    }
+
+    #[test]
+    fn reset_releases_local_ownership_after_rpu_reset() {
+        let mut layout = DataPath::<2, 2>::new(1600, 1514).unwrap();
+        layout.tx_in_flight = [true, true];
+        layout.rx_posted = [true, true];
+        layout.next_tx = 1;
+        layout.reset_after_rpu_reset();
+        assert_eq!(layout.tx_in_flight, [false, false]);
+        assert_eq!(layout.rx_posted, [false, false]);
+        assert_eq!(layout.next_tx, 0);
     }
 
     #[test]
