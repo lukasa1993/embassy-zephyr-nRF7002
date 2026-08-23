@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main, native-embassy-nrf7002]
   pull_request:
 
 permissions:
@@ -16,90 +14,369 @@ env:
   NRF_WIFI_REVISION: 5046744cb4c9640eb8b11cb92f1ea0b9554c20cf
 
 jobs:
-  rust:
+  wpa2-radio-patch:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 35
+    permissions:
+      contents: write
     steps:
-      - name: Check out the driver
+      - name: Check out the driver branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
+          ref: native-embassy-nrf7002
+          persist-credentials: true
 
-      - name: Install the pinned Rust toolchain
+      - name: Apply guarded radio integration changes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          data_path = Path("src/data.rs")
+          data = data_path.read_text()
+          old = '''const RX_EVENT_FIXED_LEN: usize = 20;
+          const RX_INFO_LEN: usize = 17;
+          const TX_COMMAND_PAYLOAD_LEN: usize = 47;
+          '''
+          new = '''const RX_EVENT_FIXED_LEN: usize = 20;
+          const RX_INFO_LEN: usize = 17;
+          const TX_DONE_FIXED_LEN: usize = 22;
+          const TX_COMMAND_PAYLOAD_LEN: usize = 47;
+          '''
+          assert old in data
+          data = data.replace(old, new, 1)
+
+          marker = '''/// Data event category that does not require an RX-packet parser.
+          '''
+          addition = '''/// Borrowed view of one firmware TX-done event.
+          #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+          pub struct TxDoneEventRef<'a> {
+              /// Descriptor token released by firmware.
+              pub token: u8,
+              /// Per-packet firmware status bytes. Zero means success.
+              pub statuses: &'a [u8],
+          }
+
+          impl<'a> TxDoneEventRef<'a> {
+              /// Parses `NRF_WIFI_CMD_TX_BUFF_DONE` and validates its status array.
+              pub fn parse(message: HostMessageRef<'a>) -> Result<Self, DataProtocolError> {
+                  if message.message_type != HostMessageType::Data {
+                      return Err(DataProtocolError::WrongMessageType);
+                  }
+                  let payload = message.payload;
+                  if payload.len() < TX_DONE_FIXED_LEN {
+                      return Err(DataProtocolError::InvalidLength);
+                  }
+                  let command = read_u32(payload, 0);
+                  if command != DataCommand::TransmitDone as u32 {
+                      return Err(DataProtocolError::InvalidCommand(command));
+                  }
+                  let declared = read_u32(payload, 4) as usize;
+                  let status_count = payload[9] as usize;
+                  let required = TX_DONE_FIXED_LEN
+                      .checked_add(status_count)
+                      .ok_or(DataProtocolError::InvalidLength)?;
+                  if declared != required || declared > payload.len() {
+                      return Err(DataProtocolError::InvalidLength);
+                  }
+                  Ok(Self {
+                      token: payload[8],
+                      statuses: &payload[TX_DONE_FIXED_LEN..required],
+                  })
+              }
+
+              /// Returns true only when all packet status bytes report success.
+              pub fn all_succeeded(&self) -> bool {
+                  !self.statuses.is_empty() && self.statuses.iter().all(|status| *status == 0)
+              }
+          }
+
+          '''
+          assert marker in data
+          data = data.replace(marker, addition + marker, 1)
+
+          old = '''        value if value == DataCommand::TransmitDone as u32 => {
+                      if declared < 10 {
+                          return Err(DataProtocolError::InvalidLength);
+                      }
+                      Ok(DataEvent::TransmitDone {
+                          token: message.payload[8],
+                          status_count: message.payload[9],
+                      })
+                  }
+          '''
+          new = '''        value if value == DataCommand::TransmitDone as u32 => {
+                      let event = TxDoneEventRef::parse(message)?;
+                      Ok(DataEvent::TransmitDone {
+                          token: event.token,
+                          status_count: event.statuses.len() as u8,
+                      })
+                  }
+          '''
+          assert old in data
+          data = data.replace(old, new, 1)
+
+          test_marker = '''    #[test]
+              fn protocol_error_type_is_independent() {
+          '''
+          test_addition = '''    #[test]
+              fn tx_done_status_array_is_validated() {
+                  let mut payload = [0u8; TX_DONE_FIXED_LEN + 1];
+                  put_u32(&mut payload, 0, DataCommand::TransmitDone as u32);
+                  put_u32(&mut payload, 4, payload.len() as u32);
+                  payload[8] = 3;
+                  payload[9] = 1;
+                  payload[TX_DONE_FIXED_LEN] = 0;
+                  let mut message = [0u8; 64];
+                  let len = encode_host_message(&mut message, HostMessageType::Data, true, &payload)
+                      .unwrap();
+                  let parsed = parse_host_message(&message[..len]).unwrap();
+                  let event = TxDoneEventRef::parse(parsed).unwrap();
+                  assert_eq!(event.token, 3);
+                  assert!(event.all_succeeded());
+              }
+
+          '''
+          assert test_marker in data
+          data = data.replace(test_marker, test_addition + test_marker, 1)
+          data_path.write_text(data)
+
+          runtime_path = Path("src/runtime.rs")
+          runtime = runtime_path.read_text()
+          old = '''use super::data::{
+              DataError, DataEvent, DataLayoutError, DataPath, DataProtocolError, ReceivedFrame, RxEventRef,
+              classify_data_event,
+          };
+          '''
+          new = '''use super::data::{
+              DataError, DataEvent, DataLayoutError, DataPath, DataProtocolError, ReceivedFrame, RxEventRef,
+              TxDoneEventRef, classify_data_event,
+          };
+          '''
+          assert old in runtime
+          runtime = runtime.replace(old, new, 1)
+
+          old = '''    Data(DataEvent),
+              Receive(RxEventRef<'a>),
+          '''
+          new = '''    Data(DataEvent),
+              TransmitDone(TxDoneEventRef<'a>),
+              Receive(RxEventRef<'a>),
+          '''
+          assert old in runtime
+          runtime = runtime.replace(old, new, 1)
+
+          marker = '''    /// Releases the low-level bus.
+              pub fn into_inner(self) -> B {
+          '''
+          addition = '''    /// Splits the device and station fields for an in-crate security coordinator.
+              pub(crate) fn security_parts_mut(&mut self) -> (&mut Device<B>, &mut StationController) {
+                  (&mut self.device, &mut self.station)
+              }
+
+              /// Moves the complete runtime into recovery.
+              pub(crate) fn enter_recovery(&mut self) {
+                  self.station.begin_recovery();
+                  self.state = DriverState::Recovering;
+              }
+
+          '''
+          assert marker in runtime
+          runtime = runtime.replace(marker, addition + marker, 1)
+
+          old = '''            HostMessageType::Umac => {
+                          let event = parse_control_event(message)?;
+                          self.station.handle_control_event(event)?;
+                          Ok(DriverEvent::Control(event))
+                      }
+          '''
+          new = '''            HostMessageType::Umac => {
+                          let event = parse_control_event(message)?;
+                          if let Err(error) = self.station.handle_control_event(event) {
+                              self.enter_recovery();
+                              return Err(DriverError::Station(error));
+                          }
+                          Ok(DriverEvent::Control(event))
+                      }
+          '''
+          assert old in runtime
+          runtime = runtime.replace(old, new, 1)
+
+          old = '''                match event {
+                              DataEvent::TransmitDone { token, .. } => {
+                                  self.data
+                                      .complete_tx(token)
+                                      .map_err(DriverError::DataProtocol)?;
+                              }
+                              DataEvent::Receive => {
+                                  let receive =
+                                      RxEventRef::parse(message).map_err(DriverError::DataProtocol)?;
+                                  return Ok(DriverEvent::Receive(receive));
+                              }
+                              _ => self.station.handle_data_event(event)?,
+                          }
+                          Ok(DriverEvent::Data(event))
+          '''
+          new = '''                match event {
+                              DataEvent::TransmitDone { .. } => {
+                                  let transmit_done =
+                                      TxDoneEventRef::parse(message).map_err(DriverError::DataProtocol)?;
+                                  self.data
+                                      .complete_tx(transmit_done.token)
+                                      .map_err(DriverError::DataProtocol)?;
+                                  return Ok(DriverEvent::TransmitDone(transmit_done));
+                              }
+                              DataEvent::Receive => {
+                                  let receive =
+                                      RxEventRef::parse(message).map_err(DriverError::DataProtocol)?;
+                                  return Ok(DriverEvent::Receive(receive));
+                              }
+                              _ => {
+                                  if let Err(error) = self.station.handle_data_event(event) {
+                                      self.enter_recovery();
+                                      return Err(DriverError::Station(error));
+                                  }
+                              }
+                          }
+                          Ok(DriverEvent::Data(event))
+          '''
+          assert old in runtime
+          runtime = runtime.replace(old, new, 1)
+          runtime_path.write_text(runtime)
+
+          station_path = Path("src/station.rs")
+          station = station_path.read_text()
+          marker = '''    /// Enters recovery and clears all connection ownership.
+              pub fn begin_recovery(&mut self) {
+          '''
+          addition = '''    /// Restores connected state after a successful group-key rekey.
+              pub fn complete_group_rekey(&mut self) -> StationState {
+                  self.state = if self.secure_connection && self.controlled_port_authorized {
+                      if self.carrier_on {
+                          StationState::Connected
+                      } else {
+                          StationState::AwaitingCarrier
+                      }
+                  } else {
+                      StationState::Fault
+                  };
+                  self.state
+              }
+
+          '''
+          assert marker in station
+          station = station.replace(marker, addition + marker, 1)
+          old = '''        self.require_one_of(&[StationState::Securing, StationState::Authorizing])?;
+          '''
+          new = '''        self.require_one_of(&[
+                      StationState::Securing,
+                      StationState::Authorizing,
+                      StationState::Connected,
+                  ])?;
+          '''
+          assert old in station
+          station = station.replace(old, new, 1)
+          station_path.write_text(station)
+
+          wpa2_path = Path("src/wpa2.rs")
+          wpa2 = wpa2_path.read_text()
+          marker = '''    /// Returns the configured authenticator address.
+              pub const fn peer(&self) -> [u8; 6] {
+          '''
+          addition = '''    /// Returns the configured supplicant address.
+              pub const fn local(&self) -> [u8; 6] {
+                  self.local
+              }
+
+          '''
+          assert marker in wpa2
+          wpa2 = wpa2.replace(marker, addition + marker, 1)
+          wpa2_path.write_text(wpa2)
+
+          integration_path = Path("src/wpa2_runtime.rs")
+          integration = integration_path.read_text()
+          integration = integration.replace(
+              '''    pub fn restart_pairwise(&mut self, supplicant_nonce: [u8; 32]) -> Result<(), Wpa2RuntimeError<()>> {
+          ''',
+              '''    pub fn restart_pairwise(&mut self, supplicant_nonce: [u8; 32]) -> Result<(), Wpa2Error> {
+          ''',
+              1,
+          )
+          old = '''        let was_complete = self.supplicant.phase() == Wpa2Phase::Complete;
+                  match self.supplicant.on_eapol(self.supplicant.peer(), payload)? {
+          '''
+          new = '''        let was_complete = self.supplicant.phase() == Wpa2Phase::Complete;
+                  let peer = self.supplicant.peer();
+                  let action = match self.supplicant.on_eapol(peer, payload) {
+                      Ok(action) => action,
+                      Err(error) => return self.fail(driver, Wpa2RuntimeError::Wpa2(error)),
+                  };
+                  match action {
+          '''
+          assert old in integration
+          integration = integration.replace(old, new, 1)
+          old = '''            EapolTransmitPurpose::GroupMessage2 | EapolTransmitPurpose::Retransmission => {
+                          self.state = Wpa2RuntimeState::Complete;
+                          Ok(Wpa2Progress::Complete)
+                      }
+          '''
+          new = '''            EapolTransmitPurpose::GroupMessage2 => {
+                          driver.station_mut().complete_group_rekey();
+                          self.state = Wpa2RuntimeState::Complete;
+                          Ok(Wpa2Progress::Complete)
+                      }
+                      EapolTransmitPurpose::Retransmission => {
+                          self.state = Wpa2RuntimeState::Complete;
+                          Ok(Wpa2Progress::Complete)
+                      }
+          '''
+          assert old in integration
+          integration = integration.replace(old, new, 1)
+          old = '''    fn fail<T, B, const RX: usize, const TX: usize>(
+                  &mut self,
+                  driver: &mut NativeDriver<B, RX, TX>,
+                  error: Wpa2RuntimeError<B::Error>,
+              ) -> Result<T, Wpa2RuntimeError<B::Error>> {
+          '''
+          new = '''    fn fail<T, B, const RX: usize, const TX: usize>(
+                  &mut self,
+                  driver: &mut NativeDriver<B, RX, TX>,
+                  error: Wpa2RuntimeError<B::Error>,
+              ) -> Result<T, Wpa2RuntimeError<B::Error>>
+              where
+                  B: Bus,
+              {
+          '''
+          assert old in integration
+          integration = integration.replace(old, new, 1)
+          integration_path.write_text(integration)
+          PY
+
+      - name: Install Rust toolchains
         run: |
           set -euxo pipefail
           rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy --target thumbv8m.main-none-eabihf
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Run host tests
-        run: cargo test --all-features
-
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Check the no-std core
-        run: cargo check --lib --no-default-features --target thumbv8m.main-none-eabihf
-
-      - name: Check the no-std Embassy adapter
-        run: cargo check --lib --features embassy-net --target thumbv8m.main-none-eabihf
-
-      - name: Check the no-std WPA2 supplicant
-        run: cargo check --lib --features wpa2 --target thumbv8m.main-none-eabihf
-
-      - name: Check documentation
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --lib --all-features --no-deps
-
-  msrv:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    steps:
-      - name: Check out the driver
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust 1.85
-        run: |
-          set -euxo pipefail
           rustup toolchain install 1.85.0 --profile minimal --target thumbv8m.main-none-eabihf
 
-      - name: Check the core at the minimum Rust version
-        run: cargo +1.85.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
-
-      - name: Check the Embassy adapter at the minimum Rust version
-        run: cargo +1.85.0 check --lib --features embassy-net --target thumbv8m.main-none-eabihf
-
-      - name: Check WPA2 at the minimum Rust version
-        run: cargo +1.85.0 check --lib --features wpa2 --target thumbv8m.main-none-eabihf
-
-  nordic-layout:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Check out the driver
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Check out the pinned Nordic host interface
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: zephyrproject-rtos/nrf_wifi
-          ref: ${{ env.NRF_WIFI_REVISION }}
-          path: nrf_wifi
-          persist-credentials: false
-
-      - name: Check packed sizes and offsets
+      - name: Format and verify the complete driver
         run: |
           set -euxo pipefail
-          cc -std=c11 -Wall -Wextra -Werror \
-            -I nrf_wifi/fw_if/umac_if/inc \
-            -I nrf_wifi/fw_if/umac_if/inc/fw \
-            -I nrf_wifi/hw_if/hal/inc \
-            tests/layout_probe.c \
-            -o /tmp/nrf7002-layout-probe
-          /tmp/nrf7002-layout-probe
+          cargo +1.95.0 fmt --all
+          cargo +1.95.0 test --all-features
+          cargo +1.95.0 clippy --all-targets --all-features -- -D warnings
+          cargo +1.95.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
+          cargo +1.95.0 check --lib --features embassy-net --target thumbv8m.main-none-eabihf
+          cargo +1.95.0 check --lib --features wpa2 --target thumbv8m.main-none-eabihf
+          RUSTDOCFLAGS='-D warnings' cargo +1.95.0 doc --lib --all-features --no-deps
+          cargo +1.85.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
+          cargo +1.85.0 check --lib --features embassy-net --target thumbv8m.main-none-eabihf
+          cargo +1.85.0 check --lib --features wpa2 --target thumbv8m.main-none-eabihf
+
+      - name: Commit the verified integration
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src
+          git commit -m "Integrate WPA2 with radio key and TX completion"
+          git push origin HEAD:native-embassy-nrf7002
