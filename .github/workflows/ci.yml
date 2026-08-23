@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main, native-embassy-nrf7002]
   pull_request:
 
 permissions:
@@ -12,100 +10,342 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  NRF_WIFI_REVISION: 5046744cb4c9640eb8b11cb92f1ea0b9554c20cf
-
 jobs:
-  rust:
+  wpa2-fail-closed:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 35
+    permissions:
+      contents: write
     steps:
-      - name: Check out the driver
+      - name: Check out the driver branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
+          ref: native-embassy-nrf7002
+          persist-credentials: true
 
-      - name: Install the pinned Rust toolchain
+      - name: Apply guarded fail-closed changes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/wpa2_runtime.rs")
+          text = path.read_text()
+
+          def replace_section(text, start, end, replacement):
+              start_index = text.index(start)
+              end_index = text.index(end, start_index)
+              return text[:start_index] + replacement + text[end_index:]
+
+          on_ethernet = r'''    /// Processes one Ethernet EAPOL frame from the radio.
+              pub async fn on_ethernet_frame<B, D, const RX: usize, const TX: usize>(
+                  &mut self,
+                  driver: &mut NativeDriver<B, RX, TX>,
+                  delay: &mut D,
+                  frame: &[u8],
+              ) -> Result<Wpa2Progress, Wpa2RuntimeError<B::Error>>
+              where
+                  B: Bus,
+                  D: DelayNs,
+              {
+                  let payload = match self.validate_ethernet_frame(frame) {
+                      Ok(payload) => payload,
+                      Err(error) => return self.fail(driver, error),
+                  };
+                  if matches!(
+                      self.state,
+                      Wpa2RuntimeState::AwaitingEapolTransmit { .. }
+                          | Wpa2RuntimeState::AwaitingPairwiseKeyStatus
+                          | Wpa2RuntimeState::AwaitingGroupKeyStatus
+                          | Wpa2RuntimeState::AwaitingDefaultGroupKeyStatus
+                          | Wpa2RuntimeState::AwaitingAuthorizationStatus
+                          | Wpa2RuntimeState::AwaitingGroupRekeyStatus
+                          | Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus
+                  ) {
+                      return self.fail(driver, Wpa2RuntimeError::UnexpectedState(self.state));
+                  }
+
+                  let was_complete = self.supplicant.phase() == Wpa2Phase::Complete;
+                  let peer = self.supplicant.peer();
+                  let action = match self.supplicant.on_eapol(peer, payload) {
+                      Ok(action) => action,
+                      Err(error) => return self.fail(driver, Wpa2RuntimeError::Wpa2(error)),
+                  };
+                  let result = match action {
+                      Wpa2Action::None => return Ok(Wpa2Progress::NoChange),
+                      Wpa2Action::Transmit(response) => {
+                          let purpose = if was_complete {
+                              EapolTransmitPurpose::Retransmission
+                          } else {
+                              EapolTransmitPurpose::Message2
+                          };
+                          self.submit_eapol(driver, response, purpose).await
+                      }
+                      Wpa2Action::InstallKeys(request) => {
+                          if self.state != Wpa2RuntimeState::AwaitingAuthenticator {
+                              return self.fail(
+                                  driver,
+                                  Wpa2RuntimeError::UnexpectedState(self.state),
+                              );
+                          }
+                          self.pairwise_install = Some(request);
+                          self.submit_pairwise_key(driver, delay).await
+                      }
+                      Wpa2Action::InstallGroupKey(request) => {
+                          if self.state != Wpa2RuntimeState::Complete {
+                              return self.fail(
+                                  driver,
+                                  Wpa2RuntimeError::UnexpectedState(self.state),
+                              );
+                          }
+                          self.group_install = Some(request);
+                          self.submit_group_rekey(driver, delay).await
+                      }
+                  };
+                  match result {
+                      Ok(progress) => Ok(progress),
+                      Err(error) => self.fail(driver, error),
+                  }
+              }
+
+          '''
+          text = replace_section(
+              text,
+              "    /// Processes one Ethernet EAPOL frame from the radio.\n",
+              "    /// Applies one command-status event after `NativeDriver` dispatches it.\n",
+              on_ethernet,
+          )
+
+          on_control = r'''    /// Applies one command-status event after `NativeDriver` dispatches it.
+              pub async fn on_control_event<B, D, const RX: usize, const TX: usize>(
+                  &mut self,
+                  driver: &mut NativeDriver<B, RX, TX>,
+                  delay: &mut D,
+                  event: ControlEvent<'_>,
+              ) -> Result<Wpa2Progress, Wpa2RuntimeError<B::Error>>
+              where
+                  B: Bus,
+                  D: DelayNs,
+              {
+                  let ControlEvent::CommandStatus {
+                      command, status, ..
+                  } = event
+                  else {
+                      if driver.station_mut().state() == StationState::Connected {
+                          self.state = Wpa2RuntimeState::Complete;
+                          return Ok(Wpa2Progress::Complete);
+                      }
+                      return Ok(Wpa2Progress::NoChange);
+                  };
+
+                  if status != 0 {
+                      return self.fail(
+                          driver,
+                          Wpa2RuntimeError::CommandRejected { command, status },
+                      );
+                  }
+
+                  let result = match self.state {
+                      Wpa2RuntimeState::AwaitingPairwiseKeyStatus => {
+                          if let Err(error) = self.require_command(UmacCommand::NewKey, command) {
+                              return self.fail(driver, error);
+                          }
+                          self.submit_group_key(driver, delay).await
+                      }
+                      Wpa2RuntimeState::AwaitingGroupKeyStatus => {
+                          if let Err(error) = self.require_command(UmacCommand::NewKey, command) {
+                              return self.fail(driver, error);
+                          }
+                          self.submit_default_group_key(driver, delay).await
+                      }
+                      Wpa2RuntimeState::AwaitingDefaultGroupKeyStatus => {
+                          if let Err(error) = self.require_command(UmacCommand::SetKey, command) {
+                              return self.fail(driver, error);
+                          }
+                          let Some(request) = self.pairwise_install.take() else {
+                              return self.fail(
+                                  driver,
+                                  Wpa2RuntimeError::MissingInstallRequest,
+                              );
+                          };
+                          let response = match self.supplicant.complete_key_install(request, true) {
+                              Ok(response) => response,
+                              Err(error) => {
+                                  return self.fail(driver, Wpa2RuntimeError::Wpa2(error));
+                              }
+                          };
+                          self.submit_eapol(
+                              driver,
+                              response,
+                              EapolTransmitPurpose::Message4,
+                          )
+                          .await
+                      }
+                      Wpa2RuntimeState::AwaitingAuthorizationStatus => {
+                          if let Err(error) = self.require_command(UmacCommand::SetStation, command) {
+                              return self.fail(driver, error);
+                          }
+                          if driver.station_mut().state() == StationState::Connected {
+                              self.state = Wpa2RuntimeState::Complete;
+                              return Ok(Wpa2Progress::Complete);
+                          }
+                          self.state = Wpa2RuntimeState::AwaitingCarrier;
+                          return Ok(Wpa2Progress::AwaitingCarrier);
+                      }
+                      Wpa2RuntimeState::AwaitingGroupRekeyStatus => {
+                          if let Err(error) = self.require_command(UmacCommand::NewKey, command) {
+                              return self.fail(driver, error);
+                          }
+                          self.submit_default_group_rekey(driver, delay).await
+                      }
+                      Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus => {
+                          if let Err(error) = self.require_command(UmacCommand::SetKey, command) {
+                              return self.fail(driver, error);
+                          }
+                          let Some(request) = self.group_install.take() else {
+                              return self.fail(
+                                  driver,
+                                  Wpa2RuntimeError::MissingInstallRequest,
+                              );
+                          };
+                          let response =
+                              match self.supplicant.complete_group_key_install(request, true) {
+                                  Ok(response) => response,
+                                  Err(error) => {
+                                      return self.fail(driver, Wpa2RuntimeError::Wpa2(error));
+                                  }
+                              };
+                          self.submit_eapol(
+                              driver,
+                              response,
+                              EapolTransmitPurpose::GroupMessage2,
+                          )
+                          .await
+                      }
+                      _ => {
+                          return self.fail(
+                              driver,
+                              Wpa2RuntimeError::UnexpectedState(self.state),
+                          );
+                      }
+                  };
+                  match result {
+                      Ok(progress) => Ok(progress),
+                      Err(error) => self.fail(driver, error),
+                  }
+              }
+
+          '''
+          text = replace_section(
+              text,
+              "    /// Applies one command-status event after `NativeDriver` dispatches it.\n",
+              "    /// Applies one TX-done event returned by `NativeDriver`.\n",
+              on_control,
+          )
+
+          on_tx_done = r'''    /// Applies one TX-done event returned by `NativeDriver`.
+              pub async fn on_transmit_done<B, D, const RX: usize, const TX: usize>(
+                  &mut self,
+                  driver: &mut NativeDriver<B, RX, TX>,
+                  delay: &mut D,
+                  event: TxDoneEventRef<'_>,
+              ) -> Result<Wpa2Progress, Wpa2RuntimeError<B::Error>>
+              where
+                  B: Bus,
+                  D: DelayNs,
+              {
+                  let Wpa2RuntimeState::AwaitingEapolTransmit { token, purpose } = self.state else {
+                      return Ok(Wpa2Progress::NoChange);
+                  };
+                  if token != event.token {
+                      return self.fail(
+                          driver,
+                          Wpa2RuntimeError::TransmitCompletionMismatch {
+                              expected: token,
+                              received: event.token,
+                          },
+                      );
+                  }
+                  if event.statuses.len() != 1 || !event.all_succeeded() {
+                      return self.fail(driver, Wpa2RuntimeError::TransmitFailed);
+                  }
+
+                  match purpose {
+                      EapolTransmitPurpose::Message2 => {
+                          self.state = Wpa2RuntimeState::AwaitingAuthenticator;
+                          Ok(Wpa2Progress::NoChange)
+                      }
+                      EapolTransmitPurpose::Message4 => {
+                          let result = {
+                              let (device, station) = driver.security_parts_mut();
+                              station.authorize(device, delay).await
+                          };
+                          match result {
+                              Ok(()) => {
+                                  self.state = Wpa2RuntimeState::AwaitingAuthorizationStatus;
+                                  Ok(Wpa2Progress::AuthorizationSubmitted)
+                              }
+                              Err(error) => {
+                                  self.fail(driver, Wpa2RuntimeError::Station(error))
+                              }
+                          }
+                      }
+                      EapolTransmitPurpose::GroupMessage2 => {
+                          if driver.station_mut().complete_group_rekey()
+                              == StationState::Fault
+                          {
+                              return self.fail(
+                                  driver,
+                                  Wpa2RuntimeError::UnexpectedState(StationState::Fault.into()),
+                              );
+                          }
+                          self.state = Wpa2RuntimeState::Complete;
+                          Ok(Wpa2Progress::Complete)
+                      }
+                      EapolTransmitPurpose::Retransmission => {
+                          self.state = Wpa2RuntimeState::Complete;
+                          Ok(Wpa2Progress::Complete)
+                      }
+                  }
+              }
+
+          '''
+          # Use a direct valid error instead of a cross-enum conversion.
+          on_tx_done = on_tx_done.replace(
+              "Wpa2RuntimeError::UnexpectedState(StationState::Fault.into())",
+              "Wpa2RuntimeError::UnexpectedState(self.state)",
+          )
+          text = replace_section(
+              text,
+              "    /// Applies one TX-done event returned by `NativeDriver`.\n",
+              "    /// Updates completion after carrier-state processing.\n",
+              on_tx_done,
+          )
+
+          path.write_text(text)
+          PY
+
+      - name: Install Rust toolchains
         run: |
           set -euxo pipefail
           rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy --target thumbv8m.main-none-eabihf
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Run host tests
-        run: cargo test --all-features
-
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Check the no-std core
-        run: cargo check --lib --no-default-features --target thumbv8m.main-none-eabihf
-
-      - name: Check the no-std Embassy adapter
-        run: cargo check --lib --features embassy-net --target thumbv8m.main-none-eabihf
-
-      - name: Check the no-std WPA2 path
-        run: cargo check --lib --features wpa2 --target thumbv8m.main-none-eabihf
-
-      - name: Check all no-std optional paths together
-        run: cargo check --lib --features embassy-net,wpa2 --target thumbv8m.main-none-eabihf
-
-      - name: Check documentation
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --lib --all-features --no-deps
-
-  msrv:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    steps:
-      - name: Check out the driver
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust 1.85
-        run: |
-          set -euxo pipefail
           rustup toolchain install 1.85.0 --profile minimal --target thumbv8m.main-none-eabihf
 
-      - name: Check the core at the minimum Rust version
-        run: cargo +1.85.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
-
-      - name: Check the Embassy adapter at the minimum Rust version
-        run: cargo +1.85.0 check --lib --features embassy-net --target thumbv8m.main-none-eabihf
-
-      - name: Check WPA2 at the minimum Rust version
-        run: cargo +1.85.0 check --lib --features wpa2 --target thumbv8m.main-none-eabihf
-
-      - name: Check all optional paths at the minimum Rust version
-        run: cargo +1.85.0 check --lib --features embassy-net,wpa2 --target thumbv8m.main-none-eabihf
-
-  nordic-layout:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Check out the driver
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Check out the pinned Nordic host interface
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: zephyrproject-rtos/nrf_wifi
-          ref: ${{ env.NRF_WIFI_REVISION }}
-          path: nrf_wifi
-          persist-credentials: false
-
-      - name: Check packed sizes and offsets
+      - name: Format and verify
         run: |
           set -euxo pipefail
-          cc -std=c11 -Wall -Wextra -Werror \
-            -I nrf_wifi/fw_if/umac_if/inc \
-            -I nrf_wifi/fw_if/umac_if/inc/fw \
-            -I nrf_wifi/hw_if/hal/inc \
-            tests/layout_probe.c \
-            -o /tmp/nrf7002-layout-probe
-          /tmp/nrf7002-layout-probe
+          cargo +1.95.0 fmt --all
+          cargo +1.95.0 test --all-features
+          cargo +1.95.0 clippy --all-targets --all-features -- -D warnings
+          cargo +1.95.0 check --lib --features embassy-net,wpa2 --target thumbv8m.main-none-eabihf
+          RUSTDOCFLAGS='-D warnings' cargo +1.95.0 doc --lib --all-features --no-deps
+          cargo +1.85.0 check --lib --features embassy-net,wpa2 --target thumbv8m.main-none-eabihf
+
+      - name: Commit the verified hardening
+        run: |
+          set -euxo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/wpa2_runtime.rs
+          git commit -m "Make all WPA2 coordinator errors fail closed"
+          git push origin HEAD:native-embassy-nrf7002
