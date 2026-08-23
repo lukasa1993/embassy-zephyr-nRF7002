@@ -359,10 +359,8 @@ where
                         }
                         return Ok(None);
                     };
-                    let count = core::cmp::min(
-                        self.event_fragment_len,
-                        pending.declared - pending.copied,
-                    );
+                    let count =
+                        core::cmp::min(self.event_fragment_len, pending.declared - pending.copied);
                     if !pending.discard {
                         self.rpu
                             .read(
@@ -428,11 +426,7 @@ where
             }
 
             self.rpu
-                .read(
-                    Processor::Umac,
-                    event_address,
-                    &mut scratch[..first_count],
-                )
+                .read(Processor::Umac, event_address, &mut scratch[..first_count])
                 .await?;
             self.release_event_fragment(queues, event_address, resubmit)
                 .await?;
