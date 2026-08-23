@@ -102,6 +102,21 @@ impl<const FRAME_SIZE: usize> NetworkState<FRAME_SIZE> {
             .is_ok()
     }
 
+    fn reserve_receive(&self) -> bool {
+        if self
+            .rx_state
+            .compare_exchange(READY, CLIENT, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        if self.reserve_tx() {
+            return true;
+        }
+        self.rx_state.store(READY, Ordering::Release);
+        false
+    }
+
     fn release_tx(&self) {
         self.tx_len.store(0, Ordering::Relaxed);
         self.tx_state.store(FREE, Ordering::Release);
@@ -127,22 +142,27 @@ impl<const FRAME_SIZE: usize> EmbassyDriver for NetworkDriver<'_, FRAME_SIZE> {
     fn receive(&mut self, cx: &mut Context<'_>) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if self.state.link_state() == LinkState::Down {
             self.state.link_waker.register(cx.waker());
-            return None;
+            if self.state.link_state() == LinkState::Down {
+                return None;
+            }
         }
-        let rx_owned = self
-            .state
-            .rx_state
-            .compare_exchange(READY, CLIENT, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        if !rx_owned {
+
+        if !self.state.reserve_receive() {
+            // Register before the second check. This prevents a missed wake if
+            // RX becomes ready or TX space opens between the checks.
             self.state.rx_waker.register(cx.waker());
-            return None;
-        }
-        if !self.state.reserve_tx() {
-            self.state.rx_state.store(READY, Ordering::Release);
             self.state.tx_space_waker.register(cx.waker());
-            return None;
+            if self.state.link_state() == LinkState::Down {
+                self.state.link_waker.register(cx.waker());
+                if self.state.link_state() == LinkState::Down {
+                    return None;
+                }
+            }
+            if !self.state.reserve_receive() {
+                return None;
+            }
         }
+
         Some((
             RxToken {
                 state: self.state,
@@ -158,7 +178,9 @@ impl<const FRAME_SIZE: usize> EmbassyDriver for NetworkDriver<'_, FRAME_SIZE> {
     fn transmit(&mut self, cx: &mut Context<'_>) -> Option<Self::TxToken<'_>> {
         if self.state.link_state() == LinkState::Down {
             self.state.link_waker.register(cx.waker());
-            return None;
+            if self.state.link_state() == LinkState::Down {
+                return None;
+            }
         }
         if self.state.reserve_tx() {
             return Some(TxToken {
@@ -318,6 +340,9 @@ impl<const FRAME_SIZE: usize> NetworkRunner<'_, FRAME_SIZE> {
     }
 
     /// Registers a waker for new TX frames.
+    ///
+    /// Check [`NetworkRunner::take_tx`] again after registration to prevent a
+    /// missed wake between an earlier check and this call.
     pub fn register_tx_waker(&self, cx: &mut Context<'_>) {
         self.state.tx_ready_waker.register(cx.waker());
     }
@@ -337,8 +362,11 @@ impl<const FRAME_SIZE: usize> TxLease<'_, FRAME_SIZE> {
         unsafe { &(&*self.state.tx.get())[..len] }
     }
 
-    /// Reports the hardware result.
-    pub fn report(&mut self, outcome: TxOutcome) {
+    /// Reports the hardware result and consumes this lease.
+    ///
+    /// Consuming the lease prevents access to the buffer after ownership is
+    /// returned to `embassy-net`.
+    pub fn report(mut self, outcome: TxOutcome) {
         match outcome {
             TxOutcome::WouldBlock => {
                 self.state.tx_state.store(READY, Ordering::Release);
@@ -379,5 +407,16 @@ mod tests {
             state.runner().push_rx(&[0; 9]),
             Err(QueueError::FrameTooLarge)
         );
+    }
+
+    #[test]
+    fn reporting_tx_consumes_and_releases_the_lease() {
+        let state = NetworkState::<8>::new([2, 0, 0, 0, 0, 1]);
+        state.tx_len.store(1, Ordering::Relaxed);
+        state.tx_state.store(READY, Ordering::Release);
+        let lease = state.runner().take_tx().unwrap();
+        assert_eq!(lease.as_slice(), &[0]);
+        lease.report(TxOutcome::Dropped);
+        assert_eq!(state.tx_state.load(Ordering::Acquire), FREE);
     }
 }
