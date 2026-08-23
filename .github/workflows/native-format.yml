@@ -1,0 +1,30 @@
+name: Format native Rust source
+
+on:
+  push:
+    branches: [native-embassy-nrf7002]
+    paths:
+      - '.github/workflows/native-format.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: native-embassy-nrf7002
+      - name: Install pinned Rust formatter
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+      - name: Format native crate
+        run: rustup run 1.95.0 cargo fmt --manifest-path native/Cargo.toml --all
+      - name: Commit formatter output
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add native
+          git diff --cached --quiet && exit 0
+          git commit -m 'Format native nRF7002 Rust source'
+          git push origin HEAD:native-embassy-nrf7002
