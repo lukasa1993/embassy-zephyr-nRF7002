@@ -43,7 +43,8 @@ jobs:
       - name: Materialize normal repository files
         run: |
           tar -xzf /tmp/native-bootstrap.tar.gz -C .
-          rm -rf .native-bootstrap .github/workflows/native-bootstrap.yml
+          git checkout -- .github/workflows/ci.yml .github/workflows/native-bootstrap.yml
+          rm -rf .native-bootstrap
       - name: Commit native driver
         run: |
           git config user.name 'github-actions[bot]'
