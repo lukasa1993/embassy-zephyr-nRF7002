@@ -23,16 +23,16 @@ jobs:
         with:
           ref: native-embassy-nrf7002
           persist-credentials: true
-          fetch-depth: 2
+          fetch-depth: 3
 
-      - name: Reuse the guarded firmware trust patch
+      - name: Reuse and correct the guarded firmware trust patch
         run: |
           set -euxo pipefail
-          git show HEAD^:.github/workflows/ci.yml > /tmp/previous-ci.yml
+          git show HEAD^^:.github/workflows/ci.yml > /tmp/original-ci.yml
           python3 - <<'PY'
           from pathlib import Path
 
-          workflow = Path('/tmp/previous-ci.yml').read_text()
+          workflow = Path('/tmp/original-ci.yml').read_text()
           start_marker = "          python3 - <<'PY'\n"
           end_marker = "          PY\n\n      - name: Install Rust toolchains"
           start = workflow.index(start_marker) + len(start_marker)
@@ -41,6 +41,10 @@ jobs:
           script = '\n'.join(
               line[10:] if line.startswith('          ') else line
               for line in script.splitlines()
+          )
+          script = script.replace(
+              "for index in 0..actual.len() {\n            difference |= actual[index] ^ self.expected[index];\n        }",
+              "for (actual_byte, expected_byte) in actual.iter().zip(self.expected.iter()) {\n            difference |= *actual_byte ^ *expected_byte;\n        }",
           )
           Path('/tmp/apply_firmware_trust.py').write_text(script + '\n')
           PY
