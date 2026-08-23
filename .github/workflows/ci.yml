@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  push:
+    branches: [main, native-embassy-nrf7002]
   pull_request:
 
 permissions:
@@ -10,71 +12,100 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  NRF_WIFI_REVISION: 5046744cb4c9640eb8b11cb92f1ea0b9554c20cf
+
 jobs:
-  wpa2-radio-patch:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+  rust:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    permissions:
-      contents: write
+    timeout-minutes: 25
     steps:
-      - name: Check out the driver branch
+      - name: Check out the driver
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: native-embassy-nrf7002
-          persist-credentials: true
-          fetch-depth: 2
+          persist-credentials: false
 
-      - name: Reuse and correct the guarded source patch
-        run: |
-          set -euxo pipefail
-          git show HEAD^:.github/workflows/ci.yml > /tmp/previous-ci.yml
-          python3 - <<'PY'
-          from pathlib import Path
-
-          workflow = Path('/tmp/previous-ci.yml').read_text()
-          start_marker = "          python3 - <<'PY'\n"
-          end_marker = "          PY\n\n      - name: Install Rust toolchains"
-          start = workflow.index(start_marker) + len(start_marker)
-          end = workflow.index(end_marker, start)
-          script = workflow[start:end]
-          script = '\n'.join(
-              line[10:] if line.startswith('          ') else line
-              for line in script.splitlines()
-          )
-          script = script.replace(
-              "put_u32(&mut payload, 4, payload.len() as u32);",
-              "let payload_len = payload.len() as u32;\n        put_u32(&mut payload, 4, payload_len);",
-          )
-          Path('/tmp/apply_integration.py').write_text(script + '\n')
-          PY
-          python3 /tmp/apply_integration.py
-
-      - name: Install Rust toolchains
+      - name: Install the pinned Rust toolchain
         run: |
           set -euxo pipefail
           rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy --target thumbv8m.main-none-eabihf
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run host tests
+        run: cargo test --all-features
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Check the no-std core
+        run: cargo check --lib --no-default-features --target thumbv8m.main-none-eabihf
+
+      - name: Check the no-std Embassy adapter
+        run: cargo check --lib --features embassy-net --target thumbv8m.main-none-eabihf
+
+      - name: Check the no-std WPA2 path
+        run: cargo check --lib --features wpa2 --target thumbv8m.main-none-eabihf
+
+      - name: Check all no-std optional paths together
+        run: cargo check --lib --features embassy-net,wpa2 --target thumbv8m.main-none-eabihf
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --lib --all-features --no-deps
+
+  msrv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out the driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        run: |
+          set -euxo pipefail
           rustup toolchain install 1.85.0 --profile minimal --target thumbv8m.main-none-eabihf
 
-      - name: Format and verify the complete driver
-        run: |
-          set -euxo pipefail
-          cargo +1.95.0 fmt --all
-          cargo +1.95.0 test --all-features
-          cargo +1.95.0 clippy --all-targets --all-features -- -D warnings
-          cargo +1.95.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
-          cargo +1.95.0 check --lib --features embassy-net --target thumbv8m.main-none-eabihf
-          cargo +1.95.0 check --lib --features wpa2 --target thumbv8m.main-none-eabihf
-          RUSTDOCFLAGS='-D warnings' cargo +1.95.0 doc --lib --all-features --no-deps
-          cargo +1.85.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
-          cargo +1.85.0 check --lib --features embassy-net --target thumbv8m.main-none-eabihf
-          cargo +1.85.0 check --lib --features wpa2 --target thumbv8m.main-none-eabihf
+      - name: Check the core at the minimum Rust version
+        run: cargo +1.85.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
 
-      - name: Commit the verified integration
+      - name: Check the Embassy adapter at the minimum Rust version
+        run: cargo +1.85.0 check --lib --features embassy-net --target thumbv8m.main-none-eabihf
+
+      - name: Check WPA2 at the minimum Rust version
+        run: cargo +1.85.0 check --lib --features wpa2 --target thumbv8m.main-none-eabihf
+
+      - name: Check all optional paths at the minimum Rust version
+        run: cargo +1.85.0 check --lib --features embassy-net,wpa2 --target thumbv8m.main-none-eabihf
+
+  nordic-layout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the pinned Nordic host interface
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zephyrproject-rtos/nrf_wifi
+          ref: ${{ env.NRF_WIFI_REVISION }}
+          path: nrf_wifi
+          persist-credentials: false
+
+      - name: Check packed sizes and offsets
         run: |
           set -euxo pipefail
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src
-          git commit -m "Integrate WPA2 with radio key and TX completion"
-          git push origin HEAD:native-embassy-nrf7002
+          cc -std=c11 -Wall -Wextra -Werror \
+            -I nrf_wifi/fw_if/umac_if/inc \
+            -I nrf_wifi/fw_if/umac_if/inc/fw \
+            -I nrf_wifi/hw_if/hal/inc \
+            tests/layout_probe.c \
+            -o /tmp/nrf7002-layout-probe
+          /tmp/nrf7002-layout-probe
