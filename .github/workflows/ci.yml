@@ -60,3 +60,12 @@ jobs:
             native/tests/layout_probe.c \
             -o /tmp/nrf7002-layout-probe
           /tmp/nrf7002-layout-probe
+      - name: Report station ABI sizes and offsets
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror \
+            -I/tmp/nrf_wifi/fw_if/umac_if/inc \
+            -I/tmp/nrf_wifi/fw_if/umac_if/inc/fw \
+            -I/tmp/nrf_wifi/hw_if/hal/inc \
+            native/tests/layout_dump.c \
+            -o /tmp/nrf7002-layout-dump
+          /tmp/nrf7002-layout-dump
