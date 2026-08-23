@@ -1,0 +1,40 @@
+name: Materialize native nRF7002 driver
+
+on:
+  push:
+    branches: [native-embassy-nrf7002]
+    paths:
+      - '.native-bootstrap/**'
+      - '.github/workflows/native-bootstrap.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: native-bootstrap-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Rebuild and verify source archive
+        run: |
+          cat .native-bootstrap/part-* | base64 --decode > /tmp/native-bootstrap.tar.gz
+          echo '8d8d79c3ff5cda36f470792af0bd5e9629b4547779b5fb3a411d087969736c01  /tmp/native-bootstrap.tar.gz' | sha256sum --check
+          tar -tzf /tmp/native-bootstrap.tar.gz
+      - name: Materialize normal repository files
+        run: |
+          tar -xzf /tmp/native-bootstrap.tar.gz -C .
+          rm -rf .native-bootstrap .github/workflows/native-bootstrap.yml
+      - name: Commit native driver
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add --all
+          git commit -m 'Add native Embassy nRF7002 driver core'
+          git push origin HEAD:${GITHUB_REF_NAME}
