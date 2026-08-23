@@ -35,10 +35,54 @@ pub enum StationState {
     Authorizing,
     AwaitingCarrier,
     Connected,
+    PowerSavePending,
     Disconnecting,
     InterfaceDownPending,
     Recovering,
     Fault,
+}
+
+/// Bounded station-state deadlines in milliseconds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StationTimeouts {
+    pub regulatory_ms: u32,
+    pub interface_ms: u32,
+    pub scan_ms: u32,
+    pub scan_complete_ms: u32,
+    pub scan_results_ms: u32,
+    pub authentication_ms: u32,
+    pub authenticated_ms: u32,
+    pub association_ms: u32,
+    pub key_exchange_ms: u32,
+    pub authorization_ms: u32,
+    pub carrier_ms: u32,
+    pub power_save_ms: u32,
+    pub disconnect_ms: u32,
+}
+
+impl StationTimeouts {
+    /// Conservative production defaults.
+    pub const DEFAULT: Self = Self {
+        regulatory_ms: 5_000,
+        interface_ms: 5_000,
+        scan_ms: 30_000,
+        scan_complete_ms: 10_000,
+        scan_results_ms: 10_000,
+        authentication_ms: 5_000,
+        authenticated_ms: 10_000,
+        association_ms: 5_000,
+        key_exchange_ms: 10_000,
+        authorization_ms: 5_000,
+        carrier_ms: 5_000,
+        power_save_ms: 5_000,
+        disconnect_ms: 5_000,
+    };
+}
+
+impl Default for StationTimeouts {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 /// Last fail-closed station fault.
@@ -51,6 +95,7 @@ pub enum StationFault {
     PeerMismatch,
     UnexpectedEvent,
     CarrierLost,
+    Timeout(StationState),
 }
 
 /// Station operation failure.
@@ -89,6 +134,9 @@ pub struct StationController {
     controlled_port_authorized: bool,
     carrier_on: bool,
     pending_command: Option<UmacCommand>,
+    pending_return_state: Option<StationState>,
+    timeouts: StationTimeouts,
+    remaining_ms: Option<u32>,
     command: [u8; MAX_STATION_MESSAGE_LEN],
 }
 
@@ -106,6 +154,9 @@ impl StationController {
             controlled_port_authorized: false,
             carrier_on: false,
             pending_command: None,
+            pending_return_state: None,
+            timeouts: StationTimeouts::DEFAULT,
+            remaining_ms: None,
             command: [0; MAX_STATION_MESSAGE_LEN],
         }
     }
@@ -113,6 +164,36 @@ impl StationController {
     /// Returns the current station state.
     pub const fn state(&self) -> StationState {
         self.state
+    }
+
+    /// Replaces the state deadlines and rearms the current pending state.
+    pub fn set_timeouts(&mut self, timeouts: StationTimeouts) {
+        self.timeouts = timeouts;
+        self.remaining_ms = self.timeout_for(self.state);
+    }
+
+    /// Returns the remaining time for the current pending state.
+    pub const fn remaining_time_ms(&self) -> Option<u32> {
+        self.remaining_ms
+    }
+
+    /// Advances the station deadlines.
+    ///
+    /// The caller must invoke this method from a monotonic timer path.
+    pub fn advance_time(&mut self, elapsed_ms: u32) -> Result<(), StationFault> {
+        let Some(remaining) = self.remaining_ms else {
+            return Ok(());
+        };
+        if elapsed_ms < remaining {
+            self.remaining_ms = Some(remaining - elapsed_ms);
+            return Ok(());
+        }
+        let fault = StationFault::Timeout(self.state);
+        self.last_fault = Some(fault);
+        self.pending_command = None;
+        self.pending_return_state = None;
+        self.transition(StationState::Fault);
+        Err(fault)
     }
 
     /// Returns the most recent fail-closed fault.
@@ -136,7 +217,7 @@ impl StationController {
 
     #[cfg(test)]
     pub(crate) fn prepare_security_for_test(&mut self, peer: [u8; 6]) {
-        self.state = StationState::Securing;
+        self.transition(StationState::Securing);
         self.last_fault = None;
         self.peer = Some(peer);
         self.secure_connection = true;
@@ -147,7 +228,7 @@ impl StationController {
 
     /// Restores connected state after a successful group-key rekey.
     pub fn complete_group_rekey(&mut self) -> StationState {
-        self.state = if self.secure_connection && self.controlled_port_authorized {
+        let next_state = if self.secure_connection && self.controlled_port_authorized {
             if self.carrier_on {
                 StationState::Connected
             } else {
@@ -156,12 +237,13 @@ impl StationController {
         } else {
             StationState::Fault
         };
+        self.transition(next_state);
         self.state
     }
 
     /// Enters recovery and clears all connection ownership.
     pub fn begin_recovery(&mut self) {
-        self.state = StationState::Recovering;
+        self.transition(StationState::Recovering);
         self.peer = None;
         self.secure_connection = false;
         self.controlled_port_authorized = false;
@@ -171,7 +253,7 @@ impl StationController {
 
     /// Marks recovery complete after firmware and queues are initialized.
     pub fn recovery_complete(&mut self) {
-        self.state = StationState::Down;
+        self.transition(StationState::Down);
         self.last_fault = None;
     }
 
@@ -200,7 +282,7 @@ impl StationController {
             .send_control_reliable(&self.command[..len], delay)
             .await?;
         self.pending_command = Some(UmacCommand::RequestSetRegulatory);
-        self.state = StationState::RegulatoryPending;
+        self.transition(StationState::RegulatoryPending);
         Ok(())
     }
 
@@ -225,7 +307,7 @@ impl StationController {
             .send_control_reliable(&self.command[..len], delay)
             .await?;
         self.pending_command = Some(UmacCommand::SetInterfaceFlags);
-        self.state = StationState::InterfaceUpPending;
+        self.transition(StationState::InterfaceUpPending);
         Ok(())
     }
 
@@ -254,7 +336,7 @@ impl StationController {
             .send_control_reliable(&self.command[..len], delay)
             .await?;
         self.pending_command = Some(UmacCommand::SetInterfaceFlags);
-        self.state = StationState::InterfaceDownPending;
+        self.transition(StationState::InterfaceDownPending);
         Ok(())
     }
 
@@ -275,7 +357,7 @@ impl StationController {
             .send_control_reliable(&self.command[..len], delay)
             .await?;
         self.pending_command = Some(UmacCommand::TriggerScan);
-        self.state = StationState::Scanning;
+        self.transition(StationState::Scanning);
         Ok(())
     }
 
@@ -296,7 +378,7 @@ impl StationController {
             .send_control_reliable(&self.command[..len], delay)
             .await?;
         self.pending_command = Some(UmacCommand::GetScanResults);
-        self.state = StationState::ReadingScanResults;
+        self.transition(StationState::ReadingScanResults);
         Ok(())
     }
 
@@ -318,7 +400,7 @@ impl StationController {
             .await?;
         self.peer = Some(request.bssid);
         self.pending_command = Some(UmacCommand::Authenticate);
-        self.state = StationState::Authenticating;
+        self.transition(StationState::Authenticating);
         Ok(())
     }
 
@@ -344,7 +426,7 @@ impl StationController {
         self.secure_connection = request.security.is_some();
         self.controlled_port_authorized = !self.secure_connection;
         self.pending_command = Some(UmacCommand::Associate);
-        self.state = StationState::Associating;
+        self.transition(StationState::Associating);
         Ok(())
     }
 
@@ -373,7 +455,7 @@ impl StationController {
             .send_control_reliable(&self.command[..len], delay)
             .await?;
         self.pending_command = Some(command);
-        self.state = StationState::Securing;
+        self.transition(StationState::Securing);
         Ok(())
     }
 
@@ -394,6 +476,7 @@ impl StationController {
             .send_control_reliable(&self.command[..len], delay)
             .await?;
         self.pending_command = Some(UmacCommand::SetKey);
+        self.transition(StationState::Securing);
         Ok(())
     }
 
@@ -416,7 +499,7 @@ impl StationController {
             .send_control_reliable(&self.command[..len], delay)
             .await?;
         self.pending_command = Some(UmacCommand::SetStation);
-        self.state = StationState::Authorizing;
+        self.transition(StationState::Authorizing);
         Ok(())
     }
 
@@ -433,6 +516,7 @@ impl StationController {
         D: DelayNs,
     {
         self.require_one_of(&[StationState::Idle, StationState::Connected])?;
+        let return_state = self.state;
         if let Some(timeout_ms) = timeout_ms {
             let len = encode_power_save_timeout(&mut self.command, self.ifaceindex, timeout_ms)?;
             device
@@ -444,6 +528,8 @@ impl StationController {
             .send_control_reliable(&self.command[..len], delay)
             .await?;
         self.pending_command = Some(UmacCommand::SetPowerSave);
+        self.pending_return_state = Some(return_state);
+        self.transition(StationState::PowerSavePending);
         Ok(())
     }
 
@@ -471,7 +557,7 @@ impl StationController {
             .deauthenticate(self.ifaceindex, peer, reason_code, false)
             .await?;
         self.pending_command = Some(UmacCommand::Deauthenticate);
-        self.state = StationState::Disconnecting;
+        self.transition(StationState::Disconnecting);
         Ok(())
     }
 
@@ -493,13 +579,13 @@ impl StationController {
                 }
                 match self.state {
                     StationState::InterfaceUpPending => {
-                        self.state = StationState::Idle;
+                        self.transition(StationState::Idle);
                         self.pending_command = None;
                         Ok(())
                     }
                     StationState::InterfaceDownPending => {
                         self.clear_connection();
-                        self.state = StationState::Down;
+                        self.transition(StationState::Down);
                         self.pending_command = None;
                         Ok(())
                     }
@@ -512,10 +598,10 @@ impl StationController {
                 }
                 self.pending_command = None;
                 if status == 0 {
-                    self.state = StationState::ScanComplete;
+                    self.transition(StationState::ScanComplete);
                     Ok(())
                 } else {
-                    self.state = StationState::Idle;
+                    self.transition(StationState::Idle);
                     self.fail(StationFault::CommandRejected {
                         command: UmacCommand::TriggerScan as u32,
                         status: status as u32,
@@ -528,7 +614,7 @@ impl StationController {
                 }
                 if result.header.sequence == 0 {
                     self.pending_command = None;
-                    self.state = StationState::Idle;
+                    self.transition(StationState::Idle);
                 }
                 Ok(())
             }
@@ -542,7 +628,7 @@ impl StationController {
                     return self.fail(StationFault::AuthenticationFailed(status));
                 }
                 self.pending_command = None;
-                self.state = StationState::Authenticated;
+                self.transition(StationState::Authenticated);
                 Ok(())
             }
             ControlEvent::Association(event) => {
@@ -555,24 +641,25 @@ impl StationController {
                     return self.fail(StationFault::AssociationFailed(status));
                 }
                 self.pending_command = None;
-                self.state = if self.secure_connection {
+                let next_state = if self.secure_connection {
                     StationState::Securing
                 } else {
                     StationState::AwaitingCarrier
                 };
+                self.transition(next_state);
                 self.refresh_connected();
                 Ok(())
             }
             ControlEvent::Deauthentication(_) | ControlEvent::Disassociation(_) => {
                 self.clear_connection();
                 self.pending_command = None;
-                self.state = StationState::Idle;
+                self.transition(StationState::Idle);
                 Ok(())
             }
             ControlEvent::RegulatoryChange { .. } => {
                 if self.state == StationState::RegulatoryPending {
                     self.pending_command = None;
-                    self.state = StationState::Down;
+                    self.transition(StationState::Down);
                     Ok(())
                 } else {
                     Ok(())
@@ -594,7 +681,7 @@ impl StationController {
                 self.carrier_on = false;
                 if self.state == StationState::Connected {
                     self.clear_connection();
-                    self.state = StationState::Idle;
+                    self.transition(StationState::Idle);
                     return self.fail(StationFault::CarrierLost);
                 }
                 Ok(())
@@ -619,15 +706,54 @@ impl StationController {
             || command == UmacCommand::DeleteKey as u32
             || command == UmacCommand::SetKey as u32
         {
-            self.state = StationState::Securing;
+            self.transition(StationState::Securing);
         } else if command == UmacCommand::SetStation as u32
             && self.state == StationState::Authorizing
         {
             self.controlled_port_authorized = true;
-            self.state = StationState::AwaitingCarrier;
+            self.transition(StationState::AwaitingCarrier);
             self.refresh_connected();
+        } else if command == UmacCommand::SetPowerSave as u32
+            && self.state == StationState::PowerSavePending
+        {
+            let return_state = self
+                .pending_return_state
+                .take()
+                .unwrap_or(StationState::Fault);
+            self.transition(return_state);
         }
         Ok(())
+    }
+
+    fn transition(&mut self, state: StationState) {
+        self.state = state;
+        self.remaining_ms = self.timeout_for(state);
+    }
+
+    fn timeout_for(&self, state: StationState) -> Option<u32> {
+        let value = match state {
+            StationState::RegulatoryPending => self.timeouts.regulatory_ms,
+            StationState::InterfaceUpPending | StationState::InterfaceDownPending => {
+                self.timeouts.interface_ms
+            }
+            StationState::Scanning => self.timeouts.scan_ms,
+            StationState::ScanComplete => self.timeouts.scan_complete_ms,
+            StationState::ReadingScanResults => self.timeouts.scan_results_ms,
+            StationState::Authenticating => self.timeouts.authentication_ms,
+            StationState::Authenticated => self.timeouts.authenticated_ms,
+            StationState::Associating => self.timeouts.association_ms,
+            StationState::Securing => self.timeouts.key_exchange_ms,
+            StationState::Authorizing => self.timeouts.authorization_ms,
+            StationState::AwaitingCarrier => self.timeouts.carrier_ms,
+            StationState::PowerSavePending => self.timeouts.power_save_ms,
+            StationState::Disconnecting => self.timeouts.disconnect_ms,
+            StationState::Down
+            | StationState::Idle
+            | StationState::Connected
+            | StationState::Recovering
+            | StationState::Fault => return None,
+        };
+        Some(value.max(1))
     }
 
     fn check_peer<E>(&mut self, peer: [u8; 6]) -> Result<(), StationError<E>> {
@@ -640,7 +766,7 @@ impl StationController {
 
     fn refresh_connected(&mut self) {
         if self.carrier_on && self.controlled_port_authorized {
-            self.state = StationState::Connected;
+            self.transition(StationState::Connected);
         }
     }
 
@@ -675,7 +801,9 @@ impl StationController {
 
     fn fail<T, E>(&mut self, fault: StationFault) -> Result<T, StationError<E>> {
         self.last_fault = Some(fault);
-        self.state = StationState::Fault;
+        self.pending_command = None;
+        self.pending_return_state = None;
+        self.transition(StationState::Fault);
         Err(StationError::Fault(fault))
     }
 }
@@ -772,6 +900,19 @@ mod tests {
                     status: 5,
                 })
                 .is_err()
+        );
+        assert_eq!(station.state(), StationState::Fault);
+    }
+
+    #[test]
+    fn pending_station_state_has_a_bounded_deadline() {
+        let mut station = StationController::new(1, 0, 7);
+        station.transition(StationState::Authenticating);
+        assert_eq!(station.remaining_time_ms(), Some(5_000));
+        assert_eq!(station.advance_time(4_999), Ok(()));
+        assert_eq!(
+            station.advance_time(1),
+            Err(StationFault::Timeout(StationState::Authenticating))
         );
         assert_eq!(station.state(), StationState::Fault);
     }

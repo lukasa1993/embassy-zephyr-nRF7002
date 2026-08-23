@@ -301,6 +301,17 @@ where
             .map_err(RecoveryError::Platform)
     }
 
+    /// Advances station-control deadlines.
+    pub fn advance_time(&mut self, elapsed_ms: u32) -> Result<(), DriverError<B::Error>> {
+        match self.station.advance_time(elapsed_ms) {
+            Ok(()) => Ok(()),
+            Err(fault) => {
+                self.enter_recovery();
+                Err(DriverError::Station(StationError::Fault(fault)))
+            }
+        }
+    }
+
     /// Polls, parses, and applies one complete RPU event.
     pub async fn poll_event<'a>(
         &mut self,

@@ -53,6 +53,31 @@ pub enum Wpa2RuntimeState {
     Failed,
 }
 
+/// Bounded WPA2 phase deadlines in milliseconds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Wpa2Timeouts {
+    pub authenticator_ms: u32,
+    pub eapol_transmit_ms: u32,
+    pub firmware_command_ms: u32,
+    pub carrier_ms: u32,
+}
+
+impl Wpa2Timeouts {
+    /// Conservative production defaults.
+    pub const DEFAULT: Self = Self {
+        authenticator_ms: 5_000,
+        eapol_transmit_ms: 2_000,
+        firmware_command_ms: 5_000,
+        carrier_ms: 5_000,
+    };
+}
+
+impl Default for Wpa2Timeouts {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// WPA2 radio integration progress.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Wpa2Progress {
@@ -95,6 +120,7 @@ pub enum Wpa2RuntimeError<E> {
         received: u8,
     },
     TransmitFailed,
+    Timeout(Wpa2RuntimeState),
 }
 
 impl<E> From<Wpa2Error> for Wpa2RuntimeError<E> {
@@ -123,6 +149,8 @@ pub struct Wpa2Runtime {
     state: Wpa2RuntimeState,
     pairwise_install: Option<Wpa2KeyInstallRequest>,
     group_install: Option<Wpa2GroupKeyInstallRequest>,
+    timeouts: Wpa2Timeouts,
+    remaining_ms: Option<u32>,
     frame: [u8; MAX_EAPOL_ETHERNET_FRAME_LEN],
 }
 
@@ -130,20 +158,54 @@ impl Wpa2Runtime {
     /// Creates one coordinator for a station interface.
     pub fn new(supplicant: Wpa2Supplicant, wdev_id: u8) -> Self {
         let local = supplicant.local();
-        Self {
+        let mut runtime = Self {
             supplicant,
             local,
             wdev_id,
             state: Wpa2RuntimeState::AwaitingAuthenticator,
             pairwise_install: None,
             group_install: None,
+            timeouts: Wpa2Timeouts::DEFAULT,
+            remaining_ms: None,
             frame: [0; MAX_EAPOL_ETHERNET_FRAME_LEN],
-        }
+        };
+        runtime.transition(Wpa2RuntimeState::AwaitingAuthenticator);
+        runtime
     }
 
     /// Returns the coordinator state.
     pub const fn state(&self) -> Wpa2RuntimeState {
         self.state
+    }
+
+    /// Replaces WPA2 deadlines and rearms the current phase.
+    pub fn set_timeouts(&mut self, timeouts: Wpa2Timeouts) {
+        self.timeouts = timeouts;
+        self.remaining_ms = self.timeout_for(self.state);
+    }
+
+    /// Returns the remaining time for the current WPA2 phase.
+    pub const fn remaining_time_ms(&self) -> Option<u32> {
+        self.remaining_ms
+    }
+
+    /// Advances WPA2 phase deadlines and forces recovery on expiry.
+    pub fn advance_time<B, const RX: usize, const TX: usize>(
+        &mut self,
+        driver: &mut NativeDriver<B, RX, TX>,
+        elapsed_ms: u32,
+    ) -> Result<(), Wpa2RuntimeError<B::Error>>
+    where
+        B: Bus,
+    {
+        let Some(remaining) = self.remaining_ms else {
+            return Ok(());
+        };
+        if elapsed_ms < remaining {
+            self.remaining_ms = Some(remaining - elapsed_ms);
+            return Ok(());
+        }
+        self.fail(driver, Wpa2RuntimeError::Timeout(self.state))
     }
 
     /// Borrows the underlying supplicant.
@@ -156,7 +218,7 @@ impl Wpa2Runtime {
         self.supplicant.restart_pairwise(supplicant_nonce)?;
         self.pairwise_install = None;
         self.group_install = None;
-        self.state = Wpa2RuntimeState::AwaitingAuthenticator;
+        self.transition(Wpa2RuntimeState::AwaitingAuthenticator);
         Ok(())
     }
 
@@ -241,7 +303,7 @@ impl Wpa2Runtime {
         } = event
         else {
             if driver.station_mut().state() == StationState::Connected {
-                self.state = Wpa2RuntimeState::Complete;
+                self.transition(Wpa2RuntimeState::Complete);
                 return Ok(Wpa2Progress::Complete);
             }
             return Ok(Wpa2Progress::NoChange);
@@ -288,10 +350,10 @@ impl Wpa2Runtime {
                     return self.fail(driver, error);
                 }
                 if driver.station_mut().state() == StationState::Connected {
-                    self.state = Wpa2RuntimeState::Complete;
+                    self.transition(Wpa2RuntimeState::Complete);
                     return Ok(Wpa2Progress::Complete);
                 }
-                self.state = Wpa2RuntimeState::AwaitingCarrier;
+                self.transition(Wpa2RuntimeState::AwaitingCarrier);
                 return Ok(Wpa2Progress::AwaitingCarrier);
             }
             Wpa2RuntimeState::AwaitingGroupRekeyStatus => {
@@ -355,7 +417,7 @@ impl Wpa2Runtime {
 
         match purpose {
             EapolTransmitPurpose::Message2 => {
-                self.state = Wpa2RuntimeState::AwaitingAuthenticator;
+                self.transition(Wpa2RuntimeState::AwaitingAuthenticator);
                 Ok(Wpa2Progress::NoChange)
             }
             EapolTransmitPurpose::Message4 => {
@@ -365,7 +427,7 @@ impl Wpa2Runtime {
                 };
                 match result {
                     Ok(()) => {
-                        self.state = Wpa2RuntimeState::AwaitingAuthorizationStatus;
+                        self.transition(Wpa2RuntimeState::AwaitingAuthorizationStatus);
                         Ok(Wpa2Progress::AuthorizationSubmitted)
                     }
                     Err(error) => self.fail(driver, Wpa2RuntimeError::Station(error)),
@@ -375,11 +437,11 @@ impl Wpa2Runtime {
                 if driver.station_mut().complete_group_rekey() == StationState::Fault {
                     return self.fail(driver, Wpa2RuntimeError::UnexpectedState(self.state));
                 }
-                self.state = Wpa2RuntimeState::Complete;
+                self.transition(Wpa2RuntimeState::Complete);
                 Ok(Wpa2Progress::Complete)
             }
             EapolTransmitPurpose::Retransmission => {
-                self.state = Wpa2RuntimeState::Complete;
+                self.transition(Wpa2RuntimeState::Complete);
                 Ok(Wpa2Progress::Complete)
             }
         }
@@ -391,11 +453,34 @@ impl Wpa2Runtime {
         driver: &mut NativeDriver<B, RX, TX>,
     ) -> Wpa2Progress {
         if driver.station_mut().state() == StationState::Connected {
-            self.state = Wpa2RuntimeState::Complete;
+            self.transition(Wpa2RuntimeState::Complete);
             Wpa2Progress::Complete
         } else {
             Wpa2Progress::NoChange
         }
+    }
+
+    fn transition(&mut self, state: Wpa2RuntimeState) {
+        self.state = state;
+        self.remaining_ms = self.timeout_for(state);
+    }
+
+    fn timeout_for(&self, state: Wpa2RuntimeState) -> Option<u32> {
+        let value = match state {
+            Wpa2RuntimeState::AwaitingAuthenticator => self.timeouts.authenticator_ms,
+            Wpa2RuntimeState::AwaitingEapolTransmit { .. } => self.timeouts.eapol_transmit_ms,
+            Wpa2RuntimeState::AwaitingPairwiseKeyStatus
+            | Wpa2RuntimeState::AwaitingGroupKeyStatus
+            | Wpa2RuntimeState::AwaitingDefaultGroupKeyStatus
+            | Wpa2RuntimeState::AwaitingAuthorizationStatus
+            | Wpa2RuntimeState::AwaitingGroupRekeyStatus
+            | Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus => {
+                self.timeouts.firmware_command_ms
+            }
+            Wpa2RuntimeState::AwaitingCarrier => self.timeouts.carrier_ms,
+            Wpa2RuntimeState::Complete | Wpa2RuntimeState::Failed => return None,
+        };
+        Some(value.max(1))
     }
 
     async fn submit_pairwise_key<B, D, const RX: usize, const TX: usize>(
@@ -416,7 +501,7 @@ impl Wpa2Runtime {
         station
             .key_command(device, delay, UmacCommand::NewKey, &key)
             .await?;
-        self.state = Wpa2RuntimeState::AwaitingPairwiseKeyStatus;
+        self.transition(Wpa2RuntimeState::AwaitingPairwiseKeyStatus);
         Ok(Wpa2Progress::PairwiseKeySubmitted)
     }
 
@@ -438,7 +523,7 @@ impl Wpa2Runtime {
         station
             .key_command(device, delay, UmacCommand::NewKey, &key)
             .await?;
-        self.state = Wpa2RuntimeState::AwaitingGroupKeyStatus;
+        self.transition(Wpa2RuntimeState::AwaitingGroupKeyStatus);
         Ok(Wpa2Progress::GroupKeySubmitted)
     }
 
@@ -458,7 +543,7 @@ impl Wpa2Runtime {
         let key = request.group().default_key_config();
         let (device, station) = driver.security_parts_mut();
         station.set_key(device, delay, &key).await?;
-        self.state = Wpa2RuntimeState::AwaitingDefaultGroupKeyStatus;
+        self.transition(Wpa2RuntimeState::AwaitingDefaultGroupKeyStatus);
         Ok(Wpa2Progress::DefaultGroupKeySubmitted)
     }
 
@@ -480,7 +565,7 @@ impl Wpa2Runtime {
         station
             .key_command(device, delay, UmacCommand::NewKey, &key)
             .await?;
-        self.state = Wpa2RuntimeState::AwaitingGroupRekeyStatus;
+        self.transition(Wpa2RuntimeState::AwaitingGroupRekeyStatus);
         Ok(Wpa2Progress::GroupKeySubmitted)
     }
 
@@ -500,7 +585,7 @@ impl Wpa2Runtime {
         let key = request.group().default_key_config();
         let (device, station) = driver.security_parts_mut();
         station.set_key(device, delay, &key).await?;
-        self.state = Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus;
+        self.transition(Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus);
         Ok(Wpa2Progress::DefaultGroupKeySubmitted)
     }
 
@@ -524,7 +609,7 @@ impl Wpa2Runtime {
         self.frame[12..14].copy_from_slice(&EAPOL_ETHERTYPE.to_be_bytes());
         self.frame[14..len].copy_from_slice(response.as_slice());
         let token = driver.transmit(self.wdev_id, &self.frame[..len], 0).await?;
-        self.state = Wpa2RuntimeState::AwaitingEapolTransmit { token, purpose };
+        self.transition(Wpa2RuntimeState::AwaitingEapolTransmit { token, purpose });
         Ok(Wpa2Progress::EapolSubmitted { token, purpose })
     }
 
@@ -583,7 +668,7 @@ impl Wpa2Runtime {
             let _ = self.supplicant.complete_group_key_install(request, false);
         }
         driver.enter_recovery();
-        self.state = Wpa2RuntimeState::Failed;
+        self.transition(Wpa2RuntimeState::Failed);
         Err(error)
     }
 }
@@ -872,5 +957,20 @@ mod tests {
         );
         assert_eq!(RPU_MEM_TX_CMD_BASE, 0xb000_00b8);
         assert_eq!(RSN_CIPHER_CCMP_128, 0x000f_ac04);
+    }
+
+    #[test]
+    fn wpa2_phase_timeout_forces_runtime_recovery() {
+        let mut runtime = Wpa2Runtime::new(supplicant(), 0);
+        let mut driver = driver();
+        assert_eq!(runtime.remaining_time_ms(), Some(5_000));
+        assert!(matches!(
+            runtime.advance_time(&mut driver, 5_000),
+            Err(Wpa2RuntimeError::Timeout(
+                Wpa2RuntimeState::AwaitingAuthenticator
+            ))
+        ));
+        assert_eq!(runtime.state(), Wpa2RuntimeState::Failed);
+        assert_eq!(driver.state(), DriverState::Recovering);
     }
 }

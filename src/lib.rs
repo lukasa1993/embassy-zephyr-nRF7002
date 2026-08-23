@@ -44,7 +44,7 @@ pub use firmware::{FirmwareBundle, FirmwareReport, FirmwareTrustPolicy, PinnedFi
 pub use memory::{Processor, Rpu};
 pub use protocol::{ScanRequest, SystemInitConfig};
 pub use runtime::{DriverError, DriverEvent, DriverState, NativeDriver, Platform, RecoveryError};
-pub use station::{StationController, StationError, StationFault, StationState};
+pub use station::{StationController, StationError, StationFault, StationState, StationTimeouts};
 pub use system::{SystemEvent, SystemEventId};
 
 #[cfg(feature = "wpa2")]
@@ -56,6 +56,7 @@ pub use wpa2::{
 #[cfg(feature = "wpa2")]
 pub use wpa2_runtime::{
     EapolTransmitPurpose, Wpa2Progress, Wpa2Runtime, Wpa2RuntimeError, Wpa2RuntimeState,
+    Wpa2Timeouts,
 };
 
 /// Pinned host-driver source revision used for every packed interface value.
