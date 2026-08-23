@@ -31,7 +31,8 @@ fn rust_numeric_abi_matches_the_pinned_nordic_interface() {
     assert_eq!(UmacEvent::Deauthenticate as u32, 264);
     assert_eq!(UmacEvent::Disconnect as u32, 271);
     assert_eq!(UmacEvent::NewInterface as u32, 281);
-    assert_eq!(UmacEvent::CommandStatus as u32, 293);
+    assert_eq!(UmacEvent::ScanDisplayResult as u32, 291);
+    assert_eq!(UmacEvent::CommandStatus as u32, 292);
 
     assert_eq!(DataCommand::TransmitBuffer as u32, 1);
     assert_eq!(DataCommand::TransmitDone as u32, 2);
