@@ -133,8 +133,7 @@ impl<B> Device<B> {
         command_len: usize,
         event_len: usize,
     ) -> Result<(), FragmentLimitError> {
-        if command_len < HOST_MESSAGE_HEADER_LEN
-            || command_len > MAX_CONTROL_MESSAGE_LEN
+        if !(HOST_MESSAGE_HEADER_LEN..=MAX_CONTROL_MESSAGE_LEN).contains(&command_len)
             || event_len < HOST_MESSAGE_HEADER_LEN
         {
             return Err(FragmentLimitError);
