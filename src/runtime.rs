@@ -218,7 +218,8 @@ impl<B, const RX: usize, const TX: usize> NativeDriver<B, RX, TX> {
         &mut self.station
     }
 
-    /// Splits the device and station fields for an in-crate security coordinator.
+    /// Splits the device and station fields for the WPA2 coordinator.
+    #[cfg(feature = "wpa2")]
     pub(crate) fn security_parts_mut(&mut self) -> (&mut Device<B>, &mut StationController) {
         (&mut self.device, &mut self.station)
     }
@@ -463,7 +464,7 @@ where
         Ok(())
     }
 
-    /// Enables or disables firmware power save without changing its timeout.
+    /// Enables or disables firmware power save.
     pub async fn set_power_save<D>(
         &mut self,
         delay: &mut D,
@@ -474,16 +475,39 @@ where
     {
         self.require_state(DriverState::Ready)?;
         self.station
-            .set_power_save(&mut self.device, delay, state, None)
+            .set_power_save(&mut self.device, delay, state)
+            .await?;
+        Ok(())
+    }
+
+    /// Changes the firmware power-save timeout.
+    pub async fn set_power_save_timeout<D>(
+        &mut self,
+        delay: &mut D,
+        timeout_ms: i32,
+    ) -> Result<(), DriverError<B::Error>>
+    where
+        D: DelayNs,
+    {
+        self.require_state(DriverState::Ready)?;
+        self.station
+            .set_power_save_timeout(&mut self.device, delay, timeout_ms)
             .await?;
         Ok(())
     }
 
     /// Starts a station deauthentication sequence.
-    pub async fn disconnect(&mut self, reason_code: u16) -> Result<(), DriverError<B::Error>> {
+    pub async fn disconnect<D>(
+        &mut self,
+        delay: &mut D,
+        reason_code: u16,
+    ) -> Result<(), DriverError<B::Error>>
+    where
+        D: DelayNs,
+    {
         self.require_state(DriverState::Ready)?;
         self.station
-            .disconnect(&mut self.device, reason_code)
+            .disconnect(&mut self.device, delay, reason_code)
             .await?;
         Ok(())
     }
@@ -702,15 +726,9 @@ where
     fn require_controlled_port(&self, ether_type: u16) -> Result<(), DriverError<B::Error>> {
         let state = self.station.state();
         let allowed = if ether_type == EAPOL_ETHERTYPE {
-            matches!(
-                state,
-                StationState::Securing
-                    | StationState::Authorizing
-                    | StationState::AwaitingCarrier
-                    | StationState::Connected
-            )
+            self.station.eapol_required()
         } else {
-            state == StationState::Connected
+            self.station.controlled_port_open()
         };
         if allowed {
             Ok(())
