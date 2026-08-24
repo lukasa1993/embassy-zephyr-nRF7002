@@ -13,9 +13,8 @@ use super::data::{
 use super::device::{Device, DeviceError};
 use super::firmware::{self, FirmwareBundle, FirmwareReport, FirmwareTrustPolicy, LoadError};
 use super::protocol::{
-    HOST_MESSAGE_HEADER_LEN, HostMessageRef, HostMessageType, InterfaceType, ProtocolError,
-    SYSTEM_INIT_LEN, ScanReason, ScanRequest, SystemInitConfig, encode_new_interface,
-    encode_system_init,
+    HOST_MESSAGE_HEADER_LEN, HostMessageRef, HostMessageType, ProtocolError, SYSTEM_INIT_LEN,
+    ScanReason, ScanRequest, SystemInitConfig, encode_system_init,
 };
 use super::station::{StationController, StationError, StationState};
 use super::system::{SystemEvent, parse_system_event};
@@ -342,22 +341,8 @@ where
         if ifaceindex != self.ifaceindex || self.configured_mac != Some(mac_address) {
             return Err(DriverError::ConfigurationMismatch);
         }
-        if self.station.state() != StationState::Down {
-            return Err(DriverError::InvalidStationState {
-                current: self.station.state(),
-                required: StationState::Down,
-            });
-        }
-        let mut message = [0u8; 128];
-        let len = encode_new_interface(
-            &mut message,
-            ifaceindex,
-            InterfaceType::Station,
-            mac_address,
-            interface_name,
-        )?;
-        self.device
-            .send_control_reliable(&message[..len], delay)
+        self.station
+            .create_interface(&mut self.device, delay, mac_address, interface_name)
             .await?;
         Ok(())
     }
