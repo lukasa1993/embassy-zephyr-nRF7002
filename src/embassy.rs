@@ -121,8 +121,7 @@ impl<const FRAME_SIZE: usize> NetworkState<FRAME_SIZE> {
     }
 
     fn epoch_is_active(&self, epoch: usize) -> bool {
-        self.link_up.load(Ordering::Acquire)
-            && self.link_epoch.load(Ordering::Acquire) == epoch
+        self.link_up.load(Ordering::Acquire) && self.link_epoch.load(Ordering::Acquire) == epoch
     }
 
     fn set_authorized_link(&self, up: bool) {
