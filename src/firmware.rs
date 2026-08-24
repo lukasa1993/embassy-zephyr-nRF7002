@@ -394,8 +394,7 @@ where
         let address = destination
             .checked_add(offset_u32)
             .ok_or(RpuError::InvalidArgument)?;
-        rpu.read(processor, address, &mut readback[..count])
-            .await?;
+        rpu.read(processor, address, &mut readback[..count]).await?;
         if readback[..count] != image.data[offset..offset + count] {
             return Err(LoadError::ReadbackMismatch {
                 kind: image.kind,
@@ -541,9 +540,6 @@ mod tests {
             FirmwareBundle::parse(&substituted),
             Err(FirmwareError::IncompatibleFeatures(FEATURE_SYSTEM_WITH_RAW))
         ));
-        assert_eq!(
-            policy.verify(&original_bundle),
-            Ok(())
-        );
+        assert_eq!(policy.verify(&original_bundle), Ok(()));
     }
 }
