@@ -5,6 +5,7 @@
 //! authorization command all succeed in order.
 
 use embedded_hal_async::delay::DelayNs;
+use sha2::{Digest, Sha256};
 
 use super::bus::Bus;
 use super::control::{ControlEvent, EAPOL_ETHERTYPE};
@@ -151,6 +152,7 @@ pub struct Wpa2Runtime {
     group_install: Option<Wpa2GroupKeyInstallRequest>,
     timeouts: Wpa2Timeouts,
     remaining_ms: Option<u32>,
+    last_input_digest: Option<[u8; 32]>,
     frame: [u8; MAX_EAPOL_ETHERNET_FRAME_LEN],
 }
 
@@ -167,6 +169,7 @@ impl Wpa2Runtime {
             group_install: None,
             timeouts: Wpa2Timeouts::DEFAULT,
             remaining_ms: None,
+            last_input_digest: None,
             frame: [0; MAX_EAPOL_ETHERNET_FRAME_LEN],
         };
         runtime.transition(Wpa2RuntimeState::AwaitingAuthenticator);
@@ -218,6 +221,7 @@ impl Wpa2Runtime {
         self.supplicant.restart_pairwise(supplicant_nonce)?;
         self.pairwise_install = None;
         self.group_install = None;
+        self.last_input_digest = None;
         self.transition(Wpa2RuntimeState::AwaitingAuthenticator);
         Ok(())
     }
@@ -237,16 +241,13 @@ impl Wpa2Runtime {
             Ok(payload) => payload,
             Err(error) => return self.fail(driver, error),
         };
-        if matches!(
-            self.state,
-            Wpa2RuntimeState::AwaitingEapolTransmit { .. }
-                | Wpa2RuntimeState::AwaitingPairwiseKeyStatus
-                | Wpa2RuntimeState::AwaitingGroupKeyStatus
-                | Wpa2RuntimeState::AwaitingDefaultGroupKeyStatus
-                | Wpa2RuntimeState::AwaitingAuthorizationStatus
-                | Wpa2RuntimeState::AwaitingGroupRekeyStatus
-                | Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus
-        ) {
+        let digest = input_digest(payload);
+        if self.has_pending_radio_operation() {
+            if self.last_input_digest == Some(digest) {
+                // Keep the original deadline. A retransmission cannot extend
+                // a stalled firmware command or an EAPOL transmit operation.
+                return Ok(Wpa2Progress::NoChange);
+            }
             return self.fail(driver, Wpa2RuntimeError::UnexpectedState(self.state));
         }
 
@@ -256,6 +257,7 @@ impl Wpa2Runtime {
             Ok(action) => action,
             Err(error) => return self.fail(driver, Wpa2RuntimeError::Wpa2(error)),
         };
+        self.last_input_digest = Some(digest);
         let result = match action {
             Wpa2Action::None => return Ok(Wpa2Progress::NoChange),
             Wpa2Action::Transmit(response) => {
@@ -483,6 +485,19 @@ impl Wpa2Runtime {
         Some(value.max(1))
     }
 
+    fn has_pending_radio_operation(&self) -> bool {
+        matches!(
+            self.state,
+            Wpa2RuntimeState::AwaitingEapolTransmit { .. }
+                | Wpa2RuntimeState::AwaitingPairwiseKeyStatus
+                | Wpa2RuntimeState::AwaitingGroupKeyStatus
+                | Wpa2RuntimeState::AwaitingDefaultGroupKeyStatus
+                | Wpa2RuntimeState::AwaitingAuthorizationStatus
+                | Wpa2RuntimeState::AwaitingGroupRekeyStatus
+                | Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus
+        )
+    }
+
     async fn submit_pairwise_key<B, D, const RX: usize, const TX: usize>(
         &mut self,
         driver: &mut NativeDriver<B, RX, TX>,
@@ -667,10 +682,18 @@ impl Wpa2Runtime {
         if let Some(request) = self.group_install.take() {
             let _ = self.supplicant.complete_group_key_install(request, false);
         }
+        self.last_input_digest = None;
         driver.enter_recovery();
         self.transition(Wpa2RuntimeState::Failed);
         Err(error)
     }
+}
+
+fn input_digest(payload: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(payload);
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&digest);
+    output
 }
 
 #[cfg(test)]
@@ -830,6 +853,16 @@ mod tests {
         }
     }
 
+    fn ethernet_eapol(payload: &[u8]) -> [u8; EAPOL_ETHERNET_HEADER_LEN + 4] {
+        assert_eq!(payload.len(), 4);
+        let mut frame = [0u8; EAPOL_ETHERNET_HEADER_LEN + 4];
+        frame[..6].copy_from_slice(&LOCAL);
+        frame[6..12].copy_from_slice(&PEER);
+        frame[12..14].copy_from_slice(&EAPOL_ETHERTYPE.to_be_bytes());
+        frame[14..].copy_from_slice(payload);
+        frame
+    }
+
     #[test]
     fn malformed_eapol_forces_driver_recovery() {
         let mut runtime = Wpa2Runtime::new(supplicant(), 0);
@@ -837,6 +870,44 @@ mod tests {
         let mut delay = NoDelay;
         let result = block_on(runtime.on_ethernet_frame(&mut driver, &mut delay, &[0; 8]));
         assert!(matches!(result, Err(Wpa2RuntimeError::FrameTooShort)));
+        assert_eq!(runtime.state(), Wpa2RuntimeState::Failed);
+        assert_eq!(driver.state(), DriverState::Recovering);
+    }
+
+    #[test]
+    fn exact_pending_retransmission_is_ignored_without_extending_the_deadline() {
+        let payload = [2, 3, 0, 0];
+        let frame = ethernet_eapol(&payload);
+        let mut runtime = Wpa2Runtime::new(supplicant(), 0);
+        runtime.state = Wpa2RuntimeState::AwaitingPairwiseKeyStatus;
+        runtime.remaining_ms = Some(123);
+        runtime.last_input_digest = Some(input_digest(&payload));
+        let mut driver = driver();
+        let mut delay = NoDelay;
+        let progress = block_on(runtime.on_ethernet_frame(&mut driver, &mut delay, &frame)).unwrap();
+        assert_eq!(progress, Wpa2Progress::NoChange);
+        assert_eq!(runtime.state(), Wpa2RuntimeState::AwaitingPairwiseKeyStatus);
+        assert_eq!(runtime.remaining_time_ms(), Some(123));
+        assert_ne!(driver.state(), DriverState::Recovering);
+    }
+
+    #[test]
+    fn conflicting_frame_during_pending_operation_forces_recovery() {
+        let payload = [2, 3, 0, 0];
+        let conflicting = [2, 3, 0, 1];
+        let frame = ethernet_eapol(&conflicting);
+        let mut runtime = Wpa2Runtime::new(supplicant(), 0);
+        runtime.state = Wpa2RuntimeState::AwaitingPairwiseKeyStatus;
+        runtime.last_input_digest = Some(input_digest(&payload));
+        let mut driver = driver();
+        let mut delay = NoDelay;
+        let result = block_on(runtime.on_ethernet_frame(&mut driver, &mut delay, &frame));
+        assert!(matches!(
+            result,
+            Err(Wpa2RuntimeError::UnexpectedState(
+                Wpa2RuntimeState::AwaitingPairwiseKeyStatus
+            ))
+        ));
         assert_eq!(runtime.state(), Wpa2RuntimeState::Failed);
         assert_eq!(driver.state(), DriverState::Recovering);
     }
