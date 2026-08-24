@@ -171,10 +171,8 @@ impl StationController {
     }
 
     /// Returns true only when normal data traffic is authorized.
-    pub const fn controlled_port_open(&self) -> bool {
-        self.state == StationState::Connected
-            && self.controlled_port_authorized
-            && self.carrier_on
+    pub fn controlled_port_open(&self) -> bool {
+        self.state == StationState::Connected && self.controlled_port_authorized && self.carrier_on
     }
 
     /// Replaces the state deadlines and rearms the current pending state.
@@ -598,13 +596,8 @@ impl StationController {
         let peer = self
             .peer
             .ok_or(StationError::Fault(StationFault::PeerMismatch))?;
-        let len = encode_deauthenticate(
-            &mut self.command,
-            self.ifaceindex,
-            peer,
-            reason_code,
-            false,
-        )?;
+        let len =
+            encode_deauthenticate(&mut self.command, self.ifaceindex, peer, reason_code, false)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
