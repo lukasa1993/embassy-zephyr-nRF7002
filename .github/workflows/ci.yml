@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  push:
+    branches: [main, native-embassy-nrf7002]
   pull_request:
 
 permissions:
@@ -10,579 +12,104 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  NRF_WIFI_REVISION: 5046744cb4c9640eb8b11cb92f1ea0b9554c20cf
+
 jobs:
-  state-deadlines:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+  rust:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    permissions:
-      contents: write
+    timeout-minutes: 30
     steps:
-      - name: Check out the driver branch
+      - name: Check out the driver
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: native-embassy-nrf7002
-          persist-credentials: true
+          persist-credentials: false
 
-      - name: Add bounded state deadlines
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          station_path = Path("src/station.rs")
-          station = station_path.read_text()
-
-          station = station.replace(
-              "    Connected,\n    Disconnecting,",
-              "    Connected,\n    PowerSavePending,\n    Disconnecting,",
-              1,
-          )
-
-          marker = "}\n\n/// Last fail-closed station fault.\n"
-          addition = r'''}
-
-          /// Bounded station-state deadlines in milliseconds.
-          #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-          pub struct StationTimeouts {
-              pub regulatory_ms: u32,
-              pub interface_ms: u32,
-              pub scan_ms: u32,
-              pub scan_complete_ms: u32,
-              pub scan_results_ms: u32,
-              pub authentication_ms: u32,
-              pub authenticated_ms: u32,
-              pub association_ms: u32,
-              pub key_exchange_ms: u32,
-              pub authorization_ms: u32,
-              pub carrier_ms: u32,
-              pub power_save_ms: u32,
-              pub disconnect_ms: u32,
-          }
-
-          impl StationTimeouts {
-              /// Conservative production defaults.
-              pub const DEFAULT: Self = Self {
-                  regulatory_ms: 5_000,
-                  interface_ms: 5_000,
-                  scan_ms: 30_000,
-                  scan_complete_ms: 10_000,
-                  scan_results_ms: 10_000,
-                  authentication_ms: 5_000,
-                  authenticated_ms: 10_000,
-                  association_ms: 5_000,
-                  key_exchange_ms: 10_000,
-                  authorization_ms: 5_000,
-                  carrier_ms: 5_000,
-                  power_save_ms: 5_000,
-                  disconnect_ms: 5_000,
-              };
-          }
-
-          impl Default for StationTimeouts {
-              fn default() -> Self {
-                  Self::DEFAULT
-              }
-          }
-
-          /// Last fail-closed station fault.
-          '''
-          assert marker in station
-          station = station.replace(marker, addition, 1)
-
-          station = station.replace(
-              "    CarrierLost,\n}",
-              "    CarrierLost,\n    Timeout(StationState),\n}",
-              1,
-          )
-
-          old = '''    pending_command: Option<UmacCommand>,
-              command: [u8; MAX_STATION_MESSAGE_LEN],
-          '''
-          new = '''    pending_command: Option<UmacCommand>,
-              pending_return_state: Option<StationState>,
-              timeouts: StationTimeouts,
-              remaining_ms: Option<u32>,
-              command: [u8; MAX_STATION_MESSAGE_LEN],
-          '''
-          assert old in station
-          station = station.replace(old, new, 1)
-
-          old = '''            pending_command: None,
-                      command: [0; MAX_STATION_MESSAGE_LEN],
-          '''
-          new = '''            pending_command: None,
-                      pending_return_state: None,
-                      timeouts: StationTimeouts::DEFAULT,
-                      remaining_ms: None,
-                      command: [0; MAX_STATION_MESSAGE_LEN],
-          '''
-          assert old in station
-          station = station.replace(old, new, 1)
-
-          marker = '''    /// Returns the most recent fail-closed fault.
-              pub const fn last_fault(&self) -> Option<StationFault> {
-          '''
-          methods = r'''    /// Replaces the state deadlines and rearms the current pending state.
-              pub fn set_timeouts(&mut self, timeouts: StationTimeouts) {
-                  self.timeouts = timeouts;
-                  self.remaining_ms = self.timeout_for(self.state);
-              }
-
-              /// Returns the remaining time for the current pending state.
-              pub const fn remaining_time_ms(&self) -> Option<u32> {
-                  self.remaining_ms
-              }
-
-              /// Advances the station deadlines.
-              ///
-              /// The caller must invoke this method from a monotonic timer path.
-              pub fn advance_time(&mut self, elapsed_ms: u32) -> Result<(), StationFault> {
-                  let Some(remaining) = self.remaining_ms else {
-                      return Ok(());
-                  };
-                  if elapsed_ms < remaining {
-                      self.remaining_ms = Some(remaining - elapsed_ms);
-                      return Ok(());
-                  }
-                  let fault = StationFault::Timeout(self.state);
-                  self.last_fault = Some(fault);
-                  self.pending_command = None;
-                  self.pending_return_state = None;
-                  self.transition(StationState::Fault);
-                  Err(fault)
-              }
-
-          '''
-          assert marker in station
-          station = station.replace(marker, methods + marker, 1)
-
-          old = '''        self.require_one_of(&[StationState::Idle, StationState::Connected])?;
-                  if let Some(timeout_ms) = timeout_ms {
-          '''
-          new = '''        self.require_one_of(&[StationState::Idle, StationState::Connected])?;
-                  let return_state = self.state;
-                  if let Some(timeout_ms) = timeout_ms {
-          '''
-          assert old in station
-          station = station.replace(old, new, 1)
-          old = '''        self.pending_command = Some(UmacCommand::SetPowerSave);
-                  Ok(())
-          '''
-          new = '''        self.pending_command = Some(UmacCommand::SetPowerSave);
-                  self.pending_return_state = Some(return_state);
-                  self.transition(StationState::PowerSavePending);
-                  Ok(())
-          '''
-          assert old in station
-          station = station.replace(old, new, 1)
-
-          old = '''        self.state = if self.secure_connection && self.controlled_port_authorized {
-                      if self.carrier_on {
-                          StationState::Connected
-                      } else {
-                          StationState::AwaitingCarrier
-                      }
-                  } else {
-                      StationState::Fault
-                  };
-                  self.state
-          '''
-          new = '''        let next_state = if self.secure_connection && self.controlled_port_authorized {
-                      if self.carrier_on {
-                          StationState::Connected
-                      } else {
-                          StationState::AwaitingCarrier
-                      }
-                  } else {
-                      StationState::Fault
-                  };
-                  self.transition(next_state);
-                  self.state
-          '''
-          assert old in station
-          station = station.replace(old, new, 1)
-
-          old = '''                self.state = if self.secure_connection {
-                              StationState::Securing
-                          } else {
-                              StationState::AwaitingCarrier
-                          };
-                          self.refresh_connected();
-          '''
-          new = '''                let next_state = if self.secure_connection {
-                              StationState::Securing
-                          } else {
-                              StationState::AwaitingCarrier
-                          };
-                          self.transition(next_state);
-                          self.refresh_connected();
-          '''
-          assert old in station
-          station = station.replace(old, new, 1)
-
-          old = '''        } else if command == UmacCommand::SetStation as u32
-                      && self.state == StationState::Authorizing
-                  {
-                      self.controlled_port_authorized = true;
-                      self.state = StationState::AwaitingCarrier;
-                      self.refresh_connected();
-                  }
-          '''
-          new = '''        } else if command == UmacCommand::SetStation as u32
-                      && self.state == StationState::Authorizing
-                  {
-                      self.controlled_port_authorized = true;
-                      self.transition(StationState::AwaitingCarrier);
-                      self.refresh_connected();
-                  } else if command == UmacCommand::SetPowerSave as u32
-                      && self.state == StationState::PowerSavePending
-                  {
-                      let return_state = self
-                          .pending_return_state
-                          .take()
-                          .unwrap_or(StationState::Fault);
-                      self.transition(return_state);
-                  }
-          '''
-          assert old in station
-          station = station.replace(old, new, 1)
-
-          # Reset the key-command deadline even when the state remains Securing.
-          old = '''        self.pending_command = Some(UmacCommand::SetKey);
-                  Ok(())
-          '''
-          new = '''        self.pending_command = Some(UmacCommand::SetKey);
-                  self.transition(StationState::Securing);
-                  Ok(())
-          '''
-          assert old in station
-          station = station.replace(old, new, 1)
-
-          station = re.sub(
-              r"self\.state = (StationState::[A-Za-z]+);",
-              r"self.transition(\1);",
-              station,
-          )
-
-          marker = '''    fn check_peer<E>(&mut self, peer: [u8; 6]) -> Result<(), StationError<E>> {
-          '''
-          helpers = r'''    fn transition(&mut self, state: StationState) {
-                  self.state = state;
-                  self.remaining_ms = self.timeout_for(state);
-              }
-
-              fn timeout_for(&self, state: StationState) -> Option<u32> {
-                  let value = match state {
-                      StationState::RegulatoryPending => self.timeouts.regulatory_ms,
-                      StationState::InterfaceUpPending | StationState::InterfaceDownPending => {
-                          self.timeouts.interface_ms
-                      }
-                      StationState::Scanning => self.timeouts.scan_ms,
-                      StationState::ScanComplete => self.timeouts.scan_complete_ms,
-                      StationState::ReadingScanResults => self.timeouts.scan_results_ms,
-                      StationState::Authenticating => self.timeouts.authentication_ms,
-                      StationState::Authenticated => self.timeouts.authenticated_ms,
-                      StationState::Associating => self.timeouts.association_ms,
-                      StationState::Securing => self.timeouts.key_exchange_ms,
-                      StationState::Authorizing => self.timeouts.authorization_ms,
-                      StationState::AwaitingCarrier => self.timeouts.carrier_ms,
-                      StationState::PowerSavePending => self.timeouts.power_save_ms,
-                      StationState::Disconnecting => self.timeouts.disconnect_ms,
-                      StationState::Down
-                      | StationState::Idle
-                      | StationState::Connected
-                      | StationState::Recovering
-                      | StationState::Fault => return None,
-                  };
-                  Some(value.max(1))
-              }
-
-          '''
-          assert marker in station
-          station = station.replace(marker, helpers + marker, 1)
-
-          # Recovery and failure must clear all pending return state.
-          station = station.replace(
-              '''        self.pending_command = None;
-                  }
-          ''',
-              '''        self.pending_command = None;
-                      self.pending_return_state = None;
-                  }
-          ''',
-              1,
-          )
-          station = station.replace(
-              '''        self.last_fault = Some(fault);
-                  self.transition(StationState::Fault);
-          ''',
-              '''        self.last_fault = Some(fault);
-                  self.pending_command = None;
-                  self.pending_return_state = None;
-                  self.transition(StationState::Fault);
-          ''',
-              1,
-          )
-
-          end = station.rfind("\n}")
-          test = r'''
-
-              #[test]
-              fn pending_station_state_has_a_bounded_deadline() {
-                  let mut station = StationController::new(1, 0, 7);
-                  station.transition(StationState::Authenticating);
-                  assert_eq!(station.remaining_time_ms(), Some(5_000));
-                  assert_eq!(station.advance_time(4_999), Ok(()));
-                  assert_eq!(
-                      station.advance_time(1),
-                      Err(StationFault::Timeout(StationState::Authenticating))
-                  );
-                  assert_eq!(station.state(), StationState::Fault);
-              }
-          '''
-          station = station[:end] + test + station[end:]
-          station_path.write_text(station)
-
-          runtime_path = Path("src/runtime.rs")
-          runtime = runtime_path.read_text()
-          marker = '''    /// Polls, parses, and applies one complete RPU event.
-              pub async fn poll_event<'a>(
-          '''
-          addition = r'''    /// Advances station-control deadlines.
-              pub fn advance_time(&mut self, elapsed_ms: u32) -> Result<(), DriverError<B::Error>> {
-                  match self.station.advance_time(elapsed_ms) {
-                      Ok(()) => Ok(()),
-                      Err(fault) => {
-                          self.enter_recovery();
-                          Err(DriverError::Station(StationError::Fault(fault)))
-                      }
-                  }
-              }
-
-          '''
-          assert marker in runtime
-          runtime = runtime.replace(marker, addition + marker, 1)
-          runtime_path.write_text(runtime)
-
-          wpa_path = Path("src/wpa2_runtime.rs")
-          wpa = wpa_path.read_text()
-          marker = "}\n\n/// WPA2 radio integration progress.\n"
-          addition = r'''}
-
-          /// Bounded WPA2 phase deadlines in milliseconds.
-          #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-          pub struct Wpa2Timeouts {
-              pub authenticator_ms: u32,
-              pub eapol_transmit_ms: u32,
-              pub firmware_command_ms: u32,
-              pub carrier_ms: u32,
-          }
-
-          impl Wpa2Timeouts {
-              /// Conservative production defaults.
-              pub const DEFAULT: Self = Self {
-                  authenticator_ms: 5_000,
-                  eapol_transmit_ms: 2_000,
-                  firmware_command_ms: 5_000,
-                  carrier_ms: 5_000,
-              };
-          }
-
-          impl Default for Wpa2Timeouts {
-              fn default() -> Self {
-                  Self::DEFAULT
-              }
-          }
-
-          /// WPA2 radio integration progress.
-          '''
-          assert marker in wpa
-          wpa = wpa.replace(marker, addition, 1)
-          wpa = wpa.replace(
-              "    TransmitFailed,\n}",
-              "    TransmitFailed,\n    Timeout(Wpa2RuntimeState),\n}",
-              1,
-          )
-          old = '''    group_install: Option<Wpa2GroupKeyInstallRequest>,
-              frame: [u8; MAX_EAPOL_ETHERNET_FRAME_LEN],
-          '''
-          new = '''    group_install: Option<Wpa2GroupKeyInstallRequest>,
-              timeouts: Wpa2Timeouts,
-              remaining_ms: Option<u32>,
-              frame: [u8; MAX_EAPOL_ETHERNET_FRAME_LEN],
-          '''
-          assert old in wpa
-          wpa = wpa.replace(old, new, 1)
-          old = '''    pub fn new(supplicant: Wpa2Supplicant, wdev_id: u8) -> Self {
-                  let local = supplicant.local();
-                  Self {
-                      supplicant,
-                      local,
-                      wdev_id,
-                      state: Wpa2RuntimeState::AwaitingAuthenticator,
-                      pairwise_install: None,
-                      group_install: None,
-                      frame: [0; MAX_EAPOL_ETHERNET_FRAME_LEN],
-                  }
-              }
-          '''
-          new = '''    pub fn new(supplicant: Wpa2Supplicant, wdev_id: u8) -> Self {
-                  let local = supplicant.local();
-                  let mut runtime = Self {
-                      supplicant,
-                      local,
-                      wdev_id,
-                      state: Wpa2RuntimeState::AwaitingAuthenticator,
-                      pairwise_install: None,
-                      group_install: None,
-                      timeouts: Wpa2Timeouts::DEFAULT,
-                      remaining_ms: None,
-                      frame: [0; MAX_EAPOL_ETHERNET_FRAME_LEN],
-                  };
-                  runtime.transition(Wpa2RuntimeState::AwaitingAuthenticator);
-                  runtime
-              }
-          '''
-          assert old in wpa
-          wpa = wpa.replace(old, new, 1)
-
-          marker = '''    /// Borrows the underlying supplicant.
-              pub const fn supplicant(&self) -> &Wpa2Supplicant {
-          '''
-          methods = r'''    /// Replaces WPA2 deadlines and rearms the current phase.
-              pub fn set_timeouts(&mut self, timeouts: Wpa2Timeouts) {
-                  self.timeouts = timeouts;
-                  self.remaining_ms = self.timeout_for(self.state);
-              }
-
-              /// Returns the remaining time for the current WPA2 phase.
-              pub const fn remaining_time_ms(&self) -> Option<u32> {
-                  self.remaining_ms
-              }
-
-              /// Advances WPA2 phase deadlines and forces recovery on expiry.
-              pub fn advance_time<B, const RX: usize, const TX: usize>(
-                  &mut self,
-                  driver: &mut NativeDriver<B, RX, TX>,
-                  elapsed_ms: u32,
-              ) -> Result<(), Wpa2RuntimeError<B::Error>>
-              where
-                  B: Bus,
-              {
-                  let Some(remaining) = self.remaining_ms else {
-                      return Ok(());
-                  };
-                  if elapsed_ms < remaining {
-                      self.remaining_ms = Some(remaining - elapsed_ms);
-                      return Ok(());
-                  }
-                  self.fail(driver, Wpa2RuntimeError::Timeout(self.state))
-              }
-
-          '''
-          assert marker in wpa
-          wpa = wpa.replace(marker, methods + marker, 1)
-
-          wpa = wpa.replace(
-              "        self.state = Wpa2RuntimeState::AwaitingEapolTransmit { token, purpose };",
-              "        self.transition(Wpa2RuntimeState::AwaitingEapolTransmit { token, purpose });",
-              1,
-          )
-          wpa = re.sub(
-              r"self\.state = (Wpa2RuntimeState::[A-Za-z]+);",
-              r"self.transition(\1);",
-              wpa,
-          )
-
-          marker = '''    async fn submit_pairwise_key<B, D, const RX: usize, const TX: usize>(
-          '''
-          helpers = r'''    fn transition(&mut self, state: Wpa2RuntimeState) {
-                  self.state = state;
-                  self.remaining_ms = self.timeout_for(state);
-              }
-
-              fn timeout_for(&self, state: Wpa2RuntimeState) -> Option<u32> {
-                  let value = match state {
-                      Wpa2RuntimeState::AwaitingAuthenticator => self.timeouts.authenticator_ms,
-                      Wpa2RuntimeState::AwaitingEapolTransmit { .. } => {
-                          self.timeouts.eapol_transmit_ms
-                      }
-                      Wpa2RuntimeState::AwaitingPairwiseKeyStatus
-                      | Wpa2RuntimeState::AwaitingGroupKeyStatus
-                      | Wpa2RuntimeState::AwaitingDefaultGroupKeyStatus
-                      | Wpa2RuntimeState::AwaitingAuthorizationStatus
-                      | Wpa2RuntimeState::AwaitingGroupRekeyStatus
-                      | Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus => {
-                          self.timeouts.firmware_command_ms
-                      }
-                      Wpa2RuntimeState::AwaitingCarrier => self.timeouts.carrier_ms,
-                      Wpa2RuntimeState::Complete | Wpa2RuntimeState::Failed => return None,
-                  };
-                  Some(value.max(1))
-              }
-
-          '''
-          assert marker in wpa
-          wpa = wpa.replace(marker, helpers + marker, 1)
-
-          end = wpa.rfind("\n}")
-          test = r'''
-
-              #[test]
-              fn wpa2_phase_timeout_forces_runtime_recovery() {
-                  let mut runtime = Wpa2Runtime::new(supplicant(), 0);
-                  let mut driver = driver();
-                  assert_eq!(runtime.remaining_time_ms(), Some(5_000));
-                  assert!(matches!(
-                      runtime.advance_time(&mut driver, 5_000),
-                      Err(Wpa2RuntimeError::Timeout(
-                          Wpa2RuntimeState::AwaitingAuthenticator
-                      ))
-                  ));
-                  assert_eq!(runtime.state(), Wpa2RuntimeState::Failed);
-                  assert_eq!(driver.state(), DriverState::Recovering);
-              }
-          '''
-          wpa = wpa[:end] + test + wpa[end:]
-          wpa_path.write_text(wpa)
-
-          lib_path = Path("src/lib.rs")
-          lib = lib_path.read_text()
-          lib = lib.replace(
-              "pub use station::{StationController, StationError, StationFault, StationState};",
-              "pub use station::{\n    StationController, StationError, StationFault, StationState, StationTimeouts,\n};",
-              1,
-          )
-          lib = lib.replace(
-              "    EapolTransmitPurpose, Wpa2Progress, Wpa2Runtime, Wpa2RuntimeError, Wpa2RuntimeState,\n};",
-              "    EapolTransmitPurpose, Wpa2Progress, Wpa2Runtime, Wpa2RuntimeError, Wpa2RuntimeState,\n    Wpa2Timeouts,\n};",
-              1,
-          )
-          lib_path.write_text(lib)
-          PY
-
-      - name: Install Rust toolchains
+      - name: Install the pinned Rust toolchain
         run: |
           set -euxo pipefail
-          rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy --target thumbv8m.main-none-eabihf
-          rustup toolchain install 1.85.0 --profile minimal --target thumbv8m.main-none-eabihf
+          rustup toolchain install 1.95.0 \
+            --profile minimal \
+            --component rustfmt,clippy \
+            --target thumbv8m.main-none-eabihf
 
-      - name: Format and verify
+      - name: Check formatting
+        run: cargo +1.95.0 fmt --all --check
+
+      - name: Run the host test matrix
         run: |
           set -euxo pipefail
-          cargo +1.95.0 fmt --all -- --emit files
+          cargo +1.95.0 test --no-default-features
+          cargo +1.95.0 test --features embassy-net
+          cargo +1.95.0 test --features wpa2
           cargo +1.95.0 test --all-features
-          cargo +1.95.0 clippy --all-targets --all-features -- -D warnings
+
+      - name: Run Clippy for all targets and features
+        run: cargo +1.95.0 clippy --all-targets --all-features -- -D warnings
+
+      - name: Check every no-std feature combination
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          set -euxo pipefail
+          cargo +1.95.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
+          cargo +1.95.0 check --lib --features embassy-net --target thumbv8m.main-none-eabihf
+          cargo +1.95.0 check --lib --features wpa2 --target thumbv8m.main-none-eabihf
           cargo +1.95.0 check --lib --features embassy-net,wpa2 --target thumbv8m.main-none-eabihf
-          RUSTDOCFLAGS='-D warnings' cargo +1.95.0 doc --lib --all-features --no-deps
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +1.95.0 doc --lib --all-features --no-deps
+
+  msrv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        run: |
+          set -euxo pipefail
+          rustup toolchain install 1.85.0 \
+            --profile minimal \
+            --target thumbv8m.main-none-eabihf
+
+      - name: Check the complete feature set at the minimum Rust version
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          set -euxo pipefail
+          cargo +1.85.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
           cargo +1.85.0 check --lib --features embassy-net,wpa2 --target thumbv8m.main-none-eabihf
 
-      - name: Commit the verified deadlines
+  nordic-layout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the pinned Nordic host interface
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zephyrproject-rtos/nrf_wifi
+          ref: ${{ env.NRF_WIFI_REVISION }}
+          path: nrf_wifi
+          persist-credentials: false
+
+      - name: Check packed sizes, offsets, and numeric ABI values
         run: |
           set -euxo pipefail
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src
-          git commit -m "Add bounded station and WPA2 deadlines"
-          git push origin HEAD:native-embassy-nrf7002
+          cc -std=c11 -Wall -Wextra -Werror \
+            -I nrf_wifi/fw_if/umac_if/inc \
+            -I nrf_wifi/fw_if/umac_if/inc/fw \
+            -I nrf_wifi/hw_if/hal/inc \
+            tests/layout_probe.c \
+            -o /tmp/nrf7002-layout-probe
+          /tmp/nrf7002-layout-probe
