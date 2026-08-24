@@ -10,6 +10,7 @@ use aes::Aes128;
 use aes::cipher::{Block, BlockDecrypt, KeyInit};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use super::control::{KeyConfig, KeyType, RSN_CIPHER_CCMP_128};
@@ -54,6 +55,10 @@ const KEY_DATA_OFFSET: usize = 99;
 const WPA2_PRF_LABEL: &[u8] = b"Pairwise key expansion";
 const AES_KEY_WRAP_IV: [u8; 8] = [0xa6; 8];
 const GTK_KDE_OUI_TYPE: [u8; 4] = [0x00, 0x0f, 0xac, 0x01];
+const RSN_CIPHER_CCMP_SUITE: [u8; 4] = [0x00, 0x0f, 0xac, 0x04];
+const RSN_AKM_PSK_SUITE: [u8; 4] = [0x00, 0x0f, 0xac, 0x02];
+const RSN_CAP_MFPR: u16 = 1 << 6;
+const RSN_CAP_MFPC: u16 = 1 << 7;
 
 /// Nordic default-key flag.
 pub const NRF_WIFI_KEY_DEFAULT: u16 = 1 << 0;
@@ -90,13 +95,16 @@ pub enum Wpa2Error {
     InvalidPassphraseLength,
     InvalidSsidLength,
     InvalidRsnInformationElement,
+    UnsupportedRsnCapabilities,
     InvalidSupplicantNonce,
     FrameTooShort,
     FrameTooLarge,
     LengthMismatch,
     NotEapolKey,
+    UnsupportedProtocolVersion(u8),
     UnsupportedDescriptor,
     UnsupportedDescriptorVersion(u8),
+    InvalidPairwiseKeyLength(u16),
     UnsupportedMessage,
     WrongPeer,
     InvalidPhase,
@@ -234,6 +242,13 @@ impl EapolTxFrame {
     /// Returns true when the frame has no bytes.
     pub const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+impl Drop for EapolTxFrame {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+        self.len = 0;
     }
 }
 
@@ -382,9 +397,13 @@ pub struct Wpa2Supplicant {
     rsn_ie_len: usize,
     rsn_ie: [u8; MAX_RSN_IE_LEN],
     message1_replay: Option<u64>,
+    message1_digest: Option<[u8; 32]>,
     completed_replay: Option<u64>,
+    completed_message3_digest: Option<[u8; 32]>,
     last_group_replay: Option<u64>,
+    last_group_message1_digest: Option<[u8; 32]>,
     pending_ticket: Option<(u32, u64, bool)>,
+    pending_frame_digest: Option<[u8; 32]>,
     next_ticket: u32,
 }
 
@@ -412,9 +431,13 @@ impl Wpa2Supplicant {
             rsn_ie_len: rsn_ie.len(),
             rsn_ie: stored_rsn_ie,
             message1_replay: None,
+            message1_digest: None,
             completed_replay: None,
+            completed_message3_digest: None,
             last_group_replay: None,
+            last_group_message1_digest: None,
             pending_ticket: None,
+            pending_frame_digest: None,
             next_ticket: 1,
         })
     }
@@ -441,11 +464,16 @@ impl Wpa2Supplicant {
             return Err(Wpa2Error::Busy);
         }
         self.ptk = None;
+        self.supplicant_nonce.zeroize();
         self.supplicant_nonce = supplicant_nonce;
         self.authenticator_nonce.zeroize();
         self.message1_replay = None;
+        clear_digest(&mut self.message1_digest);
         self.completed_replay = None;
+        clear_digest(&mut self.completed_message3_digest);
         self.last_group_replay = None;
+        clear_digest(&mut self.last_group_message1_digest);
+        clear_digest(&mut self.pending_frame_digest);
         self.phase = Wpa2Phase::AwaitingMessage1;
         Ok(())
     }
@@ -455,16 +483,36 @@ impl Wpa2Supplicant {
         if peer != self.peer {
             return self.fail(Wpa2Error::WrongPeer);
         }
-        if self.pending_ticket.is_some() {
-            return Err(Wpa2Error::Busy);
-        }
         let frame = EapolKeyFrame::parse(bytes)?;
         if frame.key_info().descriptor_version() != KEY_DESCRIPTOR_VERSION_HMAC_SHA1_AES as u8 {
             return self.fail(Wpa2Error::UnsupportedDescriptorVersion(
                 frame.key_info().descriptor_version(),
             ));
         }
-        match frame.message() {
+        let message = frame.message();
+        if matches!(
+            message,
+            EapolKeyMessage::PairwiseMessage1 | EapolKeyMessage::PairwiseMessage3
+        ) && frame.key_length() != CCMP_KEY_LEN as u16
+        {
+            return self.fail(Wpa2Error::InvalidPairwiseKeyLength(frame.key_length()));
+        }
+        let digest = frame.digest();
+        if let Some((_, replay, group)) = self.pending_ticket {
+            if frame.replay_counter() == replay {
+                let expected = if group {
+                    EapolKeyMessage::GroupMessage1
+                } else {
+                    EapolKeyMessage::PairwiseMessage3
+                };
+                if message == expected && self.pending_frame_digest == Some(digest) {
+                    return Ok(Wpa2Action::None);
+                }
+                return self.fail(Wpa2Error::ConflictingRetransmission);
+            }
+            return Err(Wpa2Error::Busy);
+        }
+        match message {
             EapolKeyMessage::PairwiseMessage1 => self.on_message1(frame),
             EapolKeyMessage::PairwiseMessage3 => self.on_message3(frame),
             EapolKeyMessage::GroupMessage1 => self.on_group_message1(frame),
@@ -481,11 +529,15 @@ impl Wpa2Supplicant {
         if self.pending_ticket != Some((request.ticket, request.replay_counter, false)) {
             return self.fail(Wpa2Error::StaleCompletion);
         }
+        let Some(digest) = self.pending_frame_digest.take() else {
+            return self.fail(Wpa2Error::StaleCompletion);
+        };
         self.pending_ticket = None;
         if !installed {
             return self.fail(Wpa2Error::InstallFailed);
         }
         self.completed_replay = Some(request.replay_counter);
+        self.completed_message3_digest = Some(digest);
         self.phase = Wpa2Phase::Complete;
         Ok(request.response)
     }
@@ -499,19 +551,27 @@ impl Wpa2Supplicant {
         if self.pending_ticket != Some((request.ticket, request.replay_counter, true)) {
             return self.fail(Wpa2Error::StaleCompletion);
         }
+        let Some(digest) = self.pending_frame_digest.take() else {
+            return self.fail(Wpa2Error::StaleCompletion);
+        };
         self.pending_ticket = None;
         if !installed {
             return self.fail(Wpa2Error::InstallFailed);
         }
         self.completed_replay = Some(request.replay_counter);
         self.last_group_replay = Some(request.replay_counter);
+        self.last_group_message1_digest = Some(digest);
         self.phase = Wpa2Phase::Complete;
         Ok(request.response)
     }
 
     fn on_message1(&mut self, frame: EapolKeyFrame<'_>) -> Result<Wpa2Action, Wpa2Error> {
+        if !frame.key_data().is_empty() {
+            return self.fail(Wpa2Error::UnsupportedMessage);
+        }
         let replay = frame.replay_counter();
         let nonce = *frame.nonce();
+        let digest = frame.digest();
         if nonce.iter().all(|value| *value == 0) {
             return self.fail(Wpa2Error::InvalidAuthenticatorNonce);
         }
@@ -531,7 +591,7 @@ impl Wpa2Supplicant {
                 return self.fail(Wpa2Error::StaleReplayCounter);
             }
             if replay == previous {
-                if self.authenticator_nonce != nonce {
+                if self.authenticator_nonce != nonce || self.message1_digest != Some(digest) {
                     return self.fail(Wpa2Error::ConflictingRetransmission);
                 }
                 let ptk = self.ptk.as_ref().ok_or(Wpa2Error::InvalidPhase)?;
@@ -550,6 +610,7 @@ impl Wpa2Supplicant {
 
         self.authenticator_nonce = nonce;
         self.message1_replay = Some(replay);
+        self.message1_digest = Some(digest);
         self.ptk = Some(
             self.pmk
                 .derive_ptk(self.peer, self.local, nonce, self.supplicant_nonce),
@@ -568,6 +629,7 @@ impl Wpa2Supplicant {
     }
 
     fn on_message3(&mut self, frame: EapolKeyFrame<'_>) -> Result<Wpa2Action, Wpa2Error> {
+        let digest = frame.digest();
         let ptk = self.ptk.as_ref().ok_or(Wpa2Error::InvalidPhase)?;
         if *frame.nonce() != self.authenticator_nonce {
             return self.fail(Wpa2Error::InvalidAuthenticatorNonce);
@@ -580,6 +642,9 @@ impl Wpa2Supplicant {
         if self.phase == Wpa2Phase::Complete {
             if self.completed_replay != Some(replay) {
                 return self.fail(Wpa2Error::StaleReplayCounter);
+            }
+            if self.completed_message3_digest != Some(digest) {
+                return self.fail(Wpa2Error::ConflictingRetransmission);
             }
             return Ok(Wpa2Action::Transmit(build_message4(
                 self.peer,
@@ -626,6 +691,7 @@ impl Wpa2Supplicant {
         let ticket = self.next_ticket;
         self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
         self.pending_ticket = Some((ticket, replay, false));
+        self.pending_frame_digest = Some(digest);
         self.phase = Wpa2Phase::InstallingKeys;
         Ok(Wpa2Action::InstallKeys(Wpa2KeyInstallRequest {
             ticket,
@@ -640,11 +706,15 @@ impl Wpa2Supplicant {
         if self.phase != Wpa2Phase::Complete {
             return self.fail(Wpa2Error::InvalidPhase);
         }
+        let digest = frame.digest();
         let ptk = self.ptk.as_ref().ok_or(Wpa2Error::InvalidPhase)?;
         let replay = frame.replay_counter();
         if self.last_group_replay == Some(replay) {
             if !frame.verify_mic(ptk) {
                 return self.fail(Wpa2Error::InvalidMic);
+            }
+            if self.last_group_message1_digest != Some(digest) {
+                return self.fail(Wpa2Error::ConflictingRetransmission);
             }
             return Ok(Wpa2Action::Transmit(build_group_message2(
                 self.peer,
@@ -685,6 +755,7 @@ impl Wpa2Supplicant {
         let ticket = self.next_ticket;
         self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
         self.pending_ticket = Some((ticket, replay, true));
+        self.pending_frame_digest = Some(digest);
         Ok(Wpa2Action::InstallGroupKey(Wpa2GroupKeyInstallRequest {
             ticket,
             replay_counter: replay,
@@ -694,8 +765,18 @@ impl Wpa2Supplicant {
     }
 
     fn fail<T>(&mut self, error: Wpa2Error) -> Result<T, Wpa2Error> {
-        self.phase = Wpa2Phase::Failed;
+        self.ptk = None;
+        self.supplicant_nonce.zeroize();
+        self.authenticator_nonce.zeroize();
+        self.message1_replay = None;
+        clear_digest(&mut self.message1_digest);
+        self.completed_replay = None;
+        clear_digest(&mut self.completed_message3_digest);
+        self.last_group_replay = None;
+        clear_digest(&mut self.last_group_message1_digest);
         self.pending_ticket = None;
+        clear_digest(&mut self.pending_frame_digest);
+        self.phase = Wpa2Phase::Failed;
         Err(error)
     }
 }
@@ -705,6 +786,10 @@ impl Drop for Wpa2Supplicant {
         self.supplicant_nonce.zeroize();
         self.authenticator_nonce.zeroize();
         self.rsn_ie.zeroize();
+        clear_digest(&mut self.message1_digest);
+        clear_digest(&mut self.completed_message3_digest);
+        clear_digest(&mut self.last_group_message1_digest);
+        clear_digest(&mut self.pending_frame_digest);
     }
 }
 
@@ -776,6 +861,9 @@ impl<'a> EapolKeyFrame<'a> {
         }
         if bytes.len() > MAX_EAPOL_FRAME_LEN {
             return Err(Wpa2Error::FrameTooLarge);
+        }
+        if !matches!(bytes[0], 1 | 2) {
+            return Err(Wpa2Error::UnsupportedProtocolVersion(bytes[0]));
         }
         if bytes[1] != EAPOL_PACKET_TYPE_KEY {
             return Err(Wpa2Error::NotEapolKey);
@@ -858,6 +946,13 @@ impl<'a> EapolKeyFrame<'a> {
         self.key_data
     }
 
+    fn digest(self) -> [u8; 32] {
+        let digest = Sha256::digest(self.bytes);
+        let mut output = [0u8; 32];
+        output.copy_from_slice(&digest);
+        output
+    }
+
     fn verify_mic(self, ptk: &Ptk) -> bool {
         let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(ptk.kck())
             .expect("a fixed WPA2 KCK length is valid for HMAC");
@@ -894,9 +989,12 @@ fn parse_gtk_kde(bytes: &[u8]) -> Result<GtkKde<'_>, Wpa2Error> {
             return Err(Wpa2Error::MissingGroupKey);
         }
         let body = &bytes[offset + 2..end];
-        if element_id == 0xdd && body.len() >= 6 && body[..4] == GTK_KDE_OUI_TYPE {
+        if element_id == 0xdd && body.len() >= 4 && body[..4] == GTK_KDE_OUI_TYPE {
+            if body.len() != 22 || body[4] & 0xf8 != 0 || body[5] != 0 {
+                return Err(Wpa2Error::InvalidEncryptedKeyData);
+            }
             let key = &body[6..];
-            if key.len() != 16 && key.len() != 32 {
+            if key.len() != CCMP_KEY_LEN {
                 return Err(Wpa2Error::UnsupportedGroupKeyLength);
             }
             return Ok(GtkKde {
@@ -1076,7 +1174,106 @@ fn validate_rsn_ie(rsn_ie: &[u8]) -> Result<(), Wpa2Error> {
     {
         return Err(Wpa2Error::InvalidRsnInformationElement);
     }
-    Ok(())
+    let body = &rsn_ie[2..];
+    let mut offset = 0usize;
+    if take_u16(body, &mut offset)? != 1 {
+        return Err(Wpa2Error::InvalidRsnInformationElement);
+    }
+    if take_suite(body, &mut offset)? != RSN_CIPHER_CCMP_SUITE {
+        return Err(Wpa2Error::InvalidRsnInformationElement);
+    }
+
+    let pairwise_count = take_u16(body, &mut offset)? as usize;
+    if pairwise_count == 0 {
+        return Err(Wpa2Error::InvalidRsnInformationElement);
+    }
+    let pairwise_len = pairwise_count
+        .checked_mul(4)
+        .ok_or(Wpa2Error::InvalidRsnInformationElement)?;
+    let pairwise_end = offset
+        .checked_add(pairwise_len)
+        .ok_or(Wpa2Error::InvalidRsnInformationElement)?;
+    let pairwise = body
+        .get(offset..pairwise_end)
+        .ok_or(Wpa2Error::InvalidRsnInformationElement)?;
+    if !pairwise
+        .chunks_exact(4)
+        .any(|suite| suite == RSN_CIPHER_CCMP_SUITE)
+    {
+        return Err(Wpa2Error::InvalidRsnInformationElement);
+    }
+    offset = pairwise_end;
+
+    let akm_count = take_u16(body, &mut offset)? as usize;
+    if akm_count == 0 {
+        return Err(Wpa2Error::InvalidRsnInformationElement);
+    }
+    let akm_len = akm_count
+        .checked_mul(4)
+        .ok_or(Wpa2Error::InvalidRsnInformationElement)?;
+    let akm_end = offset
+        .checked_add(akm_len)
+        .ok_or(Wpa2Error::InvalidRsnInformationElement)?;
+    let akms = body
+        .get(offset..akm_end)
+        .ok_or(Wpa2Error::InvalidRsnInformationElement)?;
+    if !akms
+        .chunks_exact(4)
+        .any(|suite| suite == RSN_AKM_PSK_SUITE)
+    {
+        return Err(Wpa2Error::InvalidRsnInformationElement);
+    }
+    offset = akm_end;
+
+    if offset == body.len() {
+        return Ok(());
+    }
+    let capabilities = take_u16(body, &mut offset)?;
+    if capabilities & (RSN_CAP_MFPR | RSN_CAP_MFPC) != 0 {
+        return Err(Wpa2Error::UnsupportedRsnCapabilities);
+    }
+    if offset == body.len() {
+        return Ok(());
+    }
+    let pmkid_count = take_u16(body, &mut offset)?;
+    if pmkid_count != 0 {
+        return Err(Wpa2Error::UnsupportedRsnCapabilities);
+    }
+    if offset == body.len() {
+        return Ok(());
+    }
+    Err(Wpa2Error::UnsupportedRsnCapabilities)
+}
+
+fn take_u16(bytes: &[u8], offset: &mut usize) -> Result<u16, Wpa2Error> {
+    let end = offset
+        .checked_add(2)
+        .ok_or(Wpa2Error::InvalidRsnInformationElement)?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or(Wpa2Error::InvalidRsnInformationElement)?;
+    *offset = end;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn take_suite(bytes: &[u8], offset: &mut usize) -> Result<[u8; 4], Wpa2Error> {
+    let end = offset
+        .checked_add(4)
+        .ok_or(Wpa2Error::InvalidRsnInformationElement)?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or(Wpa2Error::InvalidRsnInformationElement)?;
+    *offset = end;
+    value
+        .try_into()
+        .map_err(|_| Wpa2Error::InvalidRsnInformationElement)
+}
+
+fn clear_digest(value: &mut Option<[u8; 32]>) {
+    if let Some(bytes) = value.as_mut() {
+        bytes.zeroize();
+    }
+    *value = None;
 }
 
 #[cfg(test)]
@@ -1107,6 +1304,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_an_rsn_profile_without_ccmp() {
+        let mut rsn = RSN_IE;
+        rsn[7] = 2;
+        assert!(matches!(
+            Wpa2Supplicant::new(LOCAL, PEER, SNONCE, Pmk::from_bytes([1; 32]), &rsn),
+            Err(Wpa2Error::InvalidRsnInformationElement)
+        ));
+    }
+
+    #[test]
     fn unwraps_rfc3394_vector() {
         let kek = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
@@ -1128,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn completes_pairwise_handshake_and_rejects_stale_replay() {
+    fn completes_pairwise_handshake_and_accepts_exact_retransmission() {
         let pmk = Pmk::from_bytes([0x33; 32]);
         let mut supplicant = Wpa2Supplicant::new(LOCAL, PEER, SNONCE, pmk, &RSN_IE).unwrap();
         let message1 = build_authenticator_frame(
@@ -1172,6 +1379,10 @@ mod tests {
         let Wpa2Action::InstallKeys(request) = supplicant.on_eapol(PEER, &message3).unwrap() else {
             panic!("Message 3 must request atomic key installation");
         };
+        assert!(matches!(
+            supplicant.on_eapol(PEER, &message3),
+            Ok(Wpa2Action::None)
+        ));
         assert_eq!(request.pairwise().key_config().key.len(), 16);
         assert_eq!(request.group().key_config().key, &gtk);
         let message4 = supplicant.complete_key_install(request, true).unwrap();
@@ -1180,6 +1391,10 @@ mod tests {
             EapolKeyMessage::PairwiseMessage4
         );
         assert_eq!(supplicant.phase(), Wpa2Phase::Complete);
+        assert!(matches!(
+            supplicant.on_eapol(PEER, &message3),
+            Ok(Wpa2Action::Transmit(_))
+        ));
 
         let stale = build_authenticator_frame(
             KEY_DESCRIPTOR_VERSION_HMAC_SHA1_AES | KEY_INFO_ACK | KEY_INFO_MIC | KEY_INFO_SECURE,
@@ -1195,7 +1410,44 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_peer() {
+    fn rejects_unsupported_protocol_version() {
+        let pmk = Pmk::from_bytes([0x33; 32]);
+        let mut supplicant = Wpa2Supplicant::new(LOCAL, PEER, SNONCE, pmk, &RSN_IE).unwrap();
+        let mut message1 = build_authenticator_frame(
+            KEY_DESCRIPTOR_VERSION_HMAC_SHA1_AES | KEY_INFO_PAIRWISE | KEY_INFO_ACK,
+            1,
+            ANONCE,
+            &[],
+            None,
+        );
+        message1[0] = 3;
+        assert!(matches!(
+            supplicant.on_eapol(PEER, &message1),
+            Err(Wpa2Error::UnsupportedProtocolVersion(3))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_pairwise_key_length() {
+        let pmk = Pmk::from_bytes([0x33; 32]);
+        let mut supplicant = Wpa2Supplicant::new(LOCAL, PEER, SNONCE, pmk, &RSN_IE).unwrap();
+        let mut message1 = build_authenticator_frame(
+            KEY_DESCRIPTOR_VERSION_HMAC_SHA1_AES | KEY_INFO_PAIRWISE | KEY_INFO_ACK,
+            1,
+            ANONCE,
+            &[],
+            None,
+        );
+        message1[7..9].copy_from_slice(&32u16.to_be_bytes());
+        assert!(matches!(
+            supplicant.on_eapol(PEER, &message1),
+            Err(Wpa2Error::InvalidPairwiseKeyLength(32))
+        ));
+        assert_eq!(supplicant.phase(), Wpa2Phase::Failed);
+    }
+
+    #[test]
+    fn rejects_wrong_peer_and_clears_the_handshake() {
         let pmk = Pmk::from_bytes([0x33; 32]);
         let mut supplicant = Wpa2Supplicant::new(LOCAL, PEER, SNONCE, pmk, &RSN_IE).unwrap();
         let message1 = build_authenticator_frame(
@@ -1210,6 +1462,7 @@ mod tests {
             Err(Wpa2Error::WrongPeer)
         ));
         assert_eq!(supplicant.phase(), Wpa2Phase::Failed);
+        assert_eq!(supplicant.supplicant_nonce, [0; 32]);
     }
 
     fn build_authenticator_frame(
