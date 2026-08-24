@@ -20,6 +20,8 @@ pub const FEATURE_SYSTEM_WITH_RAW: u32 = 1 << 3;
 pub const PATCH_HEADER_LEN: usize = 52;
 /// Per-image header bytes.
 pub const IMAGE_HEADER_LEN: usize = 8;
+/// Fixed memory used for firmware download readback.
+pub const FIRMWARE_READBACK_CHUNK: usize = 256;
 
 pub const RPU_MEM_LMAC_PATCH_BIN: u32 = 0x8004_3a80;
 pub const RPU_MEM_LMAC_PATCH_BIMG: u32 = 0x8004_bbc0;
@@ -40,9 +42,9 @@ const BOOT_VECTOR_VALUES: [u32; 4] = [0x3c1a_8000, 0x275a_0000, 0x0340_0008, 0];
 
 /// External policy that authorizes one complete firmware file.
 ///
-/// The policy is separate from the digest stored inside the bundle.
-/// Thus, an attacker cannot replace both the firmware bytes and the
-/// bundle-owned digest and still pass authorization.
+/// The policy is separate from the digest stored inside the bundle. Thus, an
+/// attacker cannot replace both the firmware bytes and the bundle-owned digest
+/// and still pass authorization.
 pub trait FirmwareTrustPolicy {
     /// Authorizes the exact complete file supplied to the parser.
     fn verify(&self, bundle: &FirmwareBundle<'_>) -> Result<(), FirmwareError>;
@@ -92,7 +94,7 @@ pub enum FirmwareError {
     BadImageCount(u32),
     /// The firmware host-interface version does not match NCS v3.4.0.
     IncompatibleVersion(u32),
-    /// The bundle is not a system-mode image.
+    /// The bundle is not the exact system-mode image supported by this driver.
     IncompatibleFeatures(u32),
     /// The declared payload length does not fit the supplied slice.
     TruncatedPayload,
@@ -117,6 +119,8 @@ pub enum LoadError<E> {
     Rpu(RpuError<E>),
     /// A required image was not present.
     MissingImage(ImageKind),
+    /// Download readback did not match the trusted image bytes.
+    ReadbackMismatch { kind: ImageKind, offset: usize },
 }
 
 impl<E> From<FirmwareError> for LoadError<E> {
@@ -196,7 +200,7 @@ pub struct FirmwareBundle<'a> {
 }
 
 impl<'a> FirmwareBundle<'a> {
-    /// Parses the structure and checks the pinned interface version.
+    /// Parses the structure and checks the exact pinned system-mode interface.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, FirmwareError> {
         if bytes.len() < PATCH_HEADER_LEN {
             return Err(FirmwareError::TruncatedHeader);
@@ -214,7 +218,7 @@ impl<'a> FirmwareBundle<'a> {
             return Err(FirmwareError::IncompatibleVersion(version));
         }
         let feature_flags = word(bytes, 12);
-        if feature_flags & (FEATURE_SYSTEM_MODE | FEATURE_SYSTEM_WITH_RAW) == 0 {
+        if feature_flags != FEATURE_SYSTEM_MODE {
             return Err(FirmwareError::IncompatibleFeatures(feature_flags));
         }
         let payload_len = word(bytes, 16);
@@ -223,6 +227,9 @@ impl<'a> FirmwareBundle<'a> {
             .ok_or(FirmwareError::TruncatedPayload)?;
         if payload_end > bytes.len() {
             return Err(FirmwareError::TruncatedPayload);
+        }
+        if payload_end != bytes.len() {
+            return Err(FirmwareError::LengthMismatch);
         }
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&bytes[20..PATCH_HEADER_LEN]);
@@ -330,7 +337,7 @@ pub struct FirmwareReport {
     pub feature_flags: u32,
 }
 
-/// Resets both processors, downloads all images, boots LMAC then UMAC, and checks signatures.
+/// Resets both processors, downloads and verifies all images, boots LMAC then UMAC, and checks signatures.
 pub async fn load<B, D, T>(
     rpu: &mut Rpu<B>,
     delay: &mut D,
@@ -357,6 +364,7 @@ where
         let image = bundle.image(kind).map_err(LoadError::Firmware)?;
         let (processor, destination) = kind.destination();
         rpu.write(processor, destination, image.data).await?;
+        verify_download(rpu, processor, destination, image).await?;
     }
 
     boot_processor(rpu, delay, Processor::Lmac).await?;
@@ -367,6 +375,37 @@ where
         version: header.version,
         feature_flags: header.feature_flags,
     })
+}
+
+async fn verify_download<B>(
+    rpu: &mut Rpu<B>,
+    processor: Processor,
+    destination: u32,
+    image: FirmwareImage<'_>,
+) -> Result<(), LoadError<B::Error>>
+where
+    B: Bus,
+{
+    let mut readback = [0u8; FIRMWARE_READBACK_CHUNK];
+    let mut offset = 0usize;
+    while offset < image.data.len() {
+        let count = core::cmp::min(FIRMWARE_READBACK_CHUNK, image.data.len() - offset);
+        let offset_u32 = u32::try_from(offset).map_err(|_| RpuError::InvalidArgument)?;
+        let address = destination
+            .checked_add(offset_u32)
+            .ok_or(RpuError::InvalidArgument)?;
+        rpu.read(processor, address, &mut readback[..count])
+            .await?;
+        if readback[..count] != image.data[offset..offset + count] {
+            return Err(LoadError::ReadbackMismatch {
+                kind: image.kind,
+                offset,
+            });
+        }
+        readback[..count].fill(0);
+        offset += count;
+    }
+    Ok(())
 }
 
 async fn boot_processor<B, D>(
@@ -470,6 +509,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_raw_mode_bundle() {
+        let mut bytes = bundle_bytes();
+        bytes[12..16].copy_from_slice(&FEATURE_SYSTEM_WITH_RAW.to_le_bytes());
+        assert!(matches!(
+            FirmwareBundle::parse(&bytes),
+            Err(FirmwareError::IncompatibleFeatures(FEATURE_SYSTEM_WITH_RAW))
+        ));
+    }
+
+    #[test]
+    fn rejects_bytes_after_the_declared_payload() {
+        let original = bundle_bytes();
+        let mut bytes = [0u8; PATCH_HEADER_LEN + 4 * IMAGE_HEADER_LEN + 5];
+        bytes[..original.len()].copy_from_slice(&original);
+        assert!(matches!(
+            FirmwareBundle::parse(&bytes),
+            Err(FirmwareError::LengthMismatch)
+        ));
+    }
+
+    #[test]
     fn external_digest_covers_header_not_only_payload() {
         let original = bundle_bytes();
         let original_bundle = FirmwareBundle::parse(&original).unwrap();
@@ -477,11 +537,13 @@ mod tests {
 
         let mut substituted = original;
         substituted[12..16].copy_from_slice(&FEATURE_SYSTEM_WITH_RAW.to_le_bytes());
-        let substituted_bundle = FirmwareBundle::parse(&substituted).unwrap();
-        substituted_bundle.verify_hash().unwrap();
+        assert!(matches!(
+            FirmwareBundle::parse(&substituted),
+            Err(FirmwareError::IncompatibleFeatures(FEATURE_SYSTEM_WITH_RAW))
+        ));
         assert_eq!(
-            policy.verify(&substituted_bundle),
-            Err(FirmwareError::UntrustedImage)
+            policy.verify(&original_bundle),
+            Ok(())
         );
     }
 }
