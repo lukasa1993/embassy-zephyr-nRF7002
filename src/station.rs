@@ -12,8 +12,8 @@ use super::control::{
 use super::data::DataEvent;
 use super::device::{Device, DeviceError};
 use super::protocol::{
-    ProtocolError, ScanReason, ScanRequest, UmacCommand, UmacHeader, encode_deauthenticate,
-    encode_get_scan_results, encode_scan,
+    InterfaceType, ProtocolError, ScanReason, ScanRequest, UmacCommand, UmacEvent, UmacHeader,
+    encode_deauthenticate, encode_get_scan_results, encode_new_interface, encode_scan,
 };
 
 const MLME_FRAME_VALID: u32 = 1 << 0;
@@ -25,6 +25,7 @@ const ID_IFACE_VALID: u32 = 1 << 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StationState {
     Down,
+    InterfaceCreatePending,
     Idle,
     RegulatoryPending,
     InterfaceUpPending,
@@ -111,6 +112,8 @@ pub enum StationError<E> {
         current: StationState,
         required: StationState,
     },
+    InterfaceAlreadyCreated,
+    InterfaceNotCreated,
     Fault(StationFault),
 }
 
@@ -133,6 +136,7 @@ pub struct StationController {
     wdev_id: u32,
     state: StationState,
     last_fault: Option<StationFault>,
+    interface_created: bool,
     peer: Option<[u8; 6]>,
     secure_connection: bool,
     controlled_port_authorized: bool,
@@ -153,6 +157,7 @@ impl StationController {
             wdev_id,
             state: StationState::Down,
             last_fault: None,
+            interface_created: false,
             peer: None,
             secure_connection: false,
             controlled_port_authorized: false,
@@ -168,6 +173,11 @@ impl StationController {
     /// Returns the current station state.
     pub const fn state(&self) -> StationState {
         self.state
+    }
+
+    /// Returns true after firmware confirms interface creation.
+    pub const fn interface_created(&self) -> bool {
+        self.interface_created
     }
 
     /// Returns true only when normal data traffic is authorized.
@@ -229,6 +239,7 @@ impl StationController {
 
     #[cfg(test)]
     pub(crate) fn prepare_security_for_test(&mut self, peer: [u8; 6]) {
+        self.interface_created = true;
         self.transition(StationState::Securing);
         self.last_fault = None;
         self.peer = Some(peer);
@@ -255,8 +266,9 @@ impl StationController {
         self.state
     }
 
-    /// Enters recovery and clears all connection ownership.
+    /// Enters recovery and clears all firmware-owned interface state.
     pub fn begin_recovery(&mut self) {
+        self.interface_created = false;
         self.clear_connection();
         self.pending_command = None;
         self.pending_return_state = None;
@@ -265,11 +277,43 @@ impl StationController {
 
     /// Marks recovery complete after firmware and queues are initialized.
     pub fn recovery_complete(&mut self) {
+        self.interface_created = false;
         self.clear_connection();
         self.pending_command = None;
         self.pending_return_state = None;
         self.last_fault = None;
         self.transition(StationState::Down);
+    }
+
+    /// Creates the station interface and waits for the firmware creation event.
+    pub async fn create_interface<B, D>(
+        &mut self,
+        device: &mut Device<B>,
+        delay: &mut D,
+        mac_address: [u8; 6],
+        interface_name: &[u8],
+    ) -> Result<(), StationError<B::Error>>
+    where
+        B: Bus,
+        D: DelayNs,
+    {
+        self.require(StationState::Down)?;
+        if self.interface_created {
+            return Err(StationError::InterfaceAlreadyCreated);
+        }
+        let len = encode_new_interface(
+            &mut self.command,
+            self.ifaceindex,
+            InterfaceType::Station,
+            mac_address,
+            interface_name,
+        )?;
+        device
+            .send_control_reliable(&self.command[..len], delay)
+            .await?;
+        self.pending_command = Some(UmacCommand::NewInterface);
+        self.transition(StationState::InterfaceCreatePending);
+        Ok(())
     }
 
     /// Requests one regulatory country code.
@@ -314,6 +358,9 @@ impl StationController {
         D: DelayNs,
     {
         self.require(StationState::Down)?;
+        if !self.interface_created {
+            return Err(StationError::InterfaceNotCreated);
+        }
         let len = encode_interface_state(
             &mut self.command,
             self.ifaceindex,
@@ -343,6 +390,9 @@ impl StationController {
             StationState::Connected,
             StationState::Fault,
         ])?;
+        if !self.interface_created {
+            return Err(StationError::InterfaceNotCreated);
+        }
         let len = encode_interface_state(
             &mut self.command,
             self.ifaceindex,
@@ -720,6 +770,11 @@ impl StationController {
                 }
                 Ok(())
             }
+            ControlEvent::Other { header, .. }
+                if header.command_event == UmacEvent::NewInterface as u32 =>
+            {
+                self.handle_interface_created(header)
+            }
             ControlEvent::Other { .. } => Ok(()),
         }
     }
@@ -748,16 +803,50 @@ impl StationController {
         }
     }
 
+    fn handle_interface_created<E>(&mut self, header: UmacHeader) -> Result<(), StationError<E>> {
+        if header.result != 0 {
+            return self.fail(StationFault::CommandRejected {
+                command: UmacCommand::NewInterface as u32,
+                status: header.result as u32,
+            });
+        }
+        if self.state == StationState::InterfaceCreatePending
+            && self.pending_command == Some(UmacCommand::NewInterface)
+        {
+            self.interface_created = true;
+            self.pending_command = None;
+            self.transition(StationState::Down);
+            return Ok(());
+        }
+        if self.interface_created && self.state == StationState::Down {
+            return Ok(());
+        }
+        self.fail(StationFault::UnexpectedEvent)
+    }
+
     fn handle_command_status<E>(
         &mut self,
         command: u32,
         status: u32,
     ) -> Result<(), StationError<E>> {
+        if command == UmacCommand::NewInterface as u32
+            && self.interface_created
+            && self.pending_command.is_none()
+        {
+            return if status == 0 {
+                Ok(())
+            } else {
+                self.fail(StationFault::CommandRejected { command, status })
+            };
+        }
         if self.pending_command.map(|value| value as u32) != Some(command) {
             return self.fail(StationFault::UnexpectedEvent);
         }
         if status != 0 {
             return self.fail(StationFault::CommandRejected { command, status });
+        }
+        if command == UmacCommand::NewInterface as u32 {
+            return Ok(());
         }
         self.pending_command = None;
         if command == UmacCommand::NewKey as u32
@@ -792,9 +881,9 @@ impl StationController {
     fn timeout_for(&self, state: StationState) -> Option<u32> {
         let value = match state {
             StationState::RegulatoryPending => self.timeouts.regulatory_ms,
-            StationState::InterfaceUpPending | StationState::InterfaceDownPending => {
-                self.timeouts.interface_ms
-            }
+            StationState::InterfaceCreatePending
+            | StationState::InterfaceUpPending
+            | StationState::InterfaceDownPending => self.timeouts.interface_ms,
             StationState::Scanning => self.timeouts.scan_ms,
             StationState::ScanComplete => self.timeouts.scan_complete_ms,
             StationState::ReadingScanResults => self.timeouts.scan_results_ms,
@@ -920,11 +1009,11 @@ mod tests {
     use super::super::protocol::UmacHeader;
     use super::*;
 
-    fn header(event: UmacCommand) -> UmacHeader {
+    fn header(command_event: u32) -> UmacHeader {
         UmacHeader {
             port_id: 0,
             sequence: 1,
-            command_event: event as u32,
+            command_event,
             result: 0,
             valid_ids: ID_IFACE_VALID | ID_WDEV_VALID,
             ifaceindex: 1,
@@ -934,8 +1023,33 @@ mod tests {
     }
 
     #[test]
+    fn interface_creation_requires_the_firmware_event() {
+        let mut station = StationController::new(1, 0, 7);
+        station.state = StationState::InterfaceCreatePending;
+        station.pending_command = Some(UmacCommand::NewInterface);
+        station
+            .handle_control_event::<()>(ControlEvent::CommandStatus {
+                header: header(UmacEvent::CommandStatus as u32),
+                command: UmacCommand::NewInterface as u32,
+                status: 0,
+            })
+            .unwrap();
+        assert!(!station.interface_created());
+        assert_eq!(station.state(), StationState::InterfaceCreatePending);
+        station
+            .handle_control_event::<()>(ControlEvent::Other {
+                header: header(UmacEvent::NewInterface as u32),
+                body: &[],
+            })
+            .unwrap();
+        assert!(station.interface_created());
+        assert_eq!(station.state(), StationState::Down);
+    }
+
+    #[test]
     fn secure_connection_needs_authorization_and_carrier() {
         let mut station = StationController::new(1, 0, 7);
+        station.interface_created = true;
         station.state = StationState::Associating;
         station.peer = Some([1, 2, 3, 4, 5, 6]);
         station.secure_connection = true;
@@ -943,7 +1057,7 @@ mod tests {
         frame[26..28].copy_from_slice(&0u16.to_le_bytes());
         station
             .handle_control_event::<()>(ControlEvent::Association(MlmeEvent {
-                header: header(UmacCommand::Associate),
+                header: header(UmacCommand::Associate as u32),
                 valid_fields: MLME_FRAME_VALID,
                 frequency_mhz: 2412,
                 signal_dbm: -40,
@@ -963,7 +1077,7 @@ mod tests {
         station.pending_command = Some(UmacCommand::SetStation);
         station
             .handle_control_event::<()>(ControlEvent::CommandStatus {
-                header: header(UmacCommand::SetStation),
+                header: header(UmacEvent::CommandStatus as u32),
                 command: UmacCommand::SetStation as u32,
                 status: 0,
             })
@@ -980,7 +1094,7 @@ mod tests {
         assert!(
             station
                 .handle_control_event::<()>(ControlEvent::CommandStatus {
-                    header: header(UmacCommand::Authenticate),
+                    header: header(UmacEvent::CommandStatus as u32),
                     command: UmacCommand::Authenticate as u32,
                     status: 5,
                 })
@@ -1007,7 +1121,7 @@ mod tests {
         let mut station = StationController::new(1, 0, 7);
         station.state = StationState::Authenticating;
         station.pending_command = Some(UmacCommand::Authenticate);
-        let mut other = header(UmacCommand::Authenticate);
+        let mut other = header(UmacEvent::CommandStatus as u32);
         other.ifaceindex = 2;
         assert!(
             station
@@ -1024,6 +1138,7 @@ mod tests {
     #[test]
     fn connected_secure_station_accepts_group_rekey_eapol() {
         let mut station = StationController::new(1, 0, 7);
+        station.interface_created = true;
         station.peer = Some([1, 2, 3, 4, 5, 6]);
         station.secure_connection = true;
         station.controlled_port_authorized = true;
