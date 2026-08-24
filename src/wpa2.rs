@@ -1217,10 +1217,7 @@ fn validate_rsn_ie(rsn_ie: &[u8]) -> Result<(), Wpa2Error> {
     let akms = body
         .get(offset..akm_end)
         .ok_or(Wpa2Error::InvalidRsnInformationElement)?;
-    if !akms
-        .chunks_exact(4)
-        .any(|suite| suite == RSN_AKM_PSK_SUITE)
-    {
+    if !akms.chunks_exact(4).any(|suite| suite == RSN_AKM_PSK_SUITE) {
         return Err(Wpa2Error::InvalidRsnInformationElement);
     }
     offset = akm_end;
