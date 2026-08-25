@@ -4,10 +4,10 @@ use embedded_hal_async::delay::DelayNs;
 
 use super::bus::Bus;
 use super::control::{
-    AssociationRequest, AuthenticationRequest, ControlEvent, KeyConfig, MAX_STATION_MESSAGE_LEN,
-    PowerSaveState, encode_associate, encode_authenticate, encode_interface_state,
-    encode_key_command, encode_power_save, encode_power_save_timeout, encode_set_key,
-    encode_set_regulatory, encode_station_authorized,
+    AssociationRequest, AuthenticationRequest, ControlEvent, KeyConfig, KeyType,
+    MAX_STATION_MESSAGE_LEN, PowerSaveState, encode_associate, encode_authenticate,
+    encode_interface_state, encode_key_command, encode_power_save, encode_power_save_timeout,
+    encode_set_key, encode_set_regulatory, encode_station_authorized,
 };
 use super::data::DataEvent;
 use super::device::{Device, DeviceError};
@@ -92,12 +92,21 @@ impl Default for StationTimeouts {
 /// Last fail-closed station fault.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StationFault {
-    CommandRejected { command: u32, status: u32 },
+    CommandRejected {
+        command: u32,
+        status: u32,
+    },
     AuthenticationFailed(u16),
     AssociationFailed(u16),
     MlmeTimeout,
     PeerMismatch,
-    InterfaceMismatch,
+    InterfaceMismatch {
+        valid_ids: u32,
+        expected_ifaceindex: i32,
+        actual_ifaceindex: i32,
+        expected_wdev_id: u64,
+        actual_wdev_id: u64,
+    },
     UnexpectedEvent,
     CarrierLost,
     Timeout(StationState),
@@ -301,9 +310,16 @@ impl StationController {
         if self.interface_created {
             return Err(StationError::InterfaceAlreadyCreated);
         }
+        // Nordic firmware creates VIF 0 as part of system initialization. The
+        // pinned host driver deliberately skips NEW_INTERFACE for that VIF;
+        // firmware acknowledges the command but does not emit the creation
+        // event used for non-default interfaces.
+        if self.claim_firmware_default_interface() {
+            return Ok(());
+        }
         let len = encode_new_interface(
             &mut self.command,
-            self.ifaceindex,
+            self.wdev_id,
             InterfaceType::Station,
             mac_address,
             interface_name,
@@ -314,6 +330,17 @@ impl StationController {
         self.pending_command = Some(UmacCommand::NewInterface);
         self.transition(StationState::InterfaceCreatePending);
         Ok(())
+    }
+
+    fn claim_firmware_default_interface(&mut self) -> bool {
+        if self.wdev_id != 0 {
+            return false;
+        }
+        self.interface_created = true;
+        self.pending_command = None;
+        self.pending_return_state = None;
+        self.transition(StationState::Down);
+        true
     }
 
     /// Requests one regulatory country code.
@@ -333,7 +360,7 @@ impl StationController {
         let return_state = self.state;
         let len = encode_set_regulatory(
             &mut self.command,
-            self.ifaceindex,
+            self.wdev_id,
             country,
             user_hint_type,
             force,
@@ -361,12 +388,8 @@ impl StationController {
         if !self.interface_created {
             return Err(StationError::InterfaceNotCreated);
         }
-        let len = encode_interface_state(
-            &mut self.command,
-            self.ifaceindex,
-            true,
-            self.firmware_index,
-        )?;
+        let len =
+            encode_interface_state(&mut self.command, self.wdev_id, true, self.firmware_index)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
@@ -393,12 +416,8 @@ impl StationController {
         if !self.interface_created {
             return Err(StationError::InterfaceNotCreated);
         }
-        let len = encode_interface_state(
-            &mut self.command,
-            self.ifaceindex,
-            false,
-            self.firmware_index,
-        )?;
+        let len =
+            encode_interface_state(&mut self.command, self.wdev_id, false, self.firmware_index)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
@@ -420,7 +439,7 @@ impl StationController {
         D: DelayNs,
     {
         self.require(StationState::Idle)?;
-        let len = encode_scan(&mut self.command, self.ifaceindex, request)?;
+        let len = encode_scan(&mut self.command, self.wdev_id, request)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
@@ -441,7 +460,7 @@ impl StationController {
         D: DelayNs,
     {
         self.require(StationState::ScanComplete)?;
-        let len = encode_get_scan_results(&mut self.command, self.ifaceindex, reason)?;
+        let len = encode_get_scan_results(&mut self.command, self.wdev_id, reason)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
@@ -462,7 +481,7 @@ impl StationController {
         D: DelayNs,
     {
         self.require(StationState::Idle)?;
-        let len = encode_authenticate(&mut self.command, self.ifaceindex, request)?;
+        let len = encode_authenticate(&mut self.command, self.wdev_id, request)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
@@ -487,7 +506,7 @@ impl StationController {
         if self.peer != Some(request.bssid) {
             return self.fail(StationFault::PeerMismatch);
         }
-        let len = encode_associate(&mut self.command, self.ifaceindex, request)?;
+        let len = encode_associate(&mut self.command, self.wdev_id, request)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
@@ -515,10 +534,14 @@ impl StationController {
             StationState::Authorizing,
             StationState::Connected,
         ])?;
-        let peer = self
-            .peer
-            .ok_or(StationError::Fault(StationFault::PeerMismatch))?;
-        let len = encode_key_command(&mut self.command, self.ifaceindex, command, peer, key)?;
+        let peer = match key.key_type {
+            KeyType::Group => None,
+            KeyType::Pairwise | KeyType::Peer => Some(
+                self.peer
+                    .ok_or(StationError::Fault(StationFault::PeerMismatch))?,
+            ),
+        };
+        let len = encode_key_command(&mut self.command, self.wdev_id, command, peer, key)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
@@ -539,7 +562,7 @@ impl StationController {
         D: DelayNs,
     {
         self.require(StationState::Securing)?;
-        let len = encode_set_key(&mut self.command, self.ifaceindex, key)?;
+        let len = encode_set_key(&mut self.command, self.wdev_id, key)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
@@ -562,7 +585,7 @@ impl StationController {
         let peer = self
             .peer
             .ok_or(StationError::Fault(StationFault::PeerMismatch))?;
-        let len = encode_station_authorized(&mut self.command, self.ifaceindex, peer, true)?;
+        let len = encode_station_authorized(&mut self.command, self.wdev_id, peer, true)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
@@ -584,7 +607,7 @@ impl StationController {
     {
         self.require_one_of(&[StationState::Idle, StationState::Connected])?;
         let return_state = self.state;
-        let len = encode_power_save(&mut self.command, self.ifaceindex, state)?;
+        let len = encode_power_save(&mut self.command, self.wdev_id, state)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
@@ -614,7 +637,7 @@ impl StationController {
             )));
         }
         let return_state = self.state;
-        let len = encode_power_save_timeout(&mut self.command, self.ifaceindex, timeout_ms)?;
+        let len = encode_power_save_timeout(&mut self.command, self.wdev_id, timeout_ms)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
@@ -646,8 +669,7 @@ impl StationController {
         let peer = self
             .peer
             .ok_or(StationError::Fault(StationFault::PeerMismatch))?;
-        let len =
-            encode_deauthenticate(&mut self.command, self.ifaceindex, peer, reason_code, false)?;
+        let len = encode_deauthenticate(&mut self.command, self.wdev_id, peer, reason_code, false)?;
         device
             .send_control_reliable(&self.command[..len], delay)
             .await?;
@@ -720,7 +742,10 @@ impl StationController {
                 if self.state != StationState::Authenticating {
                     return self.fail(StationFault::UnexpectedEvent);
                 }
-                self.check_peer(event.bssid)?;
+                let Some(peer) = mlme_frame_address(&event, 10) else {
+                    return self.fail(StationFault::UnexpectedEvent);
+                };
+                self.check_peer(peer)?;
                 let status = mlme_status(&event, 28)?;
                 if status != 0 {
                     return self.fail(StationFault::AuthenticationFailed(status));
@@ -733,7 +758,10 @@ impl StationController {
                 if self.state != StationState::Associating {
                     return self.fail(StationFault::UnexpectedEvent);
                 }
-                self.check_peer(event.bssid)?;
+                let Some(peer) = mlme_frame_address(&event, 16) else {
+                    return self.fail(StationFault::UnexpectedEvent);
+                };
+                self.check_peer(peer)?;
                 let status = mlme_status(&event, 26)?;
                 if status != 0 {
                     return self.fail(StationFault::AssociationFailed(status));
@@ -752,7 +780,10 @@ impl StationController {
                 if self.peer.is_none() {
                     return Ok(());
                 }
-                self.check_peer(event.bssid)?;
+                let Some(peer) = mlme_frame_address(&event, 10) else {
+                    return self.fail(StationFault::UnexpectedEvent);
+                };
+                self.check_peer(peer)?;
                 self.clear_connection();
                 self.pending_command = None;
                 self.pending_return_state = None;
@@ -796,8 +827,14 @@ impl StationController {
                 }
                 Ok(())
             }
-            DataEvent::CarrierOn { .. } | DataEvent::CarrierOff { .. } => {
-                self.fail(StationFault::InterfaceMismatch)
+            DataEvent::CarrierOn { wdev_id } | DataEvent::CarrierOff { wdev_id } => {
+                self.fail(StationFault::InterfaceMismatch {
+                    valid_ids: ID_WDEV_VALID,
+                    expected_ifaceindex: self.ifaceindex,
+                    actual_ifaceindex: self.ifaceindex,
+                    expected_wdev_id: self.wdev_id as u64,
+                    actual_wdev_id: wdev_id as u64,
+                })
             }
             _ => Ok(()),
         }
@@ -906,10 +943,22 @@ impl StationController {
 
     fn check_header<E>(&mut self, header: UmacHeader) -> Result<(), StationError<E>> {
         if header.valid_ids & ID_IFACE_VALID != 0 && header.ifaceindex != self.ifaceindex {
-            return self.fail(StationFault::InterfaceMismatch);
+            return self.fail(StationFault::InterfaceMismatch {
+                valid_ids: header.valid_ids,
+                expected_ifaceindex: self.ifaceindex,
+                actual_ifaceindex: header.ifaceindex,
+                expected_wdev_id: self.wdev_id as u64,
+                actual_wdev_id: header.wdev_id,
+            });
         }
         if header.valid_ids & ID_WDEV_VALID != 0 && header.wdev_id != self.wdev_id as u64 {
-            return self.fail(StationFault::InterfaceMismatch);
+            return self.fail(StationFault::InterfaceMismatch {
+                valid_ids: header.valid_ids,
+                expected_ifaceindex: self.ifaceindex,
+                actual_ifaceindex: header.ifaceindex,
+                expected_wdev_id: self.wdev_id as u64,
+                actual_wdev_id: header.wdev_id,
+            });
         }
         Ok(())
     }
@@ -1003,6 +1052,13 @@ fn mlme_status<E>(
     ]))
 }
 
+fn mlme_frame_address(event: &super::control::MlmeEvent<'_>, offset: usize) -> Option<[u8; 6]> {
+    if event.valid_fields & MLME_FRAME_VALID == 0 {
+        return None;
+    }
+    event.frame.get(offset..offset + 6)?.try_into().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::control::MlmeEvent;
@@ -1047,6 +1103,18 @@ mod tests {
     }
 
     #[test]
+    fn firmware_default_interface_is_claimed_without_a_command() {
+        let mut station = StationController::new(1, 0, 0);
+        assert!(station.claim_firmware_default_interface());
+        assert!(station.interface_created());
+        assert_eq!(station.state(), StationState::Down);
+        assert_eq!(station.pending_command, None);
+
+        let mut second_vif = StationController::new(2, 1, 1);
+        assert!(!second_vif.claim_firmware_default_interface());
+    }
+
+    #[test]
     fn secure_connection_needs_authorization_and_carrier() {
         let mut station = StationController::new(1, 0, 7);
         station.interface_created = true;
@@ -1054,6 +1122,7 @@ mod tests {
         station.peer = Some([1, 2, 3, 4, 5, 6]);
         station.secure_connection = true;
         let mut frame = [0u8; 30];
+        frame[16..22].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
         frame[26..28].copy_from_slice(&0u16.to_le_bytes());
         station
             .handle_control_event::<()>(ControlEvent::Association(MlmeEvent {
@@ -1084,6 +1153,35 @@ mod tests {
             .unwrap();
         assert_eq!(station.state(), StationState::Connected);
         assert!(station.controlled_port_open());
+    }
+
+    #[test]
+    fn authentication_peer_comes_from_the_management_frame() {
+        let peer = [1, 2, 3, 4, 5, 6];
+        let mut station = StationController::new(1, 0, 7);
+        station.state = StationState::Authenticating;
+        station.pending_command = Some(UmacCommand::Authenticate);
+        station.peer = Some(peer);
+        let mut frame = [0u8; 30];
+        frame[10..16].copy_from_slice(&peer);
+        frame[28..30].copy_from_slice(&0u16.to_le_bytes());
+
+        station
+            .handle_control_event::<()>(ControlEvent::Authentication(MlmeEvent {
+                header: header(UmacEvent::Authenticate as u32),
+                valid_fields: MLME_FRAME_VALID,
+                frequency_mhz: 2412,
+                signal_dbm: -40,
+                flags: 0,
+                cookie: 0,
+                // Firmware does not promise this optional field on auth events.
+                bssid: [0; 6],
+                frame: &frame,
+                request_information_elements: &[],
+            }))
+            .unwrap();
+
+        assert_eq!(station.state(), StationState::Authenticated);
     }
 
     #[test]
@@ -1132,7 +1230,16 @@ mod tests {
                 })
                 .is_err()
         );
-        assert_eq!(station.last_fault(), Some(StationFault::InterfaceMismatch));
+        assert_eq!(
+            station.last_fault(),
+            Some(StationFault::InterfaceMismatch {
+                valid_ids: ID_IFACE_VALID | ID_WDEV_VALID,
+                expected_ifaceindex: 1,
+                actual_ifaceindex: 2,
+                expected_wdev_id: 7,
+                actual_wdev_id: 7,
+            })
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! The framing follows Nordic's `nrf70-bm` SPI shim. The SPI device must keep
 //! chip select active for every `transaction` call.
 
-use embedded_hal_async::spi::{Operation, SpiDevice};
+use embedded_hal_async::spi::SpiDevice;
 
 /// Fast-read command used by the nRF70 host interface.
 pub const OPCODE_FAST_READ: u8 = 0x0b;
@@ -26,6 +26,21 @@ pub const RPU_READY: u8 = 1 << 2;
 
 const MAX_SLAVE_LATENCY_WORDS: usize = 8;
 const MAX_SLAVE_LATENCY_BYTES: usize = MAX_SLAVE_LATENCY_WORDS * 4;
+const READ_HEADER_LEN: usize = 5;
+const HIGH_LATENCY_READ_WORD_LEN: usize = 4;
+/// Largest payload copied into the transport's reusable EasyDMA buffer.
+///
+/// This matches `NRF70_PATCH_DL_CHUNK_SIZE` in the pinned Nordic host
+/// interface. Keeping a complete 4 KiB firmware chunk in one SPI transaction
+/// is important: chip select must not toggle in the middle of a chunk.
+pub const MAX_SPI_DATA_LEN: usize = 4096;
+const SPI_IO_BUFFER_LEN: usize = READ_HEADER_LEN + MAX_SLAVE_LATENCY_BYTES + MAX_SPI_DATA_LEN;
+
+// Nordic's SPI shim requires EasyDMA buffers to be word aligned.
+#[repr(align(4))]
+struct SpiIoBuffer {
+    bytes: [u8; SPI_IO_BUFFER_LEN],
+}
 
 /// Bus operations needed by the native driver.
 #[allow(async_fn_in_trait)]
@@ -54,6 +69,7 @@ pub trait Bus {
 pub struct SpiConfig {
     address_mask: u32,
     slave_latency_words: u8,
+    nordic_memory_map_latency: bool,
 }
 
 impl SpiConfig {
@@ -61,6 +77,14 @@ impl SpiConfig {
     pub const NORDIC_DEFAULT: Self = Self {
         address_mask: INCREMENTING_ADDRESS_MASK,
         slave_latency_words: 0,
+        nordic_memory_map_latency: false,
+    };
+
+    /// Nordic's per-memory-region latency table used by the pinned bus shim.
+    pub const NORDIC_MEMORY_MAP: Self = Self {
+        address_mask: INCREMENTING_ADDRESS_MASK,
+        slave_latency_words: 0,
+        nordic_memory_map_latency: true,
     };
 
     /// Creates validated settings.
@@ -71,6 +95,7 @@ impl SpiConfig {
         Some(Self {
             address_mask,
             slave_latency_words,
+            nordic_memory_map_latency: false,
         })
     }
 
@@ -82,6 +107,31 @@ impl SpiConfig {
     /// Returns the number of 32-bit read-latency words.
     pub const fn slave_latency_words(self) -> u8 {
         self.slave_latency_words
+    }
+
+    /// Returns true when reads use Nordic's region-specific latency table.
+    pub const fn uses_nordic_memory_map_latency(self) -> bool {
+        self.nordic_memory_map_latency
+    }
+
+    fn read_latency_words(self, address: u32) -> u8 {
+        if !self.nordic_memory_map_latency {
+            return self.slave_latency_words;
+        }
+        match address & !self.address_mask {
+            0x000000..=0x008fff => 1,
+            0x009000..=0x03ffff => 2,
+            0x040000..=0x07ffff => 1,
+            0x080000..=0x092000 => 1,
+            0x0c0000..=0x0f0fff => 0,
+            0x100000..=0x134000
+            | 0x140000..=0x14c000
+            | 0x180000..=0x190000
+            | 0x200000..=0x261800
+            | 0x280000..=0x2a4000
+            | 0x300000..=0x338000 => 1,
+            _ => 0,
+        }
     }
 }
 
@@ -95,6 +145,7 @@ impl Default for SpiConfig {
 pub struct SpiTransport<SPI> {
     spi: SPI,
     config: SpiConfig,
+    io_buffer: SpiIoBuffer,
 }
 
 impl<SPI> SpiTransport<SPI> {
@@ -103,12 +154,21 @@ impl<SPI> SpiTransport<SPI> {
         Self {
             spi,
             config: SpiConfig::NORDIC_DEFAULT,
+            io_buffer: SpiIoBuffer {
+                bytes: [0; SPI_IO_BUFFER_LEN],
+            },
         }
     }
 
     /// Creates a transport with explicit framing settings.
     pub const fn with_config(spi: SPI, config: SpiConfig) -> Self {
-        Self { spi, config }
+        Self {
+            spi,
+            config,
+            io_buffer: SpiIoBuffer {
+                bytes: [0; SPI_IO_BUFFER_LEN],
+            },
+        }
     }
 
     /// Returns the framing settings.
@@ -153,28 +213,22 @@ where
             return Ok(());
         }
 
-        let address = self.wire_address(address);
-        let header = [
-            OPCODE_FAST_READ,
-            (address >> 16) as u8,
-            (address >> 8) as u8,
-            address as u8,
-            0,
-        ];
-        let latency_len = self.config.slave_latency_words as usize * 4;
-        let mut latency = [0u8; MAX_SLAVE_LATENCY_BYTES];
-
-        if latency_len == 0 {
-            let mut operations = [Operation::Write(&header), Operation::Read(data)];
-            self.spi.transaction(&mut operations).await
-        } else {
-            let mut operations = [
-                Operation::Write(&header),
-                Operation::Read(&mut latency[..latency_len]),
-                Operation::Read(data),
-            ];
-            self.spi.transaction(&mut operations).await
+        if self.config.nordic_memory_map_latency && self.config.read_latency_words(address) != 0 {
+            for (index, word) in data.chunks_mut(4).enumerate() {
+                let word_address = address + index as u32 * 4;
+                self.read_one(word_address, word, false).await?;
+            }
+            return Ok(());
         }
+
+        let mut done = 0usize;
+        while done < data.len() {
+            let count = core::cmp::min(MAX_SPI_DATA_LEN, data.len() - done);
+            self.read_one(address + done as u32, &mut data[done..done + count], true)
+                .await?;
+            done += count;
+        }
+        Ok(())
     }
 
     async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
@@ -182,15 +236,58 @@ where
             return Ok(());
         }
 
-        let address = self.wire_address(address);
-        let header = [
-            OPCODE_WRITE,
-            (address >> 16) as u8,
-            (address >> 8) as u8,
-            address as u8,
-        ];
-        let mut operations = [Operation::Write(&header), Operation::Write(data)];
-        self.spi.transaction(&mut operations).await
+        let mut done = 0usize;
+        while done < data.len() {
+            let count = core::cmp::min(MAX_SPI_DATA_LEN, data.len() - done);
+            let address = self.wire_address(address + done as u32);
+            self.io_buffer.bytes[0] = OPCODE_WRITE;
+            self.io_buffer.bytes[1] = (address >> 16) as u8;
+            self.io_buffer.bytes[2] = (address >> 8) as u8;
+            self.io_buffer.bytes[3] = address as u8;
+            self.io_buffer.bytes[4..4 + count].copy_from_slice(&data[done..done + count]);
+            self.spi.write(&self.io_buffer.bytes[..4 + count]).await?;
+            self.io_buffer.bytes[..4 + count].fill(0);
+            done += count;
+        }
+        Ok(())
+    }
+}
+
+impl<SPI> SpiTransport<SPI>
+where
+    SPI: SpiDevice<u8>,
+{
+    async fn read_one(
+        &mut self,
+        address: u32,
+        data: &mut [u8],
+        incrementing: bool,
+    ) -> Result<(), SPI::Error> {
+        let latency_len = self.config.read_latency_words(address) as usize * 4;
+        let address = if incrementing {
+            self.wire_address(address)
+        } else {
+            address & 0x00ff_ffff
+        };
+        debug_assert!(latency_len == 0 || data.len() <= HIGH_LATENCY_READ_WORD_LEN);
+        debug_assert!(data.len() <= MAX_SPI_DATA_LEN);
+        self.io_buffer.bytes[0] = OPCODE_FAST_READ;
+        self.io_buffer.bytes[1] = (address >> 16) as u8;
+        self.io_buffer.bytes[2] = (address >> 8) as u8;
+        self.io_buffer.bytes[3] = address as u8;
+        self.io_buffer.bytes[4] = 0;
+        let data_start = READ_HEADER_LEN + latency_len;
+        let transfer_len = data_start + data.len();
+        // Nordic's SPI shim clocks reads with a null TX buffer. The nRF SPIM
+        // peripheral emits its 0xff over-read character for those clocks, so
+        // reproduce that wire traffic instead of transmitting stale/zero RAM.
+        self.io_buffer.bytes[READ_HEADER_LEN..transfer_len].fill(0xff);
+        self.spi
+            .transfer_in_place(&mut self.io_buffer.bytes[..transfer_len])
+            .await?;
+        data.copy_from_slice(&self.io_buffer.bytes[data_start..transfer_len]);
+        self.io_buffer.bytes[..transfer_len].fill(0);
+        Ok(())
     }
 }
 
@@ -202,6 +299,20 @@ mod tests {
     fn nordic_defaults_are_exact() {
         assert_eq!(SpiConfig::NORDIC_DEFAULT.address_mask(), 0x80_0000);
         assert_eq!(SpiConfig::NORDIC_DEFAULT.slave_latency_words(), 0);
+        assert!(!SpiConfig::NORDIC_DEFAULT.uses_nordic_memory_map_latency());
+        assert!(SpiConfig::NORDIC_MEMORY_MAP.uses_nordic_memory_map_latency());
+    }
+
+    #[test]
+    fn nordic_memory_map_latency_matches_the_pinned_bus_shim() {
+        let config = SpiConfig::NORDIC_MEMORY_MAP;
+        assert_eq!(config.read_latency_words(0x000018), 1);
+        assert_eq!(config.read_latency_words(0x009000), 2);
+        assert_eq!(config.read_latency_words(0x048c20), 1);
+        assert_eq!(config.read_latency_words(0x080000), 1);
+        assert_eq!(config.read_latency_words(0x0c5000), 0);
+        assert_eq!(config.read_latency_words(0x143a80), 1);
+        assert_eq!(config.read_latency_words(0x28c000), 1);
     }
 
     #[test]
@@ -209,5 +320,13 @@ mod tests {
         assert!(SpiConfig::new(0x80_0000, 8).is_some());
         assert!(SpiConfig::new(0x80_0000, 9).is_none());
         assert!(SpiConfig::new(0x0100_0000, 0).is_none());
+    }
+
+    #[test]
+    fn spi_io_buffer_is_word_aligned() {
+        let buffer = SpiIoBuffer {
+            bytes: [0; SPI_IO_BUFFER_LEN],
+        };
+        assert_eq!(buffer.bytes.as_ptr() as usize & 3, 0);
     }
 }

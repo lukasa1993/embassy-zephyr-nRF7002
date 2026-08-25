@@ -6,7 +6,11 @@ use super::bus::{Bus, OPCODE_READ_STATUS_1, OPCODE_READ_STATUS_2, OPCODE_WRITE_S
 use super::bus::{RPU_AWAKE, RPU_READY, RPU_WAKE_REQUEST};
 
 /// Largest transfer emitted by the memory layer.
-pub const MAX_BUS_CHUNK: usize = 4096;
+///
+/// [`crate::SpiTransport`] owns a reusable RAM EasyDMA buffer, so firmware
+/// image bytes can remain in flash while preserving Nordic's 4 KiB download
+/// transaction size.
+pub const MAX_BUS_CHUNK: usize = super::bus::MAX_SPI_DATA_LEN;
 
 pub const RPU_ADDR_GRAM_START: u32 = 0xb700_0000;
 pub const RPU_ADDR_GRAM_END: u32 = 0xb701_01ff;
@@ -48,6 +52,10 @@ pub const RPU_REG_MIPS_MCU2_SYS_CORE_MEM_CTRL: u32 = 0xa400_0130;
 pub const RPU_REG_MIPS_MCU2_SYS_CORE_MEM_WDATA: u32 = 0xa400_0134;
 pub const RPU_REG_MIPS_MCU_WAIT_STATUS: u32 = 0xa400_0018;
 pub const RPU_REG_MIPS_MCU2_WAIT_STATUS: u32 = 0xa400_0118;
+/// PBUS register used by Nordic's bus initialization to enable RPU clocks.
+pub const RPU_REG_CLOCK_ENABLE: u32 = 0xa500_8c20;
+/// Clock-enable value required before either MIPS core can leave reset.
+pub const RPU_CLOCK_ENABLE: u32 = 0x100;
 
 /// One of the two MIPS processors in the nRF7002 RPU.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +116,13 @@ pub enum RpuError<E> {
     Unaligned,
     /// A bounded poll did not reach its expected state.
     Timeout,
+    /// A register poll exhausted its deadline without reaching the mask/value.
+    PollTimeout {
+        address: u32,
+        mask: u32,
+        expected: u32,
+        last: u32,
+    },
     /// An input length or encoded address was invalid.
     InvalidArgument,
 }
@@ -386,6 +401,12 @@ where
         Ok(())
     }
 
+    /// Enables the RPU clocks required before processor reset and firmware load.
+    pub async fn enable_clocks(&mut self) -> Result<(), RpuError<B::Error>> {
+        self.write_register(RPU_REG_CLOCK_ENABLE, RPU_CLOCK_ENABLE)
+            .await
+    }
+
     /// Performs Nordic's pulsed processor reset and waits for the MIPS wait state.
     pub async fn reset_processor<D>(
         &mut self,
@@ -415,13 +436,20 @@ where
     where
         D: DelayNs,
     {
+        let mut last = 0;
         for _ in 0..attempts {
-            if self.read_register(address).await? & mask == expected {
+            last = self.read_register(address).await?;
+            if last & mask == expected {
                 return Ok(());
             }
             delay.delay_ms(delay_ms).await;
         }
-        Err(RpuError::Timeout)
+        Err(RpuError::PollTimeout {
+            address,
+            mask,
+            expected,
+            last,
+        })
     }
 }
 
@@ -452,6 +480,13 @@ fn checked_range<E>(processor: Processor, address: u32, len: usize) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bus_chunks_match_the_pinned_nordic_loader() {
+        let chunk = core::hint::black_box(MAX_BUS_CHUNK);
+        assert_eq!(chunk, 4096);
+        assert_eq!(chunk & 3, 0);
+    }
 
     #[test]
     fn maps_all_public_regions() {

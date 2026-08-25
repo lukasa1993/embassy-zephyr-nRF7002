@@ -29,6 +29,8 @@ pub const WPA2_PASSPHRASE_MAX_LEN: usize = 63;
 pub const WPA2_PBKDF2_ITERATIONS: u32 = 4096;
 /// CCMP temporal-key length.
 pub const CCMP_KEY_LEN: usize = 16;
+/// CCMP packet-number bytes accepted by the Nordic key command.
+pub const CCMP_RECEIVE_SEQUENCE_LEN: usize = 6;
 /// Pairwise transient-key length for WPA2-PSK with CCMP.
 pub const WPA2_PTK_LEN: usize = 48;
 
@@ -299,22 +301,20 @@ impl GroupKeyInstall {
             key_type: KeyType::Group,
             key_index: self.key_index,
             key: &self.key[..self.key_len],
-            sequence: &self.receive_sequence,
-            flags: 0,
+            sequence: &self.receive_sequence[..CCMP_RECEIVE_SEQUENCE_LEN],
+            flags: NRF_WIFI_KEY_DEFAULT_TYPE_MULTICAST,
         }
     }
 
     /// Returns a Nordic set-default-key command view.
     pub fn default_key_config(&self) -> KeyConfig<'_> {
         KeyConfig {
-            cipher_suite: RSN_CIPHER_CCMP_128,
+            cipher_suite: 0,
             key_type: KeyType::Group,
             key_index: self.key_index,
-            key: &self.key[..self.key_len],
-            sequence: &self.receive_sequence,
-            flags: NRF_WIFI_KEY_DEFAULT
-                | NRF_WIFI_KEY_DEFAULT_TYPES
-                | NRF_WIFI_KEY_DEFAULT_TYPE_MULTICAST,
+            key: &[],
+            sequence: &[],
+            flags: NRF_WIFI_KEY_DEFAULT | NRF_WIFI_KEY_DEFAULT_TYPE_MULTICAST,
         }
     }
 
@@ -1382,6 +1382,7 @@ mod tests {
         ));
         assert_eq!(request.pairwise().key_config().key.len(), 16);
         assert_eq!(request.group().key_config().key, &gtk);
+        assert_eq!(request.group().key_config().sequence.len(), 6);
         let message4 = supplicant.complete_key_install(request, true).unwrap();
         assert_eq!(
             EapolKeyFrame::parse(message4.as_slice()).unwrap().message(),

@@ -286,6 +286,13 @@ where
                 .await
                 .map_err(RecoveryError::Platform)?;
 
+            self.device
+                .rpu_mut()
+                .enable_clocks()
+                .await
+                .map_err(DeviceError::from)
+                .map_err(DriverError::from)?;
+
             let report = firmware::load(self.device.rpu_mut(), delay, bundle, trust)
                 .await
                 .map_err(DriverError::from)?;

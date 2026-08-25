@@ -425,14 +425,14 @@ where
     /// Creates a station interface in firmware.
     pub async fn add_station_interface(
         &mut self,
-        ifaceindex: i32,
+        wdev_id: u32,
         mac_address: [u8; 6],
         interface_name: &[u8],
     ) -> Result<(), DeviceError<B::Error>> {
         let mut message = [0u8; 128];
         let len = encode_new_interface(
             &mut message,
-            ifaceindex,
+            wdev_id,
             InterfaceType::Station,
             mac_address,
             interface_name,
@@ -446,18 +446,18 @@ where
     /// [`Device::start_scan_reliable`] for normal operation.
     pub async fn start_scan(
         &mut self,
-        ifaceindex: i32,
+        wdev_id: u32,
         request: &ScanRequest<'_>,
     ) -> Result<(), DeviceError<B::Error>> {
         let mut message = [0u8; MAX_CONTROL_MESSAGE_LEN];
-        let len = encode_scan(&mut message, ifaceindex, request)?;
+        let len = encode_scan(&mut message, wdev_id, request)?;
         self.send_control(&message[..len]).await
     }
 
     /// Starts one firmware scan with bounded command-buffer waits.
     pub async fn start_scan_reliable<D>(
         &mut self,
-        ifaceindex: i32,
+        wdev_id: u32,
         request: &ScanRequest<'_>,
         delay: &mut D,
     ) -> Result<(), DeviceError<B::Error>>
@@ -465,25 +465,25 @@ where
         D: DelayNs,
     {
         let mut message = [0u8; MAX_CONTROL_MESSAGE_LEN];
-        let len = encode_scan(&mut message, ifaceindex, request)?;
+        let len = encode_scan(&mut message, wdev_id, request)?;
         self.send_control_reliable(&message[..len], delay).await
     }
 
     /// Requests results after a scan-done event.
     pub async fn get_scan_results(
         &mut self,
-        ifaceindex: i32,
+        wdev_id: u32,
         reason: ScanReason,
     ) -> Result<(), DeviceError<B::Error>> {
         let mut message = [0u8; 96];
-        let len = encode_get_scan_results(&mut message, ifaceindex, reason)?;
+        let len = encode_get_scan_results(&mut message, wdev_id, reason)?;
         self.send_control(&message[..len]).await
     }
 
     /// Sends a station deauthentication request.
     pub async fn deauthenticate(
         &mut self,
-        ifaceindex: i32,
+        wdev_id: u32,
         bssid: [u8; 6],
         reason_code: u16,
         local_state_change: bool,
@@ -491,7 +491,7 @@ where
         let mut message = [0u8; 96];
         let len = encode_deauthenticate(
             &mut message,
-            ifaceindex,
+            wdev_id,
             bssid,
             reason_code,
             local_state_change,

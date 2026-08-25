@@ -491,7 +491,9 @@ impl SystemInitConfig {
             tcp_ip_checksum_offload: false,
             country_code: *b"00",
             operating_band: 0,
-            management_buffer_offload: false,
+            // Nordic's system-mode host enables firmware management-frame
+            // buffering. WPA authentication depends on this mode.
+            management_buffer_offload: true,
             feature_flags: 0,
             disable_beamforming: false,
             disconnect_timeout: 0,
@@ -620,7 +622,7 @@ pub enum InterfaceType {
 /// Encodes `NRF_WIFI_UMAC_CMD_NEW_INTERFACE`.
 pub fn encode_new_interface(
     out: &mut [u8],
-    ifaceindex: i32,
+    wdev_id: u32,
     interface_type: InterfaceType,
     mac_address: [u8; 6],
     interface_name: &[u8],
@@ -640,7 +642,7 @@ pub fn encode_new_interface(
         out,
         UmacCommand::NewInterface,
         InterfaceIds {
-            ifaceindex: Some(ifaceindex),
+            wdev_id: Some(wdev_id as u64),
             ..InterfaceIds::default()
         },
         &body,
@@ -695,7 +697,7 @@ impl<'a> ScanRequest<'a> {
 /// Encodes `NRF_WIFI_UMAC_CMD_TRIGGER_SCAN`.
 pub fn encode_scan(
     out: &mut [u8],
-    ifaceindex: i32,
+    wdev_id: u32,
     request: &ScanRequest<'_>,
 ) -> Result<usize, ProtocolError> {
     if request.ssid_count as usize > MAX_SCAN_SSIDS
@@ -749,7 +751,7 @@ pub fn encode_scan(
         out,
         UmacCommand::TriggerScan,
         InterfaceIds {
-            ifaceindex: Some(ifaceindex),
+            wdev_id: Some(wdev_id as u64),
             ..InterfaceIds::default()
         },
         &body[..body_len],
@@ -759,14 +761,14 @@ pub fn encode_scan(
 /// Encodes scan-result retrieval after `ScanDone`.
 pub fn encode_get_scan_results(
     out: &mut [u8],
-    ifaceindex: i32,
+    wdev_id: u32,
     reason: ScanReason,
 ) -> Result<usize, ProtocolError> {
     encode_umac_command(
         out,
         UmacCommand::GetScanResults,
         InterfaceIds {
-            ifaceindex: Some(ifaceindex),
+            wdev_id: Some(wdev_id as u64),
             ..InterfaceIds::default()
         },
         &(reason as i32).to_le_bytes(),
@@ -776,7 +778,7 @@ pub fn encode_get_scan_results(
 /// Encodes a station deauthentication command.
 pub fn encode_deauthenticate(
     out: &mut [u8],
-    ifaceindex: i32,
+    wdev_id: u32,
     bssid: [u8; 6],
     reason_code: u16,
     local_state_change: bool,
@@ -791,7 +793,7 @@ pub fn encode_deauthenticate(
         out,
         UmacCommand::Deauthenticate,
         InterfaceIds {
-            ifaceindex: Some(ifaceindex),
+            wdev_id: Some(wdev_id as u64),
             ..InterfaceIds::default()
         },
         &body,
@@ -1013,13 +1015,17 @@ mod tests {
             read_u32(&bytes, HOST_MESSAGE_HEADER_LEN + 4),
             SYSTEM_INIT_LEN as u32
         );
+        assert_eq!(bytes[HOST_MESSAGE_HEADER_LEN + 309], 1);
     }
 
     #[test]
     fn scan_encoder_checks_limits() {
         let request = ScanRequest::all_bands();
         let mut bytes = [0u8; MAX_CONTROL_MESSAGE_LEN];
-        let len = encode_scan(&mut bytes, 0, &request).unwrap();
+        let len = encode_scan(&mut bytes, 7, &request).unwrap();
         assert!(len > UMAC_HEADER_LEN + HOST_MESSAGE_HEADER_LEN);
+        assert_eq!(read_u32(&bytes, HOST_MESSAGE_HEADER_LEN + 16), 1);
+        assert_eq!(read_i32(&bytes, HOST_MESSAGE_HEADER_LEN + 20), 0);
+        assert_eq!(read_u64(&bytes, HOST_MESSAGE_HEADER_LEN + 28), 7);
     }
 }

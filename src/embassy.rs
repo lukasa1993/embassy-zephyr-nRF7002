@@ -2,7 +2,7 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use core::task::Context;
+use core::task::{Context, Poll};
 
 use embassy_net_driver::{
     Capabilities, Driver as EmbassyDriver, HardwareAddress, LinkState, RxToken as EmbassyRxToken,
@@ -495,6 +495,33 @@ impl<const FRAME_SIZE: usize> NetworkRunner<'_, FRAME_SIZE> {
         })
     }
 
+    /// Polls for a queued TX frame without taking ownership of it.
+    ///
+    /// This is the non-destructive wake primitive for a hardware runner. Once
+    /// it returns [`Poll::Ready`], call [`Self::take_tx`] to acquire the frame.
+    /// The readiness check is repeated after registering the waker so a frame
+    /// published concurrently with registration cannot be missed.
+    pub fn poll_tx_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.tx_is_ready() {
+            return Poll::Ready(());
+        }
+
+        self.state.tx_ready_waker.register(cx.waker());
+        if self.tx_is_ready() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn tx_is_ready(&self) -> bool {
+        let Some(epoch) = self.state.active_epoch() else {
+            return false;
+        };
+        self.state.tx_state.load(Ordering::Acquire) == READY
+            && self.state.tx_epoch.load(Ordering::Acquire) == epoch
+    }
+
     /// Registers a waker for new TX frames.
     pub fn register_tx_waker(&self, cx: &mut Context<'_>) {
         self.state.tx_ready_waker.register(cx.waker());
@@ -565,6 +592,7 @@ impl<const FRAME_SIZE: usize> Drop for TxLease<'_, FRAME_SIZE> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::task::{Context, Waker};
 
     fn open_link<const FRAME_SIZE: usize>(state: &NetworkState<FRAME_SIZE>) -> usize {
         state.set_authorized_link(true);
@@ -635,6 +663,27 @@ mod tests {
         assert_eq!(lease.as_slice(), &[0]);
         lease.report(TxOutcome::Dropped);
         assert_eq!(state.tx_state.load(Ordering::Acquire), FREE);
+    }
+
+    #[test]
+    fn polling_tx_ready_does_not_consume_the_frame() {
+        let state = NetworkState::<8>::new([2, 0, 0, 0, 0, 1]);
+        let epoch = open_link(&state);
+        state.tx_epoch.store(epoch, Ordering::Relaxed);
+        state.tx_len.store(3, Ordering::Relaxed);
+        unsafe {
+            (&mut *state.tx.get())[..3].copy_from_slice(&[1, 2, 3]);
+        }
+        state.tx_state.store(READY, Ordering::Release);
+
+        let runner = state.runner();
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert_eq!(runner.poll_tx_ready(&mut cx), Poll::Ready(()));
+
+        let lease = runner.take_tx().expect("poll must leave the frame queued");
+        assert_eq!(lease.as_slice(), &[1, 2, 3]);
+        lease.report(TxOutcome::Submitted);
     }
 
     #[test]

@@ -25,7 +25,7 @@ aes = { version = "=0.8.4", default-features = false, optional = true }
 hmac = { version = "=0.12.1", default-features = false, optional = true }
 pbkdf2 = { version = "=0.12.2", default-features = false, features = ["hmac"], optional = true }
 sha1 = { version = "=0.10.6", default-features = false, optional = true }
-zeroize = { version = "=1.8.1", default-features = false, optional = true }
+zeroize = { version = "=1.9.0", default-features = false, optional = true }
 
 [dev-dependencies]
 critical-section = { version = "=1.2.0", features = ["std"] }

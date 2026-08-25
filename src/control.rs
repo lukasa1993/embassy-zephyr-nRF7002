@@ -55,13 +55,11 @@ pub const ASSOC_MESSAGE_LEN: usize = HOST_HEADER_LEN + UMAC_HEADER_LEN + ASSOC_B
 /// Full key command host-message length.
 pub const KEY_MESSAGE_LEN: usize = HOST_HEADER_LEN + UMAC_HEADER_LEN + 4 + KEY_INFO_LEN + 6;
 
-const INDEX_IFACE_VALID: u32 = 1 << 1;
+const INDEX_WDEV_VALID: u32 = 1 << 0;
 
 const AUTH_KEY_INFO_VALID: u32 = 1 << 0;
-const AUTH_BSSID_VALID: u32 = 1 << 1;
 const AUTH_FREQUENCY_VALID: u32 = 1 << 2;
 const AUTH_SSID_VALID: u32 = 1 << 3;
-const AUTH_IE_VALID: u32 = 1 << 4;
 const AUTH_SAE_VALID: u32 = 1 << 5;
 const AUTH_LOCAL_STATE_CHANGE: u16 = 1 << 0;
 
@@ -87,7 +85,6 @@ const KEY_TYPE_VALID: u32 = 1 << 1;
 const KEY_INDEX_VALID: u32 = 1 << 2;
 const KEY_SEQUENCE_VALID: u32 = 1 << 3;
 const KEY_CIPHER_VALID: u32 = 1 << 4;
-const KEY_FLAGS_VALID: u32 = 1 << 5;
 const KEY_MAC_VALID: u32 = 1 << 0;
 const SET_STATION_FLAGS_VALID: u32 = 1 << 12;
 const STATION_FLAG_AUTHORIZED: u32 = 1 << 1;
@@ -276,7 +273,7 @@ pub enum ControlEvent<'a> {
 /// Encodes `NRF_WIFI_UMAC_CMD_AUTHENTICATE`.
 pub fn encode_authenticate(
     out: &mut [u8],
-    ifaceindex: i32,
+    wdev_id: u32,
     request: &AuthenticationRequest<'_>,
 ) -> Result<usize, ProtocolError> {
     validate_ssid(request.ssid)?;
@@ -292,15 +289,14 @@ pub fn encode_authenticate(
     encode_umac(
         out,
         UmacCommand::Authenticate,
-        ifaceindex,
+        Some(wdev_id),
         AUTH_BODY_LEN,
         |writer| {
-            let mut valid = AUTH_BSSID_VALID | AUTH_FREQUENCY_VALID | AUTH_SSID_VALID;
+            // Match nrf_wifi_sys_fmac_auth: BSSID and authentication IEs are
+            // copied into auth_info but do not have outer command-valid bits.
+            let mut valid = AUTH_FREQUENCY_VALID | AUTH_SSID_VALID;
             if request.key.is_some() {
                 valid |= AUTH_KEY_INFO_VALID;
-            }
-            if !request.information_elements.is_empty() {
-                valid |= AUTH_IE_VALID;
             }
             if !request.sae_data.is_empty() {
                 valid |= AUTH_SAE_VALID;
@@ -333,7 +329,7 @@ pub fn encode_authenticate(
 /// Encodes `NRF_WIFI_UMAC_CMD_ASSOCIATE`.
 pub fn encode_associate(
     out: &mut [u8],
-    ifaceindex: i32,
+    wdev_id: u32,
     request: &AssociationRequest<'_>,
 ) -> Result<usize, ProtocolError> {
     validate_ssid(request.ssid)?;
@@ -351,7 +347,7 @@ pub fn encode_associate(
     encode_umac(
         out,
         UmacCommand::Associate,
-        ifaceindex,
+        Some(wdev_id),
         ASSOC_BODY_LEN,
         |writer| {
             writer.u32(if request.previous_bssid.is_some() {
@@ -443,49 +439,55 @@ pub fn encode_associate(
 /// Encodes `NRF_WIFI_UMAC_CMD_NEW_KEY` or `NRF_WIFI_UMAC_CMD_DEL_KEY`.
 pub fn encode_key_command(
     out: &mut [u8],
-    ifaceindex: i32,
+    wdev_id: u32,
     command: UmacCommand,
-    peer: [u8; 6],
+    peer: Option<[u8; 6]>,
     key: &KeyConfig<'_>,
 ) -> Result<usize, ProtocolError> {
     if command != UmacCommand::NewKey && command != UmacCommand::DeleteKey {
         return Err(ProtocolError::InvalidValue(command as u32));
     }
     validate_key(key)?;
-    encode_umac(out, command, ifaceindex, 4 + KEY_INFO_LEN + 6, |writer| {
-        writer.u32(KEY_MAC_VALID)?;
-        write_key_info(writer, Some(key))?;
-        writer.bytes(&peer)
-    })
+    encode_umac(
+        out,
+        command,
+        Some(wdev_id),
+        4 + KEY_INFO_LEN + 6,
+        |writer| {
+            writer.u32(if peer.is_some() { KEY_MAC_VALID } else { 0 })?;
+            write_key_info(writer, Some(key))?;
+            writer.bytes(&peer.unwrap_or([0; 6]))
+        },
+    )
 }
 
 /// Encodes `NRF_WIFI_UMAC_CMD_SET_KEY`.
 pub fn encode_set_key(
     out: &mut [u8],
-    ifaceindex: i32,
+    wdev_id: u32,
     key: &KeyConfig<'_>,
 ) -> Result<usize, ProtocolError> {
     validate_key(key)?;
     encode_umac(
         out,
         UmacCommand::SetKey,
-        ifaceindex,
+        Some(wdev_id),
         KEY_INFO_LEN,
-        |writer| write_key_info(writer, Some(key)),
+        |writer| write_default_key_info(writer, key),
     )
 }
 
 /// Encodes `NRF_WIFI_UMAC_CMD_SET_IFFLAGS`.
 pub fn encode_interface_state(
     out: &mut [u8],
-    ifaceindex: i32,
+    wdev_id: u32,
     up: bool,
     firmware_index: i8,
 ) -> Result<usize, ProtocolError> {
     encode_umac(
         out,
         UmacCommand::SetInterfaceFlags,
-        ifaceindex,
+        Some(wdev_id),
         5,
         |writer| {
             writer.i32(if up { 1 } else { 0 })?;
@@ -497,40 +499,36 @@ pub fn encode_interface_state(
 /// Encodes `NRF_WIFI_UMAC_CMD_REQ_SET_REG`.
 pub fn encode_set_regulatory(
     out: &mut [u8],
-    ifaceindex: i32,
+    _wdev_id: u32,
     country: [u8; 2],
     user_hint_type: u32,
     force: bool,
 ) -> Result<usize, ProtocolError> {
-    if !country.iter().all(|value| value.is_ascii_alphabetic()) {
+    // "00" is Nordic's explicit world regulatory domain. Otherwise require
+    // an ISO/IEC 3166 alpha-2 value.
+    if country != *b"00" && !country.iter().all(|value| value.is_ascii_alphabetic()) {
         return Err(ProtocolError::InvalidValue(
             u16::from_be_bytes(country) as u32
         ));
     }
-    encode_umac(
-        out,
-        UmacCommand::RequestSetRegulatory,
-        ifaceindex,
-        10,
-        |writer| {
-            let mut valid = 1 | (1 << 1);
-            if force {
-                valid |= 1 << 2;
-            }
-            writer.u32(valid)?;
-            writer.u32(user_hint_type)?;
-            writer.bytes(&country)
-        },
-    )
+    encode_umac(out, UmacCommand::RequestSetRegulatory, None, 10, |writer| {
+        let mut valid = 1 | (1 << 1);
+        if force {
+            valid |= 1 << 2;
+        }
+        writer.u32(valid)?;
+        writer.u32(user_hint_type)?;
+        writer.bytes(&country)
+    })
 }
 
 /// Encodes `NRF_WIFI_UMAC_CMD_SET_POWER_SAVE`.
 pub fn encode_power_save(
     out: &mut [u8],
-    ifaceindex: i32,
+    wdev_id: u32,
     state: PowerSaveState,
 ) -> Result<usize, ProtocolError> {
-    encode_umac(out, UmacCommand::SetPowerSave, ifaceindex, 4, |writer| {
+    encode_umac(out, UmacCommand::SetPowerSave, Some(wdev_id), 4, |writer| {
         writer.i32(state as i32)
     })
 }
@@ -538,13 +536,13 @@ pub fn encode_power_save(
 /// Encodes `NRF_WIFI_UMAC_CMD_SET_POWER_SAVE_TIMEOUT`.
 pub fn encode_power_save_timeout(
     out: &mut [u8],
-    ifaceindex: i32,
+    wdev_id: u32,
     timeout_ms: i32,
 ) -> Result<usize, ProtocolError> {
     encode_umac(
         out,
         UmacCommand::SetPowerSaveTimeout,
-        ifaceindex,
+        Some(wdev_id),
         4,
         |writer| writer.i32(timeout_ms),
     )
@@ -553,14 +551,14 @@ pub fn encode_power_save_timeout(
 /// Encodes `NRF_WIFI_UMAC_CMD_SET_STATION` for controlled-port authorization.
 pub fn encode_station_authorized(
     out: &mut [u8],
-    ifaceindex: i32,
+    wdev_id: u32,
     peer: [u8; 6],
     authorized: bool,
 ) -> Result<usize, ProtocolError> {
     encode_umac(
         out,
         UmacCommand::SetStation,
-        ifaceindex,
+        Some(wdev_id),
         4 + CHANGE_STATION_INFO_LEN,
         |writer| {
             writer.u32(SET_STATION_FLAGS_VALID)?;
@@ -699,7 +697,7 @@ fn parse_scan_result<'a>(
 fn encode_umac<F>(
     out: &mut [u8],
     command: UmacCommand,
-    ifaceindex: i32,
+    wdev_id: Option<u32>,
     body_len: usize,
     encode_body: F,
 ) -> Result<usize, ProtocolError>
@@ -721,10 +719,14 @@ where
     writer.u32(0)?;
     writer.u32(command as u32)?;
     writer.i32(0)?;
-    writer.u32(INDEX_IFACE_VALID)?;
-    writer.i32(ifaceindex)?;
+    writer.u32(if wdev_id.is_some() {
+        INDEX_WDEV_VALID
+    } else {
+        0
+    })?;
     writer.i32(0)?;
-    writer.u64(0)?;
+    writer.i32(0)?;
+    writer.u64(wdev_id.unwrap_or(0) as u64)?;
     encode_body(&mut writer)?;
     if writer.len() != total {
         return Err(ProtocolError::InvalidLength);
@@ -770,9 +772,6 @@ fn write_key_info(
     if !key.sequence.is_empty() {
         valid |= KEY_SEQUENCE_VALID;
     }
-    if key.flags != 0 {
-        valid |= KEY_FLAGS_VALID;
-    }
     writer.u32(valid)?;
     writer.u32(key.cipher_suite)?;
     writer.u16(key.flags)?;
@@ -781,6 +780,23 @@ fn write_key_info(
     writer.fixed(key.key, MAX_KEY_LEN)?;
     writer.i32(key.sequence.len() as i32)?;
     writer.fixed(key.sequence, MAX_KEY_SEQUENCE_LEN)?;
+    writer.u8(key.key_index)
+}
+
+fn write_default_key_info(
+    writer: &mut Writer<'_>,
+    key: &KeyConfig<'_>,
+) -> Result<(), ProtocolError> {
+    // nrf_wifi_sys_fmac_set_key accepts only the key index as a valid field;
+    // the default-key selection flags are carried independently.
+    writer.u32(KEY_INDEX_VALID)?;
+    writer.u32(0)?;
+    writer.u16(key.flags)?;
+    writer.i32(0)?;
+    writer.u32(0)?;
+    writer.zeros(MAX_KEY_LEN)?;
+    writer.i32(0)?;
+    writer.zeros(MAX_KEY_SEQUENCE_LEN)?;
     writer.u8(key.key_index)
 }
 
@@ -943,6 +959,13 @@ mod tests {
             encode_authenticate(&mut bytes, 1, &auth).unwrap(),
             AUTH_MESSAGE_LEN
         );
+        assert_eq!(read_u32(&bytes, HOST_HEADER_LEN + 16), INDEX_WDEV_VALID);
+        assert_eq!(read_i32(&bytes, HOST_HEADER_LEN + 20), 0);
+        assert_eq!(read_u64(&bytes, HOST_HEADER_LEN + 28), 1);
+        assert_eq!(
+            read_u32(&bytes, HOST_HEADER_LEN + UMAC_HEADER_LEN),
+            AUTH_FREQUENCY_VALID | AUTH_SSID_VALID
+        );
 
         let assoc = AssociationRequest {
             frequency_mhz: 2412,
@@ -964,10 +987,57 @@ mod tests {
         let key = KeyConfig::pairwise(RSN_CIPHER_CCMP_128, 0, &[0x55; 16]);
         let mut bytes = [0u8; MAX_STATION_MESSAGE_LEN];
         assert_eq!(
-            encode_key_command(&mut bytes, 1, UmacCommand::NewKey, [1, 2, 3, 4, 5, 6], &key,)
-                .unwrap(),
+            encode_key_command(
+                &mut bytes,
+                1,
+                UmacCommand::NewKey,
+                Some([1, 2, 3, 4, 5, 6]),
+                &key,
+            )
+            .unwrap(),
             KEY_MESSAGE_LEN
         );
+        let body = HOST_HEADER_LEN + UMAC_HEADER_LEN;
+        assert_eq!(read_u32(&bytes, body), KEY_MAC_VALID);
+        assert_eq!(
+            read_u32(&bytes, body + 4),
+            KEY_DATA_VALID | KEY_TYPE_VALID | KEY_INDEX_VALID | KEY_CIPHER_VALID
+        );
+
+        let group = KeyConfig {
+            cipher_suite: RSN_CIPHER_CCMP_128,
+            key_type: KeyType::Group,
+            key_index: 1,
+            key: &[0x66; 16],
+            sequence: &[0; 8],
+            flags: 1 << 4,
+        };
+        encode_key_command(&mut bytes, 1, UmacCommand::NewKey, None, &group).unwrap();
+        assert_eq!(read_u32(&bytes, body), 0);
+        assert_eq!(
+            read_u32(&bytes, body + 4),
+            KEY_DATA_VALID
+                | KEY_TYPE_VALID
+                | KEY_INDEX_VALID
+                | KEY_SEQUENCE_VALID
+                | KEY_CIPHER_VALID
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[body + 12], bytes[body + 13]]),
+            1 << 4
+        );
+
+        let default_group = KeyConfig {
+            cipher_suite: 0,
+            key_type: KeyType::Group,
+            key_index: 1,
+            key: &[],
+            sequence: &[],
+            flags: (1 << 0) | (1 << 4),
+        };
+        encode_set_key(&mut bytes, 1, &default_group).unwrap();
+        assert_eq!(read_u32(&bytes, body), KEY_INDEX_VALID);
+        assert_eq!(u16::from_le_bytes([bytes[body + 8], bytes[body + 9]]), 0x11);
     }
 
     #[test]
@@ -988,6 +1058,17 @@ mod tests {
                 status: 7,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn world_regulatory_domain_is_accepted() {
+        let mut out = [0u8; 128];
+        assert!(encode_set_regulatory(&mut out, 0, *b"00", 0, false).is_ok());
+        assert_eq!(read_u32(&out, HOST_HEADER_LEN + 16), 0);
+        assert!(matches!(
+            encode_set_regulatory(&mut out, 0, *b"0A", 0, false),
+            Err(ProtocolError::InvalidValue(_))
         ));
     }
 }
