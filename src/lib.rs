@@ -19,6 +19,7 @@ pub mod data;
 pub mod device;
 pub mod firmware;
 pub mod memory;
+pub mod production;
 pub mod protocol;
 pub mod runtime;
 pub mod station;
@@ -42,6 +43,7 @@ pub use data::{DataPath, ReceivedFrame, RxEventRef, TxDoneEventRef};
 pub use device::Device;
 pub use firmware::{FirmwareBundle, FirmwareReport, FirmwareTrustPolicy, PinnedFirmwareSha256};
 pub use memory::{Processor, Rpu};
+pub use production::{MissionCriticalDriver, ProductionError};
 pub use protocol::{ScanRequest, SystemInitConfig};
 pub use runtime::{DriverError, DriverEvent, DriverState, NativeDriver, Platform, RecoveryError};
 pub use station::{StationController, StationError, StationFault, StationState, StationTimeouts};
@@ -52,6 +54,9 @@ pub use wpa2::{
     EapolTxFrame, GroupKeyInstall, PairwiseKeyInstall, Pmk, Wpa2Action, Wpa2Error,
     Wpa2GroupKeyInstallRequest, Wpa2KeyInstallRequest, Wpa2Phase, Wpa2Supplicant,
 };
+
+#[cfg(feature = "wpa2")]
+pub use production::{SecureDriverEvent, SecureProductionError, SecureReceive, Wpa2StationDriver};
 
 #[cfg(feature = "wpa2")]
 pub use wpa2_runtime::{

@@ -884,7 +884,8 @@ mod tests {
         runtime.last_input_digest = Some(input_digest(&payload));
         let mut driver = driver();
         let mut delay = NoDelay;
-        let progress = block_on(runtime.on_ethernet_frame(&mut driver, &mut delay, &frame)).unwrap();
+        let progress =
+            block_on(runtime.on_ethernet_frame(&mut driver, &mut delay, &frame)).unwrap();
         assert_eq!(progress, Wpa2Progress::NoChange);
         assert_eq!(runtime.state(), Wpa2RuntimeState::AwaitingPairwiseKeyStatus);
         assert_eq!(runtime.remaining_time_ms(), Some(123));

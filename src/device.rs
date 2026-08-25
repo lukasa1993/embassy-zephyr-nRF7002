@@ -175,7 +175,7 @@ impl<B> Device<B> {
         self.recovery_required = false;
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "wpa2"))]
     pub(crate) fn initialize_for_test(&mut self, queues: HpqmInfo, rx_command_base: u32) {
         self.queues = Some(queues);
         self.rx_command_base = rx_command_base;

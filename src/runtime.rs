@@ -217,8 +217,7 @@ impl<B, const RX: usize, const TX: usize> NativeDriver<B, RX, TX> {
         &mut self.station
     }
 
-    /// Splits the device and station fields for the WPA2 coordinator.
-    #[cfg(feature = "wpa2")]
+    /// Splits the device and station fields for coordinated control operations.
     pub(crate) fn security_parts_mut(&mut self) -> (&mut Device<B>, &mut StationController) {
         (&mut self.device, &mut self.station)
     }

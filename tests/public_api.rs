@@ -1,15 +1,41 @@
-use embassy_nrf7002::{DataPath, NRF_WIFI_SOURCE_REVISION, ScanRequest};
+use embassy_nrf7002::{
+    Bus, DataPath, MissionCriticalDriver, NRF_WIFI_SOURCE_REVISION, ScanRequest,
+};
 use embassy_nrf7002::{
     data::{MAX_TX_TOKENS, RPU_MEM_PACKET_BASE, TX_COMMAND_SLOT_SIZE},
     device::{DEFAULT_CONTROL_FRAGMENT_LEN, MAX_EVENT_FRAGMENT_LEN, RPU_MEM_TX_CMD_BASE},
     protocol::{DataCommand, HostMessageType, UmacCommand, UmacEvent},
 };
 
+struct PublicBus;
+
+impl Bus for PublicBus {
+    type Error = ();
+
+    async fn read_status(&mut self, _opcode: u8) -> Result<u8, Self::Error> {
+        Ok(0)
+    }
+
+    async fn write_status(&mut self, _opcode: u8, _value: u8) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn read(&mut self, _address: u32, data: &mut [u8]) -> Result<(), Self::Error> {
+        data.fill(0);
+        Ok(())
+    }
+
+    async fn write(&mut self, _address: u32, _data: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 #[test]
 fn pinned_revision_and_public_types_are_available() {
     assert_eq!(NRF_WIFI_SOURCE_REVISION.len(), 40);
     let _ = DataPath::<8, 4>::new(1600, 1514).unwrap();
     let _ = ScanRequest::all_bands();
+    let _ = MissionCriticalDriver::<PublicBus, 8, 4>::new(PublicBus, 1600, 1514, 0, 0, 0).unwrap();
 }
 
 #[test]

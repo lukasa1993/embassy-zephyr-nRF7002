@@ -8,17 +8,15 @@
 use embedded_hal_async::delay::DelayNs;
 
 use super::bus::Bus;
-use super::control::{
-    AssociationRequest, AuthenticationRequest, EAPOL_ETHERTYPE, PowerSaveState,
-};
-use super::data::{DataError, DataLayoutError, DataProtocolError, ReceivedFrame, RxEventRef};
+use super::control::{AssociationRequest, AuthenticationRequest, EAPOL_ETHERTYPE, PowerSaveState};
+use super::data::{DataError, DataLayoutError, ReceivedFrame, RxEventRef};
 use super::device::{DeviceError, FragmentLimitError};
 use super::firmware::{FirmwareBundle, FirmwareReport, FirmwareTrustPolicy};
-use super::protocol::{ProtocolError, ScanReason, ScanRequest, SystemInitConfig};
+use super::protocol::{ScanReason, ScanRequest, SystemInitConfig};
 use super::runtime::{
     DriverError, DriverEvent, DriverState, NativeDriver, Platform, RecoveryError,
 };
-use super::station::{StationError, StationFault, StationState, StationTimeouts};
+use super::station::{StationError, StationState, StationTimeouts};
 
 #[cfg(feature = "embassy-net")]
 use super::embassy::NetworkRunner;
@@ -308,12 +306,30 @@ where
         self.finish_station(result)
     }
 
-    /// Applies a sequenced firmware power-save update.
+    /// Starts a firmware power-save state update.
     pub async fn set_power_save<D>(
         &mut self,
         delay: &mut D,
         state: PowerSaveState,
-        timeout_ms: Option<i32>,
+    ) -> Result<(), ProductionError<B::Error>>
+    where
+        D: DelayNs,
+    {
+        self.ensure_ready()?;
+        let result = {
+            let (device, station) = self.inner.security_parts_mut();
+            station.set_power_save(device, delay, state).await
+        };
+        self.finish_station(result)
+    }
+
+    /// Starts a firmware power-save timeout update.
+    ///
+    /// Process its command-status event before a power-save state update.
+    pub async fn set_power_save_timeout<D>(
+        &mut self,
+        delay: &mut D,
+        timeout_ms: i32,
     ) -> Result<(), ProductionError<B::Error>>
     where
         D: DelayNs,
@@ -322,7 +338,7 @@ where
         let result = {
             let (device, station) = self.inner.security_parts_mut();
             station
-                .set_power_save(device, delay, state, timeout_ms)
+                .set_power_save_timeout(device, delay, timeout_ms)
                 .await
         };
         self.finish_station(result)
@@ -368,10 +384,7 @@ where
         output: &mut [u8],
     ) -> Result<ReceivedFrame, ProductionError<B::Error>> {
         self.ensure_ready()?;
-        let result = self
-            .inner
-            .receive_packet(event, packet_index, output)
-            .await;
+        let result = self.inner.receive_packet(event, packet_index, output).await;
         let frame = match result {
             Ok(frame) => frame,
             Err(error) => {
@@ -490,7 +503,10 @@ fn station_error_requires_recovery<E>(error: &StationError<E>) -> bool {
     match error {
         StationError::Device(error) => device_error_requires_recovery(error),
         StationError::Fault(_) => true,
-        StationError::Protocol(_) | StationError::InvalidState { .. } => false,
+        StationError::Protocol(_)
+        | StationError::InvalidState { .. }
+        | StationError::InterfaceAlreadyCreated
+        | StationError::InterfaceNotCreated => false,
     }
 }
 
@@ -511,7 +527,9 @@ fn data_error_requires_recovery<E>(error: &DataError<E>, operation: DriverOperat
         DataError::Device(error) => device_error_requires_recovery(error),
         DataError::Rpu(_) | DataError::QueueOwnershipUncertain(_) => true,
         DataError::ReceiveDescriptorBusy(_) => true,
-        DataError::Protocol(_) => matches!(operation, DriverOperation::Receive | DriverOperation::Event),
+        DataError::Protocol(_) => {
+            matches!(operation, DriverOperation::Receive | DriverOperation::Event)
+        }
         DataError::NoTransmitToken | DataError::OutputTooSmall { .. } => false,
     }
 }
@@ -528,11 +546,19 @@ fn driver_error_requires_recovery<E>(error: &DriverError<E>, operation: DriverOp
         }
         DriverError::Data(error) => data_error_requires_recovery(error, operation),
         DriverError::DataProtocol(_) => true,
-        DriverError::Firmware(_) | DriverError::Protocol(_) | DriverError::InvalidWatchdogStatus => {
-            true
-        }
+        DriverError::Firmware(_)
+        | DriverError::Protocol(_)
+        | DriverError::InvalidWatchdogStatus => true,
         DriverError::Station(error) => station_error_requires_recovery(error),
-        DriverError::InvalidState { .. } => false,
+        DriverError::WrongInterface { .. } => {
+            matches!(operation, DriverOperation::Receive | DriverOperation::Event)
+        }
+        DriverError::UnexpectedEventForState { .. } => true,
+        DriverError::InvalidState { .. }
+        | DriverError::InvalidStationState { .. }
+        | DriverError::ConfigurationMismatch
+        | DriverError::FrameTooShort
+        | DriverError::ControlledPortClosed { .. } => false,
     }
 }
 
@@ -649,10 +675,7 @@ where
     }
 
     /// Advances both station and WPA2 deadlines.
-    pub fn advance_time(
-        &mut self,
-        elapsed_ms: u32,
-    ) -> Result<(), SecureProductionError<B::Error>> {
+    pub fn advance_time(&mut self, elapsed_ms: u32) -> Result<(), SecureProductionError<B::Error>> {
         self.driver.advance_time(elapsed_ms)?;
         self.security
             .advance_time(&mut self.driver.inner, elapsed_ms)?;
@@ -715,11 +738,7 @@ where
 
         let progress = self
             .security
-            .on_ethernet_frame(
-                &mut self.driver.inner,
-                delay,
-                &output[..frame.len],
-            )
+            .on_ethernet_frame(&mut self.driver.inner, delay, &output[..frame.len])
             .await?;
         output[..frame.len].fill(0);
         Ok(SecureReceive::Eapol(progress))
@@ -746,7 +765,9 @@ fn control_event_is_expected(state: Wpa2RuntimeState, event: ControlEvent<'_>) -
         | Wpa2RuntimeState::AwaitingGroupKeyStatus
         | Wpa2RuntimeState::AwaitingGroupRekeyStatus => command == UmacCommand::NewKey as u32,
         Wpa2RuntimeState::AwaitingDefaultGroupKeyStatus
-        | Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus => command == UmacCommand::SetKey as u32,
+        | Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus => {
+            command == UmacCommand::SetKey as u32
+        }
         Wpa2RuntimeState::AwaitingAuthorizationStatus => command == UmacCommand::SetStation as u32,
         _ => false,
     }
@@ -763,6 +784,9 @@ fn transmit_done_is_expected(state: Wpa2RuntimeState, event: TxDoneEventRef<'_>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::DataProtocolError;
+    use crate::protocol::ProtocolError;
+    use crate::station::StationFault;
 
     #[test]
     fn short_ethernet_frame_is_rejected() {
