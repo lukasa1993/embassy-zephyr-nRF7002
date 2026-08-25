@@ -1,0 +1,164 @@
+name: Apply production API fix
+
+on:
+  push:
+    branches:
+      - native-embassy-nrf7002
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Add one-shot production API fix'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the current branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: native-embassy-nrf7002
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: |
+          set -euxo pipefail
+          rustup toolchain install 1.95.0 \
+            --profile minimal \
+            --component rustfmt,clippy \
+            --target thumbv8m.main-none-eabihf
+
+      - name: Apply the production API corrections
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}: {old!r}")
+              file.write_text(text.replace(old, new))
+
+          replace(
+              "src/lib.rs",
+              "pub mod protocol;\npub mod runtime;",
+              "pub mod protocol;\npub mod production;\npub mod runtime;",
+          )
+          replace(
+              "src/lib.rs",
+              "pub use protocol::{ScanRequest, SystemInitConfig};\npub use runtime::{",
+              "pub use production::{MissionCriticalDriver, ProductionError};\n"
+              "pub use protocol::{ScanRequest, SystemInitConfig};\npub use runtime::{",
+          )
+          replace(
+              "src/lib.rs",
+              "#[cfg(feature = \"wpa2\")]\npub use wpa2_runtime::{",
+              "#[cfg(feature = \"wpa2\")]\n"
+              "pub use production::{SecureDriverEvent, SecureProductionError, SecureReceive, Wpa2StationDriver};\n\n"
+              "#[cfg(feature = \"wpa2\")]\npub use wpa2_runtime::{",
+          )
+
+          replace(
+              "src/production.rs",
+              "use super::data::{DataError, DataLayoutError, DataProtocolError, ReceivedFrame, RxEventRef};",
+              "use super::data::{DataError, DataLayoutError, ReceivedFrame, RxEventRef};",
+          )
+          replace(
+              "src/production.rs",
+              "use super::protocol::{ProtocolError, ScanReason, ScanRequest, SystemInitConfig};",
+              "use super::protocol::{ScanReason, ScanRequest, SystemInitConfig};",
+          )
+          replace(
+              "src/production.rs",
+              "use super::station::{StationError, StationFault, StationState, StationTimeouts};",
+              "use super::station::{StationError, StationState, StationTimeouts};",
+          )
+          replace(
+              "src/production.rs",
+              "mod tests {\n    use super::*;",
+              "mod tests {\n    use super::*;\n"
+              "    use crate::data::DataProtocolError;\n"
+              "    use crate::protocol::ProtocolError;\n"
+              "    use crate::station::StationFault;",
+          )
+
+          replace(
+              "src/wpa2_runtime.rs",
+              "        let progress = block_on(runtime.on_ethernet_frame(&mut driver, &mut delay, &frame)).unwrap();",
+              "        let progress =\n"
+              "            block_on(runtime.on_ethernet_frame(&mut driver, &mut delay, &frame)).unwrap();",
+          )
+
+          replace(
+              "tests/public_api.rs",
+              "use embassy_nrf7002::{DataPath, NRF_WIFI_SOURCE_REVISION, ScanRequest};",
+              "use embassy_nrf7002::{\n"
+              "    Bus, DataPath, MissionCriticalDriver, NRF_WIFI_SOURCE_REVISION, ScanRequest,\n"
+              "};",
+          )
+          replace(
+              "tests/public_api.rs",
+              "};\n\n#[test]",
+              "};\n\n"
+              "struct PublicBus;\n\n"
+              "impl Bus for PublicBus {\n"
+              "    type Error = ();\n\n"
+              "    async fn read(&mut self, _address: u32, data: &mut [u8]) -> Result<(), Self::Error> {\n"
+              "        data.fill(0);\n"
+              "        Ok(())\n"
+              "    }\n\n"
+              "    async fn write(&mut self, _address: u32, _data: &[u8]) -> Result<(), Self::Error> {\n"
+              "        Ok(())\n"
+              "    }\n"
+              "}\n\n"
+              "#[test]",
+          )
+          replace(
+              "tests/public_api.rs",
+              "    let _ = ScanRequest::all_bands();",
+              "    let _ = ScanRequest::all_bands();\n"
+              "    let _ = MissionCriticalDriver::<PublicBus, 8, 4>::new(\n"
+              "        PublicBus, 1600, 1514, 0, 0, 0,\n"
+              "    )\n"
+              "    .unwrap();",
+          )
+          PY
+
+          cargo +1.95.0 fmt --all
+          git diff --check
+
+      - name: Run the complete host test matrix
+        run: |
+          set -euxo pipefail
+          cargo +1.95.0 test --no-default-features
+          cargo +1.95.0 test --features embassy-net
+          cargo +1.95.0 test --features wpa2
+          cargo +1.95.0 test --all-features
+
+      - name: Run Clippy
+        run: cargo +1.95.0 clippy --all-targets --all-features -- -D warnings
+
+      - name: Check no-std targets
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          set -euxo pipefail
+          cargo +1.95.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
+          cargo +1.95.0 check --lib --features embassy-net,wpa2 --target thumbv8m.main-none-eabihf
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +1.95.0 doc --lib --all-features --no-deps
+
+      - name: Commit the verified correction
+        run: |
+          set -euxo pipefail
+          rm .github/workflows/apply-production-fix.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lib.rs src/production.rs src/wpa2_runtime.rs tests/public_api.rs .github/workflows/apply-production-fix.yml
+          git commit -m 'Compile and expose the fail-closed production API'
+          git push origin HEAD:native-embassy-nrf7002
