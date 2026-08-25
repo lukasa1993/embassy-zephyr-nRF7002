@@ -1,0 +1,112 @@
+name: Apply production API fix v4
+
+on:
+  push:
+    branches:
+      - native-embassy-nrf7002
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Complete production API test coverage'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the current branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: native-embassy-nrf7002
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: |
+          set -euxo pipefail
+          rustup toolchain install 1.95.0 \
+            --profile minimal \
+            --component rustfmt,clippy \
+            --target thumbv8m.main-none-eabihf
+
+      - name: Apply exact source corrections
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          workflow = Path('.github/workflows/apply-production-fix-v3.yml').read_text()
+          marker = "          python3 - <<'PY'\n"
+          start = workflow.index(marker) + len(marker)
+          end = workflow.index("\n          PY", start)
+          exec(textwrap.dedent(workflow[start:end]), {})
+
+          def replace(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}: {old!r}")
+              file.write_text(text.replace(old, new))
+
+          replace(
+              'src/device.rs',
+              '    #[cfg(test)]\n    pub(crate) fn initialize_for_test',
+              '    #[cfg(all(test, feature = "wpa2"))]\n    pub(crate) fn initialize_for_test',
+          )
+          replace(
+              'tests/public_api.rs',
+              '    type Error = ();\n\n    async fn read(',
+              '    type Error = ();\n\n'
+              '    async fn read_status(&mut self, _opcode: u8) -> Result<u8, Self::Error> {\n'
+              '        Ok(0)\n'
+              '    }\n\n'
+              '    async fn write_status(\n'
+              '        &mut self,\n'
+              '        _opcode: u8,\n'
+              '        _value: u8,\n'
+              '    ) -> Result<(), Self::Error> {\n'
+              '        Ok(())\n'
+              '    }\n\n'
+              '    async fn read(',
+          )
+          PY
+
+          cargo +1.95.0 fmt --all
+          git diff --check
+
+      - name: Run the host test matrix
+        run: |
+          set -euxo pipefail
+          cargo +1.95.0 test --no-default-features
+          cargo +1.95.0 test --features embassy-net
+          cargo +1.95.0 test --features wpa2
+          cargo +1.95.0 test --all-features
+
+      - name: Run Clippy
+        run: cargo +1.95.0 clippy --all-targets --all-features -- -D warnings
+
+      - name: Check no-std targets
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          set -euxo pipefail
+          cargo +1.95.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
+          cargo +1.95.0 check --lib --features embassy-net,wpa2 --target thumbv8m.main-none-eabihf
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +1.95.0 doc --lib --all-features --no-deps
+
+      - name: Commit the verified correction
+        run: |
+          set -euxo pipefail
+          git rm .github/workflows/apply-production-fix.yml
+          git rm .github/workflows/apply-production-fix-v2.yml
+          git rm .github/workflows/apply-production-fix-v3.yml
+          git rm .github/workflows/apply-production-fix-v4.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lib.rs src/device.rs src/production.rs src/runtime.rs src/wpa2_runtime.rs tests/public_api.rs
+          git commit -m 'Compile and expose the fail-closed production API'
+          git push origin HEAD:native-embassy-nrf7002
