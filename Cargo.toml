@@ -1,46 +1,31 @@
-[workspace]
-resolver = "2"
-
 [package]
-name = "embassy-zephyr-nrf7002"
+name = "embassy-nrf7002"
 version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "Safe no_std Embassy Wi-Fi/L2 boundary for nRF7002 on pinned Zephyr/NCS"
+description = "Native no_std Embassy driver core for the Nordic nRF7002"
 repository = "https://github.com/lukasa1993/embassy-zephyr-nRF7002"
 readme = "README.md"
-keywords = ["embassy", "zephyr", "nrf7002", "wifi", "embedded"]
+keywords = ["embassy", "nrf7002", "wifi", "embedded", "no-std"]
 categories = ["embedded", "no-std", "hardware-support"]
-# The crate is consumed from the matching Git tag because the Zephyr wrapper,
-# pinned west manifest, and private C mechanism live in this repository too.
-# Publishing the Rust half alone to crates.io would create a broken contract.
 publish = false
 
 [features]
 default = []
-# Enable the production C ABI backend.  Keeping this opt-in lets host tests
-# and documentation builds run without a Zephyr foundation package or linker.
-zephyr = []
-# Enable the allocation-free Embassy network-driver adapter.  The adapter is
-# kept behind its own feature so the small synchronous ABI crate remains usable
-# by host-side tools without pulling in Embassy's waitqueue dependency.
 embassy-net = ["dep:embassy-net-driver", "dep:embassy-sync"]
-
-[lib]
-path = "src/lib.rs"
+wpa2 = ["dep:aes", "dep:hmac", "dep:pbkdf2", "dep:sha1", "dep:zeroize"]
 
 [dependencies]
-# zephyr-lang-rust's current NCS proof uses the Embassy-net driver trait.  The
-# trait crate is intentionally the only Embassy-net dependency here; the full
-# embassy-net stack stays in the Rust application workspace.
+embedded-hal-async = "=1.0.0"
+sha2 = { version = "=0.10.9", default-features = false }
 embassy-net-driver = { version = "=0.2.0", default-features = false, optional = true }
-# AtomicWaker provides the bounded wakeup primitive used by the driver.  It
-# does not create an executor, task, queue, or heap allocation.
 embassy-sync = { version = "=0.6.2", default-features = false, optional = true }
+aes = { version = "=0.8.4", default-features = false, optional = true }
+hmac = { version = "=0.12.1", default-features = false, optional = true }
+pbkdf2 = { version = "=0.12.2", default-features = false, features = ["hmac"], optional = true }
+sha1 = { version = "=0.10.6", default-features = false, optional = true }
+zeroize = { version = "=1.9.0", default-features = false, optional = true }
 
 [dev-dependencies]
-# Host tests need a critical-section implementation for embassy-sync's
-# AtomicWaker.  This is a test-only dependency and is not present in the
-# no_std Zephyr artifact.
 critical-section = { version = "=1.2.0", features = ["std"] }

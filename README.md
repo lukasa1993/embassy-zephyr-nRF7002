@@ -1,141 +1,88 @@
-# embassy-zephyr-nRF7002
+# embassy-nrf7002
 
-A reusable, `no_std` Rust control and raw-Ethernet boundary for the Nordic
-nRF7002 Wi-Fi companion on `nrf7002dk/nrf5340/cpuapp`. Embassy owns DHCP,
-IP, TCP, and application logic. A pinned NCS/Zephyr foundation owns device
-initialization, the nRF70 driver, WPA supplicant, automatic reconnect/roaming,
-and the final firmware link.
+`embassy-nrf7002` is a native, allocation-free, `no_std` Rust driver core for the Nordic nRF7002 Wi-Fi companion IC.
 
-> **Alpha status:** host tests and the complete pinned Zephyr build/link pass.
-> The included firmware has not yet completed an on-device association, DHCP,
-> and HTTP request gate. Use the prerelease for evaluation, not production.
+The driver core talks to the nRF7002 radio processor directly. It does not link Zephyr, the Nordic C host driver, a C ABI, or a C run-time library.
 
-## What Rust controls
+## Status
 
-The safe `WifiController` API exposes all supported runtime choices:
+This branch is an early alpha. It is not a complete station driver and it is not ready for production use.
 
-- enable or disable STA and SoftAP independently;
-- scan on 2.4 GHz and/or 5 GHz;
-- connect one STA association using credentials supplied by Rust at runtime;
-- start one SoftAP, with one officially supported connected client;
-- run concurrent STA + SoftAP through two nRF70 virtual interfaces;
-- select SSID, security, MFP, BSSID, band, channel, bandwidth, timeout, hidden
-  SSID behavior, regulatory country/domain, power-save settings, and TWT;
-- read role status, link details, regulatory channels, statistics, and Wi-Fi
-  events; and
-- disconnect roles, stop SoftAP, reset statistics, or remove the AP client.
+The current code implements these parts:
 
-Credentials are borrowed for a synchronous call, copied into bounded bridge
-storage, submitted to the supplicant, and wiped. No SSID or passphrase is
-compiled into the Zephyr foundation. Automatic reconnect and roaming are the
-only mechanism-side policy; Rust receives their resulting events and status.
+- SPI framing and RPU memory access;
+- firmware bundle parsing and patch boot;
+- host-port queues and fragmented command and event transport;
+- system initialization, station-interface creation, scan request, scan-result request, and deauthentication command formats;
+- basic RX and TX packet handling; and
+- an optional `embassy-net-driver` queue adapter.
 
-The current frozen capability limits are one STA association, one officially
-supported SoftAP client, two virtual interfaces, and both 2.4 GHz and 5 GHz.
-`WifiController::capabilities()` validates these limits at runtime.
+The current code does not implement a complete connection flow. Authentication, association, key installation, regulatory control, connection-state handling, power save, fault recovery, and a board-ready top-level runner are still missing. See [`docs/ABI_REQUIREMENTS.md`](docs/ABI_REQUIREMENTS.md).
 
-## Add the Rust crate
+Host tests and packed-interface layout checks cover compilation, bounds, firmware parsing, queue logic, and message formats. These checks do not prove RF operation. Use the hardware test plan before a release.
 
-Use the matching Git tag so the Rust API, C ABI, Zephyr configuration, and
-toolchain pins cannot drift independently:
+The host interface is pinned to:
 
-```toml
-[dependencies]
-embassy-zephyr-nrf7002 = {
-  git = "https://github.com/lukasa1993/embassy-zephyr-nRF7002",
-  tag = "v0.1.0-alpha.1",
-  default-features = false,
-  features = ["zephyr", "embassy-net"],
-}
-```
+- nRF Connect SDK firmware release `v3.4.0`;
+- `nrf_wifi` revision `5046744cb4c9640eb8b11cb92f1ea0b9554c20cf`.
 
-```rust,ignore
-use embassy_zephyr_nrf7002::{
-    ConnectRequest, CountryCode, InterfaceRole, Security, WifiController,
-};
+Do not use another firmware or host-interface revision without a full ABI review.
 
-let mut wifi = WifiController::take()?;
-wifi.set_enabled(InterfaceRole::Station, true)?;
-wifi.set_country(InterfaceRole::Station, CountryCode::new(*b"US")?, false)?;
-wifi.connect(ConnectRequest::new(
-    runtime_ssid,
-    Security::Wpa2Psk,
-    runtime_passphrase,
-))?;
-```
+## Driver contents
 
-The `zephyr` feature calls the repository's private C ABI and therefore must
-be linked inside the matching Zephyr wrapper. A Cargo dependency by itself
-does not replace Zephyr's generated linker passes. See
-[the crate API guide](docs/crate-api.md) for the Rust-only surface and data
-plane.
+The crate provides:
 
-## Prebuilt proof firmware
+- nRF70 SPI framing and status-register access;
+- RPU address translation, reset, power, register, and memory access;
+- firmware bundle parsing, SHA-256 integrity checks, patch download, and processor start;
+- host-port queue management, command fragmentation, event reassembly, and interrupt control;
+- packed system, UMAC, scan, interface, RX, and TX messages;
+- fixed packet-RAM allocation, RX descriptor recycling, and TX tokens;
+- Ethernet II frame conversion; and
+- an allocation-free `embassy-net-driver` adapter behind the `embassy-net` feature.
 
-The GitHub prerelease provides:
+## Firmware input
 
-- a flashable `.hex`, plus matching `.elf` and `.bin` files;
-- a SHA-256 checksum file; and
-- a verified foundation archive for inspection and reproducible caching.
-
-The proof image asks for the SSID, security mode, and passphrase through its
-Rust provisioning console, then runs Embassy DHCP/TCP and serves:
+Use the system-mode firmware bundle from `sdk-nrfxlib` `v3.4.0`:
 
 ```text
-Hello from embassy-zephyr-nRF7002
+nrf_wifi/bin/zephyr/default/nrf70.bin
 ```
 
-No credentials are present in the release image. The foundation archive is an
-auditable cache, not a standalone firmware linker SDK: Zephyr's persistent
-CMake/Ninja tree is still required to link changed Rust firmware.
+The path name comes from the Nordic firmware package. The driver does not use Zephyr. The firmware file is not stored in this repository. The application can include it after it accepts the Nordic firmware license.
 
-## Build once, then rebuild Rust
+The bundle-owned SHA-256 value checks payload integrity. It does not authorize the file. Production boot requires a `FirmwareTrustPolicy`. Use `PinnedFirmwareSha256` with a complete-file digest stored outside `nrf70.bin`. Get the firmware from a trusted Nordic package and protect the external digest as part of the signed application image.
 
-Only Docker is required on the host. NCS, Zephyr, west, CMake, the Nordic
-toolchain, the Rust target toolchain, generated files, and caches remain in
-this repository's ignored directories.
+## Board contract
+
+Board code must supply:
+
+- one asynchronous `embedded-hal-async` SPI device;
+- the host-interrupt GPIO handler or future;
+- a delay provider;
+- valid board RF parameters and TX power ceilings; and
+- the correct nRF7002 power, reset, and coexistence GPIO sequence.
+
+Use 8 MHz or less for the wake status-register transaction. Use only a board-qualified frequency for normal traffic.
+
+## Build
+
+The crate declares Rust `1.85` as its minimum version. The repository pins Rust `1.95.0` for normal development.
 
 ```sh
-scripts/bootstrap.sh
-scripts/build.sh
+cargo fmt --all --check
+cargo test --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo check --lib --no-default-features --target thumbv8m.main-none-eabihf
+cargo check --lib --features embassy-net --target thumbv8m.main-none-eabihf
 ```
 
-After that, edit the Rust application under `rust/app/` and run:
+CI also checks Rust `1.85` and compiles the pinned Nordic C headers with static assertions. The C test checks the sizes and offsets that the Rust codecs use.
 
-```sh
-scripts/rust-rebuild.sh
-```
+## Documents
 
-That command invokes the existing inner Ninja graph directly. Cargo rebuilds
-the Rust static library and Zephyr performs its required metadata/final-link
-passes; it does not run west update, CMake reconfiguration, or rebuild the
-checked-out C foundation.
-
-Package and verify the frozen foundation explicitly:
-
-```sh
-scripts/package.sh
-scripts/verify.sh --for-rust
-scripts/status.sh
-```
-
-Host-side crate tests do not need Docker or Zephyr:
-
-```sh
-rustup run 1.95.0 cargo test --features embassy-net \
-  --target aarch64-apple-darwin
-```
-
-## Isolation and pins
-
-All non-Rust integration lives in this repository. It is not a Cargo member of
-any consuming product repository. `.workspace/`, `.build/`, `artifacts/`,
-`target/`, and `release/` are ignored.
-
-The wrapper currently pins NCS v3.4.0, Zephyr `ncs-v3.4.0`,
-`zephyr-lang-rust` commit `dd73abc242e995784da62352fe8c70d9a6c7ac2e`,
-Rust 1.95.0, and the Nordic v3.4.0 toolchain image by immutable digest. The
-build fails closed if Zephyr IPv4/IPv6, DHCP, DNS, TCP, or UDP is enabled;
-ordinary Ethernet frames cross into `embassy-net` instead.
+- [`docs/PORTING.md`](docs/PORTING.md): board integration map.
+- [`docs/ABI_REQUIREMENTS.md`](docs/ABI_REQUIREMENTS.md): feature and ABI completion gate.
+- [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md): host and hardware acceptance tests.
 
 Licensed under Apache-2.0 or MIT, at your option.

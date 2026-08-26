@@ -1,23 +1,115 @@
-name: Rust and repository checks
+name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, native-embassy-nrf7002]
   pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NRF_WIFI_REVISION: 5046744cb4c9640eb8b11cb92f1ea0b9554c20cf
+
 jobs:
-  host:
-    runs-on: ubuntu-latest
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+      - name: Check out the driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          set -euxo pipefail
+          rustup toolchain install 1.95.0 \
+            --profile minimal \
+            --component rustfmt,clippy \
+            --target thumbv8m.main-none-eabihf
+
       - name: Check formatting
-        run: rustup run 1.95.0 cargo fmt --all --check
-      - name: Test safe Rust boundary
-        run: rustup run 1.95.0 cargo test --features embassy-net
-      - name: Check shell syntax
-        run: for script in scripts/*.sh; do sh -n "$script"; done
+        run: cargo +1.95.0 fmt --all --check
+
+      - name: Run the host test matrix
+        run: |
+          set -euxo pipefail
+          cargo +1.95.0 test --no-default-features
+          cargo +1.95.0 test --features embassy-net
+          cargo +1.95.0 test --features wpa2
+          cargo +1.95.0 test --all-features
+
+      - name: Run Clippy for all targets and features
+        run: cargo +1.95.0 clippy --all-targets --all-features -- -D warnings
+
+      - name: Check every no-std feature combination
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          set -euxo pipefail
+          cargo +1.95.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
+          cargo +1.95.0 check --lib --features embassy-net --target thumbv8m.main-none-eabihf
+          cargo +1.95.0 check --lib --features wpa2 --target thumbv8m.main-none-eabihf
+          cargo +1.95.0 check --lib --features embassy-net,wpa2 --target thumbv8m.main-none-eabihf
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +1.95.0 doc --lib --all-features --no-deps
+
+  msrv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        run: |
+          set -euxo pipefail
+          rustup toolchain install 1.85.0 \
+            --profile minimal \
+            --target thumbv8m.main-none-eabihf
+
+      - name: Check the complete feature set at the minimum Rust version
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          set -euxo pipefail
+          cargo +1.85.0 check --lib --no-default-features --target thumbv8m.main-none-eabihf
+          cargo +1.85.0 check --lib --features embassy-net,wpa2 --target thumbv8m.main-none-eabihf
+
+  nordic-layout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the pinned Nordic host interface
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zephyrproject-rtos/nrf_wifi
+          ref: ${{ env.NRF_WIFI_REVISION }}
+          path: nrf_wifi
+          persist-credentials: false
+
+      - name: Check packed sizes, offsets, and numeric ABI values
+        run: |
+          set -euxo pipefail
+          cc -std=c11 -Wall -Wextra -Werror \
+            -I nrf_wifi/fw_if/umac_if/inc \
+            -I nrf_wifi/fw_if/umac_if/inc/fw \
+            -I nrf_wifi/hw_if/hal/inc \
+            tests/layout_probe.c \
+            -o /tmp/nrf7002-layout-probe
+          /tmp/nrf7002-layout-probe

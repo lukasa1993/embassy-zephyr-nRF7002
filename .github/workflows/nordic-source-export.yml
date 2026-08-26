@@ -1,0 +1,34 @@
+name: Nordic source export
+
+on:
+  push:
+    branches:
+      - native-embassy-nrf7002
+
+permissions:
+  contents: read
+
+env:
+  NRF_WIFI_REVISION: 5046744cb4c9640eb8b11cb92f1ea0b9554c20cf
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the pinned Nordic host interface
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: zephyrproject-rtos/nrf_wifi
+          ref: ${{ env.NRF_WIFI_REVISION }}
+          persist-credentials: false
+
+      - name: Create a pinned source archive
+        run: tar --exclude=.git -czf "$RUNNER_TEMP/nrf-wifi-pinned.tar.gz" .
+
+      - name: Upload the pinned source archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nrf-wifi-pinned-source
+          path: ${{ runner.temp }}/nrf-wifi-pinned.tar.gz
+          if-no-files-found: error
+          retention-days: 1
