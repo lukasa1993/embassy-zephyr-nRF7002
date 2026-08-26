@@ -122,7 +122,7 @@ impl SpiConfig {
             0x000000..=0x008fff => 1,
             0x009000..=0x03ffff => 2,
             0x040000..=0x07ffff => 1,
-            0x080000..=0x092000 => 1,
+            0x080000..=0x092000 => 2,
             0x0c0000..=0x0f0fff => 0,
             0x100000..=0x134000
             | 0x140000..=0x14c000
@@ -278,10 +278,11 @@ where
         self.io_buffer.bytes[4] = 0;
         let data_start = READ_HEADER_LEN + latency_len;
         let transfer_len = data_start + data.len();
-        // Nordic's SPI shim clocks reads with a null TX buffer. The nRF SPIM
-        // peripheral emits its 0xff over-read character for those clocks, so
-        // reproduce that wire traffic instead of transmitting stale/zero RAM.
-        self.io_buffer.bytes[READ_HEADER_LEN..transfer_len].fill(0xff);
+        // Match Nordic's two-buffer transfer exactly: latency clocks extend a
+        // zero-filled header, then the null TX data buffer uses SPIM's 0xff
+        // over-read character while the payload is received.
+        self.io_buffer.bytes[READ_HEADER_LEN..data_start].fill(0);
+        self.io_buffer.bytes[data_start..transfer_len].fill(0xff);
         self.spi
             .transfer_in_place(&mut self.io_buffer.bytes[..transfer_len])
             .await?;
@@ -309,7 +310,7 @@ mod tests {
         assert_eq!(config.read_latency_words(0x000018), 1);
         assert_eq!(config.read_latency_words(0x009000), 2);
         assert_eq!(config.read_latency_words(0x048c20), 1);
-        assert_eq!(config.read_latency_words(0x080000), 1);
+        assert_eq!(config.read_latency_words(0x080000), 2);
         assert_eq!(config.read_latency_words(0x0c5000), 0);
         assert_eq!(config.read_latency_words(0x143a80), 1);
         assert_eq!(config.read_latency_words(0x28c000), 1);

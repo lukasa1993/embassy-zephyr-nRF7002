@@ -387,6 +387,14 @@ where
         let result = self.inner.receive_packet(event, packet_index, output).await;
         let frame = match result {
             Ok(frame) => frame,
+            Err(DriverError::ControlledPortClosed { ether_type, .. }) => {
+                // The portable layer has already consumed the firmware RX
+                // buffer. Normalize this expected fail-closed drop so WPA2
+                // callers do not mistake pre-authorization ARP/IP traffic for
+                // a hardware fault, and wipe any copied caller bytes.
+                output.fill(0);
+                return Err(ProductionError::ControlledPortClosed { ether_type });
+            }
             Err(error) => {
                 if receive_error_requires_recovery(&error) {
                     self.inner.enter_recovery();

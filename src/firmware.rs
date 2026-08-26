@@ -20,11 +20,6 @@ pub const FEATURE_SYSTEM_WITH_RAW: u32 = 1 << 3;
 pub const PATCH_HEADER_LEN: usize = 52;
 /// Per-image header bytes.
 pub const IMAGE_HEADER_LEN: usize = 8;
-/// Fixed memory used for firmware download readback.
-pub const FIRMWARE_READBACK_CHUNK: usize = 256;
-/// Bounded read attempts for each firmware verification chunk.
-pub const FIRMWARE_READBACK_ATTEMPTS: usize = 3;
-
 pub const RPU_MEM_LMAC_PATCH_BIN: u32 = 0x8004_3a80;
 pub const RPU_MEM_LMAC_PATCH_BIMG: u32 = 0x8004_bbc0;
 pub const RPU_MEM_UMAC_PATCH_BIN: u32 = 0x8008_c000;
@@ -124,13 +119,6 @@ pub enum LoadError<E> {
     },
     /// A required image was not present.
     MissingImage(ImageKind),
-    /// Download readback did not match the trusted image bytes.
-    ReadbackMismatch {
-        kind: ImageKind,
-        offset: usize,
-        expected: [u8; 4],
-        actual: [u8; 4],
-    },
 }
 
 /// Firmware operation active when an RPU access failed.
@@ -138,7 +126,6 @@ pub enum LoadError<E> {
 pub enum LoadStage {
     Reset(Processor),
     Download(ImageKind),
-    Verify(ImageKind),
     Boot(Processor),
 }
 
@@ -350,7 +337,8 @@ pub struct FirmwareReport {
     pub feature_flags: u32,
 }
 
-/// Resets both processors, downloads and verifies all images, boots LMAC then UMAC, and checks signatures.
+/// Validates the trusted bundle, resets both processors, downloads all images,
+/// boots LMAC then UMAC, and checks both boot signatures.
 pub async fn load<B, D, T>(
     rpu: &mut Rpu<B>,
     delay: &mut D,
@@ -392,10 +380,9 @@ where
                 stage: LoadStage::Download(kind),
                 error,
             })?;
-        // The RPU direct-memory bridge can return a stale first word when a
-        // high-latency read follows the final write immediately.
-        delay.delay_ms(1).await;
-        verify_download(rpu, delay, processor, destination, image).await?;
+        // Match Nordic's pinned loader: the high-latency direct-memory read
+        // path is not a reliable write verifier. Both processors must still
+        // publish their boot signatures below, which fails a bad download.
     }
 
     boot_processor(rpu, delay, Processor::Lmac)
@@ -416,71 +403,6 @@ where
         version: header.version,
         feature_flags: header.feature_flags,
     })
-}
-
-async fn verify_download<B, D>(
-    rpu: &mut Rpu<B>,
-    delay: &mut D,
-    processor: Processor,
-    destination: u32,
-    image: FirmwareImage<'_>,
-) -> Result<(), LoadError<B::Error>>
-where
-    B: Bus,
-    D: DelayNs,
-{
-    let mut readback = [0u8; FIRMWARE_READBACK_CHUNK];
-    let mut offset = 0usize;
-    while offset < image.data.len() {
-        let count = core::cmp::min(FIRMWARE_READBACK_CHUNK, image.data.len() - offset);
-        let stage = LoadStage::Verify(image.kind);
-        let offset_u32 = u32::try_from(offset).map_err(|_| LoadError::Rpu {
-            stage,
-            error: RpuError::InvalidArgument,
-        })?;
-        let address = destination.checked_add(offset_u32).ok_or(LoadError::Rpu {
-            stage,
-            error: RpuError::InvalidArgument,
-        })?;
-        let mut matched = false;
-        for attempt in 0..FIRMWARE_READBACK_ATTEMPTS {
-            rpu.read(processor, address, &mut readback[..count])
-                .await
-                .map_err(|error| LoadError::Rpu { stage, error })?;
-            if readback[..count] == image.data[offset..offset + count] {
-                matched = true;
-                break;
-            }
-            if attempt + 1 < FIRMWARE_READBACK_ATTEMPTS {
-                delay.delay_ms(1).await;
-            }
-        }
-        if !matched {
-            let mismatch = readback[..count]
-                .iter()
-                .zip(&image.data[offset..offset + count])
-                .position(|(actual, expected)| actual != expected)
-                .unwrap_or(0);
-            let mut expected = [0u8; 4];
-            let mut actual = [0u8; 4];
-            let diagnostic_len = core::cmp::min(4, count - mismatch);
-            expected[..diagnostic_len].copy_from_slice(
-                &image.data[offset + mismatch..offset + mismatch + diagnostic_len],
-            );
-            actual[..diagnostic_len]
-                .copy_from_slice(&readback[mismatch..mismatch + diagnostic_len]);
-            readback[..count].fill(0);
-            return Err(LoadError::ReadbackMismatch {
-                kind: image.kind,
-                offset: offset + mismatch,
-                expected,
-                actual,
-            });
-        }
-        readback[..count].fill(0);
-        offset += count;
-    }
-    Ok(())
 }
 
 async fn boot_processor<B, D>(
