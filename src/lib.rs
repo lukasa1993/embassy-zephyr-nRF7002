@@ -13,6 +13,8 @@ extern crate std;
 #[cfg(test)]
 mod test_support;
 
+mod codec;
+
 pub mod bus;
 pub mod control;
 pub mod data;

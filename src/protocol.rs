@@ -3,6 +3,8 @@
 //! All encoders write fields explicitly in little-endian order. No C ABI,
 //! bindgen output, unaligned reference, or transmute is used.
 
+use crate::codec::{Writer, read_i32, read_u32, read_u64};
+
 /// Common host message header length.
 pub const HOST_MESSAGE_HEADER_LEN: usize = 12;
 /// Packed UMAC command/event header length.
@@ -637,7 +639,7 @@ pub fn encode_new_interface(
     writer.i32(0)?;
     writer.u32(0)?;
     writer.bytes(&mac_address)?;
-    writer.fixed_bytes(interface_name, 16)?;
+    writer.fixed(interface_name, 16)?;
     encode_umac_command(
         out,
         UmacCommand::NewInterface,
@@ -730,12 +732,12 @@ pub fn encode_scan(
             &[]
         };
         writer.u8(ssid.len() as u8)?;
-        writer.fixed_bytes(ssid, MAX_SSID_LEN)?;
+        writer.fixed(ssid, MAX_SSID_LEN)?;
     }
     writer.u8(u8::from(request.no_cck))?;
     writer.u8(request.bands)?;
     writer.u16(request.information_elements.len() as u16)?;
-    writer.fixed_bytes(request.information_elements, MAX_SCAN_IE_LEN)?;
+    writer.fixed(request.information_elements, MAX_SCAN_IE_LEN)?;
     writer.bytes(&request.mac_address)?;
     writer.u16(request.active_dwell_ms)?;
     writer.u16(request.passive_dwell_ms)?;
@@ -842,74 +844,6 @@ const fn bool_u32(value: bool) -> u32 {
     if value { 1 } else { 0 }
 }
 
-struct Writer<'a> {
-    bytes: &'a mut [u8],
-    position: usize,
-}
-
-impl<'a> Writer<'a> {
-    fn new(bytes: &'a mut [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-
-    fn len(&self) -> usize {
-        self.position
-    }
-
-    fn u8(&mut self, value: u8) -> Result<(), ProtocolError> {
-        self.bytes(&[value])
-    }
-
-    fn u16(&mut self, value: u16) -> Result<(), ProtocolError> {
-        self.bytes(&value.to_le_bytes())
-    }
-
-    fn u32(&mut self, value: u32) -> Result<(), ProtocolError> {
-        self.bytes(&value.to_le_bytes())
-    }
-
-    fn i32(&mut self, value: i32) -> Result<(), ProtocolError> {
-        self.bytes(&value.to_le_bytes())
-    }
-
-    fn u64(&mut self, value: u64) -> Result<(), ProtocolError> {
-        self.bytes(&value.to_le_bytes())
-    }
-
-    fn bytes(&mut self, value: &[u8]) -> Result<(), ProtocolError> {
-        let end = self
-            .position
-            .checked_add(value.len())
-            .ok_or(ProtocolError::BufferTooSmall)?;
-        let target = self
-            .bytes
-            .get_mut(self.position..end)
-            .ok_or(ProtocolError::BufferTooSmall)?;
-        target.copy_from_slice(value);
-        self.position = end;
-        Ok(())
-    }
-
-    fn fixed_bytes(&mut self, value: &[u8], width: usize) -> Result<(), ProtocolError> {
-        if value.len() > width {
-            return Err(ProtocolError::LimitExceeded);
-        }
-        self.bytes(value)?;
-        let zeros = width - value.len();
-        let end = self
-            .position
-            .checked_add(zeros)
-            .ok_or(ProtocolError::BufferTooSmall)?;
-        let target = self
-            .bytes
-            .get_mut(self.position..end)
-            .ok_or(ProtocolError::BufferTooSmall)?;
-        target.fill(0);
-        self.position = end;
-        Ok(())
-    }
-}
-
 struct Reader<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -936,37 +870,6 @@ impl<'a> Reader<'a> {
             dequeue_address: self.u32()?,
         })
     }
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
-}
-
-fn read_i32(bytes: &[u8], offset: usize) -> i32 {
-    i32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-        bytes[offset + 4],
-        bytes[offset + 5],
-        bytes[offset + 6],
-        bytes[offset + 7],
-    ])
 }
 
 #[cfg(test)]

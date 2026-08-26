@@ -4,6 +4,7 @@
 //! 1024-byte scratch limit. These codecs write directly into caller storage
 //! and do not allocate.
 
+use super::codec::{Writer, read_i32, read_u16, read_u32, read_u64};
 use super::protocol::{
     HostMessageRef, HostMessageType, ProtocolError, UMAC_HEADER_LEN, UmacCommand, UmacEvent,
     UmacHeader, parse_umac_event,
@@ -808,86 +809,7 @@ fn require_len(bytes: &[u8], len: usize) -> Result<(), ProtocolError> {
     }
 }
 
-struct Writer<'a> {
-    bytes: &'a mut [u8],
-    position: usize,
-}
-
-impl<'a> Writer<'a> {
-    fn new(bytes: &'a mut [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-
-    fn len(&self) -> usize {
-        self.position
-    }
-
-    fn u8(&mut self, value: u8) -> Result<(), ProtocolError> {
-        self.bytes(&[value])
-    }
-
-    fn u16(&mut self, value: u16) -> Result<(), ProtocolError> {
-        self.bytes(&value.to_le_bytes())
-    }
-
-    fn u32(&mut self, value: u32) -> Result<(), ProtocolError> {
-        self.bytes(&value.to_le_bytes())
-    }
-
-    fn i32(&mut self, value: i32) -> Result<(), ProtocolError> {
-        self.bytes(&value.to_le_bytes())
-    }
-
-    fn u64(&mut self, value: u64) -> Result<(), ProtocolError> {
-        self.bytes(&value.to_le_bytes())
-    }
-
-    fn bytes(&mut self, value: &[u8]) -> Result<(), ProtocolError> {
-        let end = self
-            .position
-            .checked_add(value.len())
-            .ok_or(ProtocolError::BufferTooSmall)?;
-        let target = self
-            .bytes
-            .get_mut(self.position..end)
-            .ok_or(ProtocolError::BufferTooSmall)?;
-        target.copy_from_slice(value);
-        self.position = end;
-        Ok(())
-    }
-
-    fn zeros(&mut self, count: usize) -> Result<(), ProtocolError> {
-        let end = self
-            .position
-            .checked_add(count)
-            .ok_or(ProtocolError::BufferTooSmall)?;
-        let target = self
-            .bytes
-            .get_mut(self.position..end)
-            .ok_or(ProtocolError::BufferTooSmall)?;
-        target.fill(0);
-        self.position = end;
-        Ok(())
-    }
-
-    fn fixed(&mut self, value: &[u8], width: usize) -> Result<(), ProtocolError> {
-        if value.len() > width {
-            return Err(ProtocolError::LimitExceeded);
-        }
-        self.bytes(value)?;
-        self.zeros(width - value.len())
-    }
-
-    fn fixed_u32(&mut self, value: &[u32], count: usize) -> Result<(), ProtocolError> {
-        if value.len() > count {
-            return Err(ProtocolError::LimitExceeded);
-        }
-        for item in value {
-            self.u32(*item)?;
-        }
-        self.zeros((count - value.len()) * 4)
-    }
-
+impl Writer<'_> {
     fn ssid(&mut self, value: &[u8]) -> Result<(), ProtocolError> {
         validate_ssid(value)?;
         self.u8(value.len() as u8)?;
@@ -899,41 +821,6 @@ impl<'a> Writer<'a> {
         self.u16(value.len() as u16)?;
         self.fixed(value, MAX_IE_LEN)
     }
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
-}
-
-fn read_i32(bytes: &[u8], offset: usize) -> i32 {
-    i32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-        bytes[offset + 4],
-        bytes[offset + 5],
-        bytes[offset + 6],
-        bytes[offset + 7],
-    ])
 }
 
 #[cfg(test)]
