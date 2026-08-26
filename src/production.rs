@@ -813,8 +813,11 @@ mod tests {
     use crate::bus::Bus;
     use crate::data::DataProtocolError;
     use crate::memory::RpuError;
-    use crate::protocol::{HostMessageRef, HostMessageType, ProtocolError, UmacHeader};
+    #[cfg(feature = "wpa2")]
+    use crate::protocol::UmacHeader;
+    use crate::protocol::{HostMessageRef, HostMessageType, ProtocolError};
     use crate::station::StationFault;
+    #[cfg(feature = "wpa2")]
     use crate::system::SystemEvent;
     use crate::test_support::block_on;
 
@@ -849,8 +852,10 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "wpa2")]
     struct NoDelay;
 
+    #[cfg(feature = "wpa2")]
     impl DelayNs for NoDelay {
         async fn delay_ns(&mut self, _ns: u32) {}
     }
@@ -875,6 +880,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "wpa2")]
     fn umac_header() -> UmacHeader {
         UmacHeader {
             port_id: 0,
