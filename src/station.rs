@@ -74,7 +74,10 @@ impl StationTimeouts {
         scan_results_ms: 10_000,
         authentication_ms: 5_000,
         authenticated_ms: 10_000,
-        association_ms: 5_000,
+        // Some access points defer reassociation while expiring the previous
+        // station session. Keep the fail-closed deadline bounded, but allow
+        // enough time for that normal reconnect path on real hardware.
+        association_ms: 20_000,
         key_exchange_ms: 10_000,
         authorization_ms: 5_000,
         carrier_ms: 5_000,
@@ -1210,6 +1213,19 @@ mod tests {
         assert_eq!(
             station.advance_time(1),
             Err(StationFault::Timeout(StationState::Authenticating))
+        );
+        assert_eq!(station.state(), StationState::Fault);
+    }
+
+    #[test]
+    fn association_allows_bounded_access_point_reconnect_delay() {
+        let mut station = StationController::new(1, 0, 7);
+        station.transition(StationState::Associating);
+        assert_eq!(station.remaining_time_ms(), Some(20_000));
+        assert_eq!(station.advance_time(19_999), Ok(()));
+        assert_eq!(
+            station.advance_time(1),
+            Err(StationFault::Timeout(StationState::Associating))
         );
         assert_eq!(station.state(), StationState::Fault);
     }
