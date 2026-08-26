@@ -1,5 +1,28 @@
 use super::bus::Bus;
 
+use core::future::Future;
+use core::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::task::Wake;
+
+struct NoopWake;
+
+impl Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut context = Context::from_waker(&waker);
+    let mut future = core::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
 impl Bus for () {
     type Error = ();
 

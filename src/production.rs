@@ -64,6 +64,17 @@ pub struct MissionCriticalDriver<B, const RX: usize, const TX: usize> {
     inner: NativeDriver<B, RX, TX>,
 }
 
+macro_rules! run_station_command {
+    ($driver:ident, $delay:expr, $method:ident $(, $argument:expr)* $(,)?) => {{
+        $driver.ensure_ready()?;
+        let result = {
+            let (device, station) = $driver.inner.security_parts_mut();
+            station.$method(device, $delay $(, $argument)*).await
+        };
+        $driver.finish_station(result)
+    }};
+}
+
 impl<B, const RX: usize, const TX: usize> MissionCriticalDriver<B, RX, TX> {
     /// Creates one cold fail-closed driver.
     pub fn new(
@@ -181,14 +192,7 @@ where
     where
         D: DelayNs,
     {
-        self.ensure_ready()?;
-        let result = {
-            let (device, station) = self.inner.security_parts_mut();
-            station
-                .create_interface(device, delay, mac_address, interface_name)
-                .await
-        };
-        self.finish_station(result)
+        run_station_command!(self, delay, create_interface, mac_address, interface_name)
     }
 
     /// Applies and validates one regulatory country code.
@@ -202,14 +206,7 @@ where
     where
         D: DelayNs,
     {
-        self.ensure_ready()?;
-        let result = {
-            let (device, station) = self.inner.security_parts_mut();
-            station
-                .set_regulatory(device, delay, country, user_hint_type, force)
-                .await
-        };
-        self.finish_station(result)
+        run_station_command!(self, delay, set_regulatory, country, user_hint_type, force)
     }
 
     /// Brings the station interface up.
@@ -217,12 +214,7 @@ where
     where
         D: DelayNs,
     {
-        self.ensure_ready()?;
-        let result = {
-            let (device, station) = self.inner.security_parts_mut();
-            station.bring_up(device, delay).await
-        };
-        self.finish_station(result)
+        run_station_command!(self, delay, bring_up)
     }
 
     /// Brings the station interface down.
@@ -230,12 +222,7 @@ where
     where
         D: DelayNs,
     {
-        self.ensure_ready()?;
-        let result = {
-            let (device, station) = self.inner.security_parts_mut();
-            station.bring_down(device, delay).await
-        };
-        self.finish_station(result)
+        run_station_command!(self, delay, bring_down)
     }
 
     /// Starts one bounded scan.
@@ -247,12 +234,7 @@ where
     where
         D: DelayNs,
     {
-        self.ensure_ready()?;
-        let result = {
-            let (device, station) = self.inner.security_parts_mut();
-            station.start_scan(device, delay, request).await
-        };
-        self.finish_station(result)
+        run_station_command!(self, delay, start_scan, request)
     }
 
     /// Requests the scan-result stream.
@@ -264,12 +246,7 @@ where
     where
         D: DelayNs,
     {
-        self.ensure_ready()?;
-        let result = {
-            let (device, station) = self.inner.security_parts_mut();
-            station.request_scan_results(device, delay, reason).await
-        };
-        self.finish_station(result)
+        run_station_command!(self, delay, request_scan_results, reason)
     }
 
     /// Starts 802.11 authentication.
@@ -281,12 +258,7 @@ where
     where
         D: DelayNs,
     {
-        self.ensure_ready()?;
-        let result = {
-            let (device, station) = self.inner.security_parts_mut();
-            station.authenticate(device, delay, request).await
-        };
-        self.finish_station(result)
+        run_station_command!(self, delay, authenticate, request)
     }
 
     /// Starts 802.11 association.
@@ -298,12 +270,7 @@ where
     where
         D: DelayNs,
     {
-        self.ensure_ready()?;
-        let result = {
-            let (device, station) = self.inner.security_parts_mut();
-            station.associate(device, delay, request).await
-        };
-        self.finish_station(result)
+        run_station_command!(self, delay, associate, request)
     }
 
     /// Starts a firmware power-save state update.
@@ -315,12 +282,7 @@ where
     where
         D: DelayNs,
     {
-        self.ensure_ready()?;
-        let result = {
-            let (device, station) = self.inner.security_parts_mut();
-            station.set_power_save(device, delay, state).await
-        };
-        self.finish_station(result)
+        run_station_command!(self, delay, set_power_save, state)
     }
 
     /// Starts a firmware power-save timeout update.
@@ -334,14 +296,7 @@ where
     where
         D: DelayNs,
     {
-        self.ensure_ready()?;
-        let result = {
-            let (device, station) = self.inner.security_parts_mut();
-            station
-                .set_power_save_timeout(device, delay, timeout_ms)
-                .await
-        };
-        self.finish_station(result)
+        run_station_command!(self, delay, set_power_save_timeout, timeout_ms)
     }
 
     /// Starts a reliable deauthentication sequence.
@@ -353,12 +308,7 @@ where
     where
         D: DelayNs,
     {
-        self.ensure_ready()?;
-        let result = {
-            let (device, station) = self.inner.security_parts_mut();
-            station.disconnect(device, delay, reason_code).await
-        };
-        self.finish_station(result)
+        run_station_command!(self, delay, disconnect, reason_code)
     }
 
     /// Advances all station deadlines.
@@ -385,24 +335,39 @@ where
     ) -> Result<ReceivedFrame, ProductionError<B::Error>> {
         self.ensure_ready()?;
         let result = self.inner.receive_packet(event, packet_index, output).await;
-        let frame = match result {
-            Ok(frame) => frame,
+        let frame = self.finish_receive(result, output)?;
+        self.enforce_received_frame(frame, output)
+    }
+
+    fn finish_receive(
+        &mut self,
+        result: Result<ReceivedFrame, DriverError<B::Error>>,
+        output: &mut [u8],
+    ) -> Result<ReceivedFrame, ProductionError<B::Error>> {
+        match result {
+            Ok(frame) => Ok(frame),
             Err(DriverError::ControlledPortClosed { ether_type, .. }) => {
                 // The portable layer has already consumed the firmware RX
                 // buffer. Normalize this expected fail-closed drop so WPA2
                 // callers do not mistake pre-authorization ARP/IP traffic for
                 // a hardware fault, and wipe any copied caller bytes.
                 output.fill(0);
-                return Err(ProductionError::ControlledPortClosed { ether_type });
+                Err(ProductionError::ControlledPortClosed { ether_type })
             }
             Err(error) => {
                 if receive_error_requires_recovery(&error) {
                     self.inner.enter_recovery();
                 }
-                return Err(ProductionError::Driver(error));
+                Err(ProductionError::Driver(error))
             }
-        };
+        }
+    }
 
+    fn enforce_received_frame(
+        &mut self,
+        frame: ReceivedFrame,
+        output: &mut [u8],
+    ) -> Result<ReceivedFrame, ProductionError<B::Error>> {
         if self.frame_allowed(frame.ether_type) {
             return Ok(frame);
         }
@@ -535,39 +500,44 @@ fn data_error_requires_recovery<E>(error: &DataError<E>, operation: DriverOperat
         DataError::Device(error) => device_error_requires_recovery(error),
         DataError::Rpu(_) | DataError::QueueOwnershipUncertain(_) => true,
         DataError::ReceiveDescriptorBusy(_) => true,
-        DataError::Protocol(_) => {
-            matches!(operation, DriverOperation::Receive | DriverOperation::Event)
-        }
+        DataError::Protocol(_) => input_protocol_error_requires_recovery(operation),
         DataError::NoTransmitToken | DataError::OutputTooSmall { .. } => false,
     }
 }
 
 fn driver_error_requires_recovery<E>(error: &DriverError<E>, operation: DriverOperation) -> bool {
     match error {
-        DriverError::Device(error) => {
-            if matches!(operation, DriverOperation::Event)
-                && matches!(error, DeviceError::EventBufferChanged)
-            {
-                return false;
-            }
-            device_error_requires_recovery(error)
-        }
+        DriverError::Device(error) => device_error_requires_recovery(error),
         DriverError::Data(error) => data_error_requires_recovery(error, operation),
-        DriverError::DataProtocol(_) => true,
-        DriverError::Firmware(_)
-        | DriverError::Protocol(_)
-        | DriverError::InvalidWatchdogStatus => true,
         DriverError::Station(error) => station_error_requires_recovery(error),
-        DriverError::WrongInterface { .. } => {
-            matches!(operation, DriverOperation::Receive | DriverOperation::Event)
-        }
-        DriverError::UnexpectedEventForState { .. } => true,
+        other => simple_driver_error_requires_recovery(other, operation),
+    }
+}
+
+fn simple_driver_error_requires_recovery<E>(
+    error: &DriverError<E>,
+    operation: DriverOperation,
+) -> bool {
+    match error {
+        DriverError::DataProtocol(_)
+        | DriverError::Firmware(_)
+        | DriverError::Protocol(_)
+        | DriverError::UnexpectedEventForState { .. }
+        | DriverError::InvalidWatchdogStatus => true,
+        DriverError::WrongInterface { .. } => input_protocol_error_requires_recovery(operation),
         DriverError::InvalidState { .. }
         | DriverError::InvalidStationState { .. }
         | DriverError::ConfigurationMismatch
         | DriverError::FrameTooShort
         | DriverError::ControlledPortClosed { .. } => false,
+        DriverError::Device(_) | DriverError::Data(_) | DriverError::Station(_) => {
+            unreachable!("nested driver errors are handled first")
+        }
     }
+}
+
+fn input_protocol_error_requires_recovery(operation: DriverOperation) -> bool {
+    matches!(operation, DriverOperation::Receive | DriverOperation::Event)
 }
 
 fn receive_error_requires_recovery<E>(error: &DriverError<E>) -> bool {
@@ -703,26 +673,59 @@ where
             return Ok(None);
         };
 
-        let security = match event {
-            DriverEvent::Control(control)
-                if control_event_is_expected(self.security.state(), control) =>
-            {
-                self.security
-                    .on_control_event(&mut self.driver.inner, delay, control)
-                    .await?
-            }
-            DriverEvent::TransmitDone(done)
-                if transmit_done_is_expected(self.security.state(), done) =>
-            {
-                self.security
-                    .on_transmit_done(&mut self.driver.inner, delay, done)
-                    .await?
-            }
-            DriverEvent::Data(_) => self.security.refresh_carrier(&mut self.driver.inner),
-            _ => Wpa2Progress::NoChange,
-        };
+        let security = self.apply_security_event(delay, event).await?;
 
         Ok(Some(SecureDriverEvent { event, security }))
+    }
+
+    async fn apply_security_event<D>(
+        &mut self,
+        delay: &mut D,
+        event: DriverEvent<'_>,
+    ) -> Result<Wpa2Progress, SecureProductionError<B::Error>>
+    where
+        D: DelayNs,
+    {
+        match event {
+            DriverEvent::Control(control) => self.apply_control_event(delay, control).await,
+            DriverEvent::TransmitDone(done) => self.apply_transmit_done(delay, done).await,
+            DriverEvent::Data(_) => Ok(self.security.refresh_carrier(&mut self.driver.inner)),
+            _ => Ok(Wpa2Progress::NoChange),
+        }
+    }
+
+    async fn apply_control_event<D>(
+        &mut self,
+        delay: &mut D,
+        control: ControlEvent<'_>,
+    ) -> Result<Wpa2Progress, SecureProductionError<B::Error>>
+    where
+        D: DelayNs,
+    {
+        if !control_event_is_expected(self.security.state(), control) {
+            return Ok(Wpa2Progress::NoChange);
+        }
+        Ok(self
+            .security
+            .on_control_event(&mut self.driver.inner, delay, control)
+            .await?)
+    }
+
+    async fn apply_transmit_done<D>(
+        &mut self,
+        delay: &mut D,
+        done: TxDoneEventRef<'_>,
+    ) -> Result<Wpa2Progress, SecureProductionError<B::Error>>
+    where
+        D: DelayNs,
+    {
+        if !transmit_done_is_expected(self.security.state(), done) {
+            return Ok(Wpa2Progress::NoChange);
+        }
+        Ok(self
+            .security
+            .on_transmit_done(&mut self.driver.inner, delay, done)
+            .await?)
     }
 
     /// Reads one packet. EAPOL packets are consumed by the WPA2 state machine.
@@ -740,16 +743,28 @@ where
             .driver
             .receive_packet(event, packet_index, output)
             .await?;
+        self.finish_received_packet(delay, frame, output).await
+    }
+
+    async fn finish_received_packet<D>(
+        &mut self,
+        delay: &mut D,
+        frame: ReceivedFrame,
+        output: &mut [u8],
+    ) -> Result<SecureReceive, SecureProductionError<B::Error>>
+    where
+        D: DelayNs,
+    {
         if frame.ether_type != EAPOL_ETHERTYPE {
             return Ok(SecureReceive::Data(frame));
         }
 
-        let progress = self
+        let result = self
             .security
             .on_ethernet_frame(&mut self.driver.inner, delay, &output[..frame.len])
-            .await?;
+            .await;
         output[..frame.len].fill(0);
-        Ok(SecureReceive::Eapol(progress))
+        Ok(SecureReceive::Eapol(result?))
     }
 
     /// Sends one normal Ethernet frame through the authorized port.
@@ -768,16 +783,19 @@ fn control_event_is_expected(state: Wpa2RuntimeState, event: ControlEvent<'_>) -
     let ControlEvent::CommandStatus { command, .. } = event else {
         return false;
     };
+    expected_security_command(state) == Some(command)
+}
+
+#[cfg(feature = "wpa2")]
+fn expected_security_command(state: Wpa2RuntimeState) -> Option<u32> {
     match state {
         Wpa2RuntimeState::AwaitingPairwiseKeyStatus
         | Wpa2RuntimeState::AwaitingGroupKeyStatus
-        | Wpa2RuntimeState::AwaitingGroupRekeyStatus => command == UmacCommand::NewKey as u32,
+        | Wpa2RuntimeState::AwaitingGroupRekeyStatus => Some(UmacCommand::NewKey as u32),
         Wpa2RuntimeState::AwaitingDefaultGroupKeyStatus
-        | Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus => {
-            command == UmacCommand::SetKey as u32
-        }
-        Wpa2RuntimeState::AwaitingAuthorizationStatus => command == UmacCommand::SetStation as u32,
-        _ => false,
+        | Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus => Some(UmacCommand::SetKey as u32),
+        Wpa2RuntimeState::AwaitingAuthorizationStatus => Some(UmacCommand::SetStation as u32),
+        _ => None,
     }
 }
 
@@ -792,9 +810,527 @@ fn transmit_done_is_expected(state: Wpa2RuntimeState, event: TxDoneEventRef<'_>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::Bus;
     use crate::data::DataProtocolError;
-    use crate::protocol::ProtocolError;
+    use crate::memory::RpuError;
+    use crate::protocol::{HostMessageRef, HostMessageType, ProtocolError, UmacHeader};
     use crate::station::StationFault;
+    use crate::system::SystemEvent;
+    use crate::test_support::block_on;
+
+    #[cfg(feature = "wpa2")]
+    use crate::data::DataEvent;
+    #[cfg(feature = "wpa2")]
+    use crate::wpa2::Pmk;
+    #[cfg(feature = "wpa2")]
+    use crate::wpa2_runtime::EapolTransmitPurpose;
+
+    #[derive(Default)]
+    struct NullBus;
+
+    impl Bus for NullBus {
+        type Error = ();
+
+        async fn read_status(&mut self, _opcode: u8) -> Result<u8, Self::Error> {
+            Ok(0)
+        }
+
+        async fn write_status(&mut self, _opcode: u8, _value: u8) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn read(&mut self, _address: u32, data: &mut [u8]) -> Result<(), Self::Error> {
+            data.fill(0);
+            Ok(())
+        }
+
+        async fn write(&mut self, _address: u32, _data: &[u8]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    struct NoDelay;
+
+    impl DelayNs for NoDelay {
+        async fn delay_ns(&mut self, _ns: u32) {}
+    }
+
+    fn driver() -> MissionCriticalDriver<NullBus, 1, 1> {
+        MissionCriticalDriver::new(NullBus, 64, 64, 1, 0, 0).unwrap()
+    }
+
+    fn ready_driver() -> MissionCriticalDriver<NullBus, 1, 1> {
+        let mut driver = driver();
+        driver.inner.prepare_ready_for_test();
+        driver
+    }
+
+    fn received(ether_type: u16) -> ReceivedFrame {
+        ReceivedFrame {
+            len: 14,
+            ether_type,
+            descriptor_id: 0,
+            signal_dbm: -40,
+            frequency_mhz: 2412,
+        }
+    }
+
+    fn umac_header() -> UmacHeader {
+        UmacHeader {
+            port_id: 0,
+            sequence: 1,
+            command_event: 0,
+            result: 0,
+            valid_ids: 0,
+            ifaceindex: 1,
+            wiphy_index: 0,
+            wdev_id: 0,
+        }
+    }
+
+    fn rx_event_payload() -> [u8; 37] {
+        let mut payload = [0u8; 37];
+        payload[..4]
+            .copy_from_slice(&(crate::data::DataCommand::ReceiveBuffer as u32).to_le_bytes());
+        let len = payload.len() as u32;
+        payload[4..8].copy_from_slice(&len.to_le_bytes());
+        payload[13] = 1;
+        payload[15] = 24;
+        payload
+    }
+
+    #[cfg(feature = "wpa2")]
+    fn secure_driver() -> Wpa2StationDriver<NullBus, 1, 1> {
+        const RSN_IE: [u8; 22] = [
+            0x30, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
+        ];
+        let supplicant = Wpa2Supplicant::new(
+            [2, 0, 0, 0, 0, 1],
+            [2, 0, 0, 0, 0, 2],
+            [0x11; 32],
+            Pmk::from_bytes([0x33; 32]),
+            &RSN_IE,
+        )
+        .unwrap();
+        Wpa2StationDriver::new(driver(), supplicant, 0)
+    }
+
+    #[test]
+    fn mission_driver_is_fail_closed_until_ready_and_validates_ethernet_first() {
+        let mut cold = driver();
+        assert_eq!(cold.state(), DriverState::Cold);
+        assert!(!cold.controlled_port_open());
+        assert!(matches!(
+            block_on(cold.transmit(0, &[0; 14], 0)),
+            Err(ProductionError::Driver(DriverError::InvalidState { .. }))
+        ));
+        let payload = rx_event_payload();
+        let event = RxEventRef::parse(HostMessageRef {
+            resubmit: false,
+            message_type: HostMessageType::Data,
+            payload: &payload,
+        })
+        .unwrap();
+        assert!(matches!(
+            block_on(cold.receive_packet(&event, 0, &mut [0; 64])),
+            Err(ProductionError::Driver(DriverError::InvalidState { .. }))
+        ));
+
+        let mut ready = ready_driver();
+        assert!(matches!(
+            block_on(ready.transmit(0, &[0; 13], 0)),
+            Err(ProductionError::InvalidEthernetFrame)
+        ));
+        let mut ipv4 = [0u8; 14];
+        ipv4[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        assert!(matches!(
+            block_on(ready.transmit(0, &ipv4, 0)),
+            Err(ProductionError::ControlledPortClosed { ether_type: 0x0800 })
+        ));
+    }
+
+    #[test]
+    fn receive_result_normalization_wipes_closed_port_frames_and_recovers_faults() {
+        let mut driver = ready_driver();
+        let mut output = [7u8; 32];
+        assert!(matches!(
+            driver.finish_receive(
+                Err(DriverError::ControlledPortClosed {
+                    state: StationState::Down,
+                    ether_type: 0x0800,
+                }),
+                &mut output,
+            ),
+            Err(ProductionError::ControlledPortClosed { ether_type: 0x0800 })
+        ));
+        assert_eq!(output, [0; 32]);
+        assert_eq!(driver.state(), DriverState::Ready);
+
+        output.fill(7);
+        assert!(matches!(
+            driver.finish_receive(
+                Err(DriverError::Data(DataError::OutputTooSmall {
+                    needed: 64,
+                    capacity: 32,
+                })),
+                &mut output,
+            ),
+            Err(ProductionError::Driver(DriverError::Data(
+                DataError::OutputTooSmall { .. }
+            )))
+        ));
+        assert_eq!(driver.state(), DriverState::Ready);
+
+        assert!(matches!(
+            driver.finish_receive(
+                Err(DriverError::DataProtocol(DataProtocolError::InvalidLength)),
+                &mut output,
+            ),
+            Err(ProductionError::Driver(DriverError::DataProtocol(_)))
+        ));
+        assert_eq!(driver.state(), DriverState::Recovering);
+    }
+
+    #[test]
+    fn received_frame_policy_allows_only_the_active_controlled_port() {
+        let mut driver = ready_driver();
+        let mut output = [9u8; 32];
+        assert!(!driver.frame_allowed(EAPOL_ETHERTYPE));
+        assert!(matches!(
+            driver.enforce_received_frame(received(0x0800), &mut output),
+            Err(ProductionError::ControlledPortClosed { ether_type: 0x0800 })
+        ));
+        assert_eq!(&output[..14], &[0; 14]);
+
+        driver
+            .inner
+            .station_mut()
+            .prepare_security_for_test([1, 2, 3, 4, 5, 6]);
+        assert!(driver.frame_allowed(EAPOL_ETHERTYPE));
+        assert!(!driver.frame_allowed(0x0800));
+        assert!(
+            driver
+                .enforce_received_frame(received(EAPOL_ETHERTYPE), &mut output)
+                .is_ok()
+        );
+
+        driver
+            .inner
+            .station_mut()
+            .prepare_connected_for_test([1, 2, 3, 4, 5, 6]);
+        assert!(driver.frame_allowed(0x0800));
+        assert!(
+            driver
+                .enforce_received_frame(received(0x0800), &mut output)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn finish_helpers_enter_recovery_only_for_hardware_and_station_faults() {
+        let mut driver = ready_driver();
+        assert_eq!(driver.finish_station::<u8>(Ok(7)).unwrap(), 7);
+        assert!(matches!(
+            driver.finish_station::<()>(Err(StationError::Protocol(ProtocolError::LimitExceeded))),
+            Err(ProductionError::Station(StationError::Protocol(_)))
+        ));
+        assert_eq!(driver.state(), DriverState::Ready);
+        assert!(matches!(
+            driver.finish_station::<()>(Err(StationError::Fault(StationFault::UnexpectedEvent))),
+            Err(ProductionError::Station(StationError::Fault(_)))
+        ));
+        assert_eq!(driver.state(), DriverState::Recovering);
+
+        let mut driver = ready_driver();
+        assert_eq!(
+            driver
+                .finish_driver::<u8>(Ok(9), DriverOperation::Control)
+                .unwrap(),
+            9
+        );
+        assert!(matches!(
+            driver.finish_driver::<()>(Err(DriverError::FrameTooShort), DriverOperation::Transmit),
+            Err(ProductionError::Driver(DriverError::FrameTooShort))
+        ));
+        assert_eq!(driver.state(), DriverState::Ready);
+        assert!(matches!(
+            driver.finish_driver::<()>(
+                Err(DriverError::InvalidWatchdogStatus),
+                DriverOperation::Watchdog
+            ),
+            Err(ProductionError::Driver(DriverError::InvalidWatchdogStatus))
+        ));
+        assert_eq!(driver.state(), DriverState::Recovering);
+    }
+
+    #[test]
+    fn all_recovery_policy_categories_are_explicit() {
+        for error in [
+            DeviceError::<()>::Rpu(RpuError::Timeout),
+            DeviceError::NotInitialized,
+            DeviceError::InvalidQueueMap,
+            DeviceError::CommandDeliveryUncertain,
+            DeviceError::RecoveryRequired,
+            DeviceError::EventTooLarge {
+                declared: 2,
+                capacity: 1,
+            },
+        ] {
+            assert!(device_error_requires_recovery(&error));
+        }
+        for error in [
+            DeviceError::<()>::Protocol(ProtocolError::InvalidLength),
+            DeviceError::CommandQueueEmpty,
+            DeviceError::CommandNeedsWait,
+            DeviceError::CommandQueueTimeout,
+            DeviceError::EventBufferChanged,
+        ] {
+            assert!(!device_error_requires_recovery(&error));
+        }
+
+        assert!(data_error_requires_recovery(
+            &DataError::<()>::Rpu(RpuError::Timeout),
+            DriverOperation::Transmit
+        ));
+        assert!(data_error_requires_recovery(
+            &DataError::<()>::Device(DeviceError::NotInitialized),
+            DriverOperation::Control
+        ));
+        assert!(data_error_requires_recovery(
+            &DataError::<()>::QueueOwnershipUncertain(DeviceError::CommandDeliveryUncertain),
+            DriverOperation::Transmit
+        ));
+        assert!(data_error_requires_recovery(
+            &DataError::<()>::ReceiveDescriptorBusy(1),
+            DriverOperation::Receive
+        ));
+        assert!(data_error_requires_recovery(
+            &DataError::<()>::Protocol(DataProtocolError::InvalidLength),
+            DriverOperation::Event
+        ));
+        assert!(!data_error_requires_recovery(
+            &DataError::<()>::Protocol(DataProtocolError::InvalidLength),
+            DriverOperation::Transmit
+        ));
+        assert!(!data_error_requires_recovery(
+            &DataError::<()>::NoTransmitToken,
+            DriverOperation::Transmit
+        ));
+        assert!(!data_error_requires_recovery(
+            &DataError::<()>::OutputTooSmall {
+                needed: 2,
+                capacity: 1,
+            },
+            DriverOperation::Receive
+        ));
+    }
+
+    #[test]
+    fn simple_driver_error_policy_distinguishes_input_context() {
+        assert!(simple_driver_error_requires_recovery(
+            &DriverError::<()>::DataProtocol(DataProtocolError::InvalidLength),
+            DriverOperation::Control
+        ));
+        assert!(simple_driver_error_requires_recovery(
+            &DriverError::<()>::Protocol(ProtocolError::InvalidLength),
+            DriverOperation::Control
+        ));
+        assert!(simple_driver_error_requires_recovery(
+            &DriverError::<()>::Firmware(crate::firmware::LoadError::Firmware(
+                crate::firmware::FirmwareError::TruncatedHeader,
+            )),
+            DriverOperation::Control
+        ));
+        let wrong = DriverError::<()>::WrongInterface {
+            expected: 0,
+            received: 1,
+        };
+        assert!(simple_driver_error_requires_recovery(
+            &wrong,
+            DriverOperation::Receive
+        ));
+        assert!(!simple_driver_error_requires_recovery(
+            &wrong,
+            DriverOperation::Transmit
+        ));
+        assert!(simple_driver_error_requires_recovery(
+            &DriverError::<()>::UnexpectedEventForState {
+                state: DriverState::Ready,
+            },
+            DriverOperation::Event
+        ));
+        assert!(!simple_driver_error_requires_recovery(
+            &DriverError::<()>::ConfigurationMismatch,
+            DriverOperation::Control
+        ));
+    }
+
+    #[cfg(feature = "wpa2")]
+    #[test]
+    fn expected_wpa2_commands_and_transmit_tokens_are_state_specific() {
+        for state in [
+            Wpa2RuntimeState::AwaitingPairwiseKeyStatus,
+            Wpa2RuntimeState::AwaitingGroupKeyStatus,
+            Wpa2RuntimeState::AwaitingGroupRekeyStatus,
+        ] {
+            assert_eq!(
+                expected_security_command(state),
+                Some(UmacCommand::NewKey as u32)
+            );
+        }
+        for state in [
+            Wpa2RuntimeState::AwaitingDefaultGroupKeyStatus,
+            Wpa2RuntimeState::AwaitingDefaultGroupRekeyStatus,
+        ] {
+            assert_eq!(
+                expected_security_command(state),
+                Some(UmacCommand::SetKey as u32)
+            );
+        }
+        assert_eq!(
+            expected_security_command(Wpa2RuntimeState::AwaitingAuthorizationStatus),
+            Some(UmacCommand::SetStation as u32)
+        );
+        assert_eq!(
+            expected_security_command(Wpa2RuntimeState::AwaitingAuthenticator),
+            None
+        );
+
+        let status = ControlEvent::CommandStatus {
+            header: umac_header(),
+            command: UmacCommand::NewKey as u32,
+            status: 0,
+        };
+        assert!(control_event_is_expected(
+            Wpa2RuntimeState::AwaitingPairwiseKeyStatus,
+            status
+        ));
+        assert!(!control_event_is_expected(
+            Wpa2RuntimeState::AwaitingAuthorizationStatus,
+            status
+        ));
+        assert!(!control_event_is_expected(
+            Wpa2RuntimeState::AwaitingPairwiseKeyStatus,
+            ControlEvent::InterfaceState {
+                header: umac_header(),
+                status: 0,
+            }
+        ));
+
+        let done = TxDoneEventRef {
+            token: 7,
+            statuses: &[0],
+        };
+        assert!(transmit_done_is_expected(
+            Wpa2RuntimeState::AwaitingEapolTransmit {
+                token: 7,
+                purpose: EapolTransmitPurpose::Message2,
+            },
+            done
+        ));
+        assert!(!transmit_done_is_expected(
+            Wpa2RuntimeState::AwaitingEapolTransmit {
+                token: 8,
+                purpose: EapolTransmitPurpose::Message2,
+            },
+            done
+        ));
+    }
+
+    #[cfg(feature = "wpa2")]
+    #[test]
+    fn secure_event_routing_ignores_unexpected_events_fail_closed() {
+        let mut secure = secure_driver();
+        let mut delay = NoDelay;
+        assert_eq!(
+            block_on(
+                secure
+                    .apply_security_event(&mut delay, DriverEvent::System(SystemEvent::InitDone),)
+            )
+            .unwrap(),
+            Wpa2Progress::NoChange
+        );
+        assert_eq!(
+            block_on(secure.apply_security_event(
+                &mut delay,
+                DriverEvent::Control(ControlEvent::InterfaceState {
+                    header: umac_header(),
+                    status: 0,
+                }),
+            ))
+            .unwrap(),
+            Wpa2Progress::NoChange
+        );
+        assert_eq!(
+            block_on(secure.apply_security_event(
+                &mut delay,
+                DriverEvent::TransmitDone(TxDoneEventRef {
+                    token: 7,
+                    statuses: &[0],
+                }),
+            ))
+            .unwrap(),
+            Wpa2Progress::NoChange
+        );
+        assert_eq!(
+            block_on(secure.apply_security_event(
+                &mut delay,
+                DriverEvent::Data(DataEvent::CarrierOn { wdev_id: 0 }),
+            ))
+            .unwrap(),
+            Wpa2Progress::NoChange
+        );
+
+        assert!(matches!(
+            block_on(secure.poll_event(&mut delay, &mut [0; 64])),
+            Err(SecureProductionError::Production(ProductionError::Driver(
+                DriverError::Device(DeviceError::NotInitialized)
+            )))
+        ));
+    }
+
+    #[cfg(feature = "wpa2")]
+    #[test]
+    fn secure_receive_classifies_data_and_wipes_rejected_eapol() {
+        let mut secure = secure_driver();
+        let mut delay = NoDelay;
+        let mut output = [9u8; 32];
+
+        assert_eq!(
+            block_on(secure.finish_received_packet(&mut delay, received(0x0800), &mut output,))
+                .unwrap(),
+            SecureReceive::Data(received(0x0800))
+        );
+        assert_eq!(output, [9; 32]);
+
+        assert!(matches!(
+            block_on(secure.finish_received_packet(
+                &mut delay,
+                received(EAPOL_ETHERTYPE),
+                &mut output,
+            )),
+            Err(SecureProductionError::Wpa2(_))
+        ));
+        assert_eq!(&output[..14], &[0; 14]);
+        assert_eq!(secure.state(), DriverState::Recovering);
+    }
+
+    #[cfg(feature = "wpa2")]
+    #[test]
+    fn secure_deadlines_advance_and_expire_fail_closed() {
+        let mut secure = secure_driver();
+        assert!(secure.advance_time(1).is_ok());
+        assert_eq!(secure.security.remaining_time_ms(), Some(4_999));
+
+        assert!(matches!(
+            secure.advance_time(4_999),
+            Err(SecureProductionError::Wpa2(Wpa2RuntimeError::Timeout(
+                Wpa2RuntimeState::AwaitingAuthenticator
+            )))
+        ));
+        assert_eq!(secure.state(), DriverState::Recovering);
+        assert_eq!(secure.security_state(), Wpa2RuntimeState::Failed);
+    }
 
     #[test]
     fn short_ethernet_frame_is_rejected() {

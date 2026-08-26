@@ -151,6 +151,10 @@ impl<const FRAME_SIZE: usize> NetworkState<FRAME_SIZE> {
             return false;
         }
         self.tx_epoch.store(epoch, Ordering::Release);
+        self.confirm_reserved_tx(epoch)
+    }
+
+    fn confirm_reserved_tx(&self, epoch: usize) -> bool {
         if self.epoch_is_active(epoch) {
             true
         } else {
@@ -160,6 +164,33 @@ impl<const FRAME_SIZE: usize> NetworkState<FRAME_SIZE> {
     }
 
     fn reserve_receive(&self, epoch: usize) -> bool {
+        if !self.claim_ready_rx(epoch) {
+            return false;
+        }
+        self.reserve_claimed_receive(epoch)
+    }
+
+    fn reserve_claimed_receive(&self, epoch: usize) -> bool {
+        if !self.confirm_claimed_rx(epoch) {
+            return false;
+        }
+        if self.reserve_tx(epoch) {
+            return true;
+        }
+        self.restore_rx_after_tx_contention(epoch);
+        false
+    }
+
+    fn confirm_claimed_rx(&self, epoch: usize) -> bool {
+        if self.claimed_rx_is_current(epoch) {
+            true
+        } else {
+            self.release_rx();
+            false
+        }
+    }
+
+    fn claim_ready_rx(&self, epoch: usize) -> bool {
         if !self.epoch_is_active(epoch) {
             return false;
         }
@@ -169,27 +200,22 @@ impl<const FRAME_SIZE: usize> NetworkState<FRAME_SIZE> {
             self.discard_ready_rx();
             return false;
         }
-        if self
-            .rx_state
+        self.rx_state
             .compare_exchange(READY, CLIENT, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return false;
-        }
-        if self.rx_epoch.load(Ordering::Acquire) != epoch || !self.epoch_is_active(epoch) {
-            self.release_rx();
-            return false;
-        }
-        if self.reserve_tx(epoch) {
-            return true;
-        }
-        if self.rx_epoch.load(Ordering::Acquire) == epoch && self.epoch_is_active(epoch) {
+            .is_ok()
+    }
+
+    fn claimed_rx_is_current(&self, epoch: usize) -> bool {
+        self.rx_epoch.load(Ordering::Acquire) == epoch && self.epoch_is_active(epoch)
+    }
+
+    fn restore_rx_after_tx_contention(&self, epoch: usize) {
+        if self.claimed_rx_is_current(epoch) {
             self.rx_state.store(READY, Ordering::Release);
             self.rx_waker.wake();
         } else {
             self.release_rx();
         }
-        false
     }
 
     fn release_rx(&self) {
@@ -253,75 +279,33 @@ impl<const FRAME_SIZE: usize> EmbassyDriver for NetworkDriver<'_, FRAME_SIZE> {
         Self: 'a;
 
     fn receive(&mut self, cx: &mut Context<'_>) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let Some(epoch) = self.state.active_epoch() {
-            if self.state.reserve_receive(epoch) {
-                return Some((
-                    RxToken {
-                        state: self.state,
-                        epoch,
-                        consumed: false,
-                    },
-                    TxToken {
-                        state: self.state,
-                        epoch,
-                        consumed: false,
-                    },
-                ));
-            }
+        if let Some(tokens) = self.try_receive() {
+            return Some(tokens);
         }
 
         self.state.link_waker.register(cx.waker());
         self.state.rx_waker.register(cx.waker());
         self.state.tx_space_waker.register(cx.waker());
 
-        let epoch = self.state.active_epoch()?;
-        if !self.state.reserve_receive(epoch) {
-            return None;
-        }
-        Some((
-            RxToken {
-                state: self.state,
-                epoch,
-                consumed: false,
-            },
-            TxToken {
-                state: self.state,
-                epoch,
-                consumed: false,
-            },
-        ))
+        self.try_receive()
     }
 
     fn transmit(&mut self, cx: &mut Context<'_>) -> Option<Self::TxToken<'_>> {
-        if let Some(epoch) = self.state.active_epoch() {
-            if self.state.reserve_tx(epoch) {
-                return Some(TxToken {
-                    state: self.state,
-                    epoch,
-                    consumed: false,
-                });
-            }
+        if let Some(token) = self.try_transmit() {
+            return Some(token);
         }
 
         self.state.link_waker.register(cx.waker());
         self.state.tx_space_waker.register(cx.waker());
 
-        let epoch = self.state.active_epoch()?;
-        if !self.state.reserve_tx(epoch) {
-            return None;
-        }
-        Some(TxToken {
-            state: self.state,
-            epoch,
-            consumed: false,
-        })
+        self.try_transmit()
     }
 
     fn link_state(&mut self, cx: &mut Context<'_>) -> LinkState {
         let first = self.state.link_state();
         self.state.link_waker.register(cx.waker());
         let second = self.state.link_state();
-        if first != second {
+        if link_state_changed(first, second) {
             cx.waker().wake_by_ref();
         }
         second
@@ -339,15 +323,48 @@ impl<const FRAME_SIZE: usize> EmbassyDriver for NetworkDriver<'_, FRAME_SIZE> {
     }
 }
 
+fn link_state_changed(first: LinkState, second: LinkState) -> bool {
+    first != second
+}
+
+impl<'a, const FRAME_SIZE: usize> NetworkDriver<'a, FRAME_SIZE> {
+    fn try_receive(&self) -> Option<(RxToken<'a, FRAME_SIZE>, TxToken<'a, FRAME_SIZE>)> {
+        let epoch = self.state.active_epoch()?;
+        if !self.state.reserve_receive(epoch) {
+            return None;
+        }
+        Some((
+            RxToken {
+                state: self.state,
+                epoch,
+            },
+            TxToken {
+                state: self.state,
+                epoch,
+            },
+        ))
+    }
+
+    fn try_transmit(&self) -> Option<TxToken<'a, FRAME_SIZE>> {
+        let epoch = self.state.active_epoch()?;
+        if !self.state.reserve_tx(epoch) {
+            return None;
+        }
+        Some(TxToken {
+            state: self.state,
+            epoch,
+        })
+    }
+}
+
 /// RX token owned by `embassy-net`.
 pub struct RxToken<'a, const FRAME_SIZE: usize> {
     state: &'a NetworkState<FRAME_SIZE>,
     epoch: usize,
-    consumed: bool,
 }
 
 impl<const FRAME_SIZE: usize> EmbassyRxToken for RxToken<'_, FRAME_SIZE> {
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
@@ -361,17 +378,14 @@ impl<const FRAME_SIZE: usize> EmbassyRxToken for RxToken<'_, FRAME_SIZE> {
         // The CLIENT state gives this token exclusive mutable access.
         let result = unsafe { f(&mut (&mut *self.state.rx.get())[..len]) };
         self.state.release_rx();
-        self.consumed = true;
+        core::mem::forget(self);
         result
     }
 }
 
 impl<const FRAME_SIZE: usize> Drop for RxToken<'_, FRAME_SIZE> {
     fn drop(&mut self) {
-        if !self.consumed {
-            self.state.release_rx();
-            self.consumed = true;
-        }
+        self.state.release_rx();
     }
 }
 
@@ -379,11 +393,10 @@ impl<const FRAME_SIZE: usize> Drop for RxToken<'_, FRAME_SIZE> {
 pub struct TxToken<'a, const FRAME_SIZE: usize> {
     state: &'a NetworkState<FRAME_SIZE>,
     epoch: usize,
-    consumed: bool,
 }
 
 impl<const FRAME_SIZE: usize> EmbassyTxToken for TxToken<'_, FRAME_SIZE> {
-    fn consume<R, F>(mut self, len: usize, f: F) -> R
+    fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
@@ -402,17 +415,14 @@ impl<const FRAME_SIZE: usize> EmbassyTxToken for TxToken<'_, FRAME_SIZE> {
         } else {
             self.state.release_tx();
         }
-        self.consumed = true;
+        core::mem::forget(self);
         result
     }
 }
 
 impl<const FRAME_SIZE: usize> Drop for TxToken<'_, FRAME_SIZE> {
     fn drop(&mut self) {
-        if !self.consumed {
-            self.state.release_tx();
-            self.consumed = true;
-        }
+        self.state.release_tx();
     }
 }
 
@@ -442,10 +452,19 @@ impl<const FRAME_SIZE: usize> NetworkRunner<'_, FRAME_SIZE> {
             return Err(QueueError::FrameTooLarge);
         }
         let epoch = self.state.active_epoch().ok_or(QueueError::LinkDown)?;
+        self.claim_rx_producer()?;
+        self.copy_and_publish_rx(epoch, frame)
+    }
+
+    fn claim_rx_producer(&self) -> Result<(), QueueError> {
         self.state
             .rx_state
             .compare_exchange(FREE, PRODUCER, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| QueueError::RxBusy)?;
+            .map(|_| ())
+            .map_err(|_| QueueError::RxBusy)
+    }
+
+    fn copy_and_publish_rx(&self, epoch: usize, frame: &[u8]) -> Result<(), QueueError> {
         if !self.state.epoch_is_active(epoch) {
             self.state.release_rx();
             return Err(QueueError::LinkDown);
@@ -468,31 +487,41 @@ impl<const FRAME_SIZE: usize> NetworkRunner<'_, FRAME_SIZE> {
     /// Takes one frame prepared by `embassy-net`.
     pub fn take_tx(&self) -> Option<TxLease<'_, FRAME_SIZE>> {
         let epoch = self.state.active_epoch()?;
-        if self.state.tx_state.load(Ordering::Acquire) == READY
-            && self.state.tx_epoch.load(Ordering::Acquire) != epoch
-        {
-            self.state.discard_ready_tx();
+        if self.discard_stale_tx(epoch) {
             return None;
         }
-        if self
-            .state
-            .tx_state
-            .compare_exchange(READY, PRODUCER, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        if !self.claim_ready_tx() {
             return None;
         }
-        if self.state.tx_epoch.load(Ordering::Acquire) != epoch
-            || !self.state.epoch_is_active(epoch)
-        {
+        if !self.claimed_tx_is_current(epoch) {
             self.state.release_tx();
             return None;
         }
         Some(TxLease {
             state: self.state,
             epoch,
-            released: false,
         })
+    }
+
+    fn discard_stale_tx(&self, epoch: usize) -> bool {
+        if self.state.tx_state.load(Ordering::Acquire) != READY
+            || self.state.tx_epoch.load(Ordering::Acquire) == epoch
+        {
+            return false;
+        }
+        self.state.discard_ready_tx();
+        true
+    }
+
+    fn claim_ready_tx(&self) -> bool {
+        self.state
+            .tx_state
+            .compare_exchange(READY, PRODUCER, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn claimed_tx_is_current(&self, epoch: usize) -> bool {
+        self.state.tx_epoch.load(Ordering::Acquire) == epoch && self.state.epoch_is_active(epoch)
     }
 
     /// Polls for a queued TX frame without taking ownership of it.
@@ -525,12 +554,8 @@ impl<const FRAME_SIZE: usize> NetworkRunner<'_, FRAME_SIZE> {
     /// Registers a waker for new TX frames.
     pub fn register_tx_waker(&self, cx: &mut Context<'_>) {
         self.state.tx_ready_waker.register(cx.waker());
-        if let Some(epoch) = self.state.active_epoch() {
-            if self.state.tx_state.load(Ordering::Acquire) == READY
-                && self.state.tx_epoch.load(Ordering::Acquire) == epoch
-            {
-                cx.waker().wake_by_ref();
-            }
+        if self.tx_is_ready() {
+            cx.waker().wake_by_ref();
         }
     }
 }
@@ -539,7 +564,6 @@ impl<const FRAME_SIZE: usize> NetworkRunner<'_, FRAME_SIZE> {
 pub struct TxLease<'a, const FRAME_SIZE: usize> {
     state: &'a NetworkState<FRAME_SIZE>,
     epoch: usize,
-    released: bool,
 }
 
 impl<const FRAME_SIZE: usize> TxLease<'_, FRAME_SIZE> {
@@ -564,27 +588,24 @@ impl<const FRAME_SIZE: usize> TxLease<'_, FRAME_SIZE> {
     ///
     /// A stale lease is always released. It cannot return an old frame to the
     /// queue after a disconnect and reconnect.
-    pub fn report(mut self, outcome: TxOutcome) {
+    pub fn report(self, outcome: TxOutcome) {
         if outcome == TxOutcome::WouldBlock && self.is_current() {
             self.state.tx_state.store(READY, Ordering::Release);
             self.state.tx_ready_waker.wake();
         } else {
             self.state.release_tx();
         }
-        self.released = true;
+        core::mem::forget(self);
     }
 }
 
 impl<const FRAME_SIZE: usize> Drop for TxLease<'_, FRAME_SIZE> {
     fn drop(&mut self) {
-        if !self.released {
-            if self.is_current() {
-                self.state.tx_state.store(READY, Ordering::Release);
-                self.state.tx_ready_waker.wake();
-            } else {
-                self.state.release_tx();
-            }
-            self.released = true;
+        if self.is_current() {
+            self.state.tx_state.store(READY, Ordering::Release);
+            self.state.tx_ready_waker.wake();
+        } else {
+            self.state.release_tx();
         }
     }
 }
@@ -597,6 +618,221 @@ mod tests {
     fn open_link<const FRAME_SIZE: usize>(state: &NetworkState<FRAME_SIZE>) -> usize {
         state.set_authorized_link(true);
         state.active_epoch().unwrap()
+    }
+
+    fn context() -> Context<'static> {
+        Context::from_waker(Waker::noop())
+    }
+
+    #[test]
+    fn embassy_driver_exposes_metadata_and_moves_rx_and_tx_tokens() {
+        let mac = [2, 0, 0, 0, 0, 1];
+        let state = NetworkState::<64>::new(mac);
+        assert_eq!(state.mac_address(), mac);
+        let mut driver = state.driver();
+        let mut cx = context();
+        assert!(EmbassyDriver::link_state(&mut driver, &mut cx) == LinkState::Down);
+        assert_eq!(driver.hardware_address(), HardwareAddress::Ethernet(mac));
+        assert_eq!(driver.capabilities().max_transmission_unit, 64);
+        assert_eq!(driver.capabilities().max_burst_size, Some(1));
+        assert!(driver.receive(&mut cx).is_none());
+        assert!(driver.transmit(&mut cx).is_none());
+
+        open_link(&state);
+        state.runner().push_rx(&[1, 2, 3]).unwrap();
+        let (rx, tx) = driver.receive(&mut cx).unwrap();
+        assert_eq!(rx.consume(|frame| frame.to_vec()), [1, 2, 3]);
+        tx.consume(4, |frame| frame.copy_from_slice(&[4, 5, 6, 7]));
+        let runner = state.runner();
+        let lease = runner.take_tx().unwrap();
+        assert_eq!(lease.as_slice(), &[4, 5, 6, 7]);
+        lease.report(TxOutcome::Submitted);
+        assert_eq!(state.rx_state.load(Ordering::Acquire), FREE);
+        assert_eq!(state.tx_state.load(Ordering::Acquire), FREE);
+    }
+
+    #[test]
+    fn receive_restores_rx_when_the_companion_tx_slot_is_busy() {
+        let state = NetworkState::<16>::new([2, 0, 0, 0, 0, 1]);
+        let epoch = open_link(&state);
+        state.runner().push_rx(&[1]).unwrap();
+        assert!(state.reserve_tx(epoch));
+        let mut driver = state.driver();
+        assert!(driver.receive(&mut context()).is_none());
+        assert_eq!(state.rx_state.load(Ordering::Acquire), READY);
+        state.release_tx();
+        let (rx, tx) = driver.receive(&mut context()).unwrap();
+        assert_eq!(rx.consume(|frame| frame[0]), 1);
+        drop(tx);
+    }
+
+    #[test]
+    fn stale_rx_state_and_tokens_are_fail_closed() {
+        let state = NetworkState::<16>::new([2, 0, 0, 0, 0, 1]);
+        let epoch = open_link(&state);
+        state
+            .rx_epoch
+            .store(epoch.wrapping_sub(1), Ordering::Relaxed);
+        state.rx_len.store(1, Ordering::Relaxed);
+        state.rx_state.store(READY, Ordering::Release);
+        assert!(!state.reserve_receive(epoch));
+        assert_eq!(state.rx_state.load(Ordering::Acquire), FREE);
+        assert!(!state.reserve_receive(epoch.wrapping_add(1)));
+
+        state.runner().push_rx(&[9]).unwrap();
+        assert!(state.reserve_receive(epoch));
+        let token = RxToken {
+            state: &state,
+            epoch,
+        };
+        state.set_authorized_link(false);
+        assert!(token.consume(|frame| frame.is_empty()));
+        assert_eq!(state.rx_state.load(Ordering::Acquire), FREE);
+    }
+
+    #[test]
+    fn rx_epoch_discard_only_releases_the_matching_ready_slot() {
+        let state = NetworkState::<8>::new([2, 0, 0, 0, 0, 1]);
+        let epoch = open_link(&state);
+        state.rx_epoch.store(epoch, Ordering::Relaxed);
+        state.rx_len.store(3, Ordering::Relaxed);
+        state.rx_state.store(READY, Ordering::Release);
+        state.discard_ready_rx_epoch(epoch.wrapping_add(1));
+        assert_eq!(state.rx_state.load(Ordering::Acquire), READY);
+        state.discard_ready_rx_epoch(epoch);
+        assert_eq!(state.rx_state.load(Ordering::Acquire), FREE);
+        assert_eq!(state.rx_len.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn direct_tx_token_and_runner_cover_ready_would_block_and_stale_states() {
+        let state = NetworkState::<16>::new([2, 0, 0, 0, 0, 1]);
+        let epoch = open_link(&state);
+        let mut driver = state.driver();
+        let token = driver.transmit(&mut context()).unwrap();
+        token.consume(3, |frame| frame.copy_from_slice(&[7, 8, 9]));
+        let runner = state.runner();
+        let lease = runner.take_tx().unwrap();
+        lease.report(TxOutcome::WouldBlock);
+        let lease = runner.take_tx().unwrap();
+        assert_eq!(lease.as_slice(), &[7, 8, 9]);
+        drop(lease);
+        assert!(runner.take_tx().is_some());
+        runner.take_tx().unwrap().report(TxOutcome::Submitted);
+
+        state
+            .tx_epoch
+            .store(epoch.wrapping_sub(1), Ordering::Relaxed);
+        state.tx_state.store(READY, Ordering::Release);
+        assert!(runner.take_tx().is_none());
+        assert_eq!(state.tx_state.load(Ordering::Acquire), FREE);
+        assert!(runner.take_tx().is_none());
+    }
+
+    #[test]
+    fn link_epoch_changes_only_on_real_transitions_and_purges_ready_rx() {
+        let state = NetworkState::<8>::new([2, 0, 0, 0, 0, 1]);
+        let epoch = open_link(&state);
+        state.set_authorized_link(true);
+        assert_eq!(state.active_epoch(), Some(epoch));
+        state.runner().push_rx(&[1]).unwrap();
+        state.set_authorized_link(false);
+        assert!(state.link_state() == LinkState::Down);
+        assert_eq!(state.rx_state.load(Ordering::Acquire), FREE);
+        assert_eq!(state.active_epoch(), None);
+    }
+
+    #[test]
+    fn reservation_race_checks_release_stale_atomic_ownership() {
+        let state = NetworkState::<8>::new([2, 0, 0, 0, 0, 1]);
+        let epoch = open_link(&state);
+        let stale = epoch.wrapping_add(1);
+        assert!(!state.reserve_tx(stale));
+
+        state.tx_state.store(CLIENT, Ordering::Release);
+        state.tx_len.store(4, Ordering::Relaxed);
+        assert!(!state.confirm_reserved_tx(stale));
+        assert_eq!(state.tx_state.load(Ordering::Acquire), FREE);
+        assert_eq!(state.tx_len.load(Ordering::Acquire), 0);
+
+        assert!(!state.claim_ready_rx(stale));
+        state.rx_state.store(READY, Ordering::Release);
+        state.rx_epoch.store(stale, Ordering::Relaxed);
+        assert!(!state.claim_ready_rx(epoch));
+        assert_eq!(state.rx_state.load(Ordering::Acquire), FREE);
+
+        state.rx_state.store(CLIENT, Ordering::Release);
+        state.rx_epoch.store(epoch, Ordering::Relaxed);
+        assert!(state.claimed_rx_is_current(epoch));
+        assert!(!state.claimed_rx_is_current(stale));
+        assert!(!state.confirm_claimed_rx(stale));
+        assert_eq!(state.rx_state.load(Ordering::Acquire), FREE);
+
+        state.rx_state.store(CLIENT, Ordering::Release);
+        state.rx_epoch.store(stale, Ordering::Relaxed);
+        assert!(!state.claimed_rx_is_current(stale));
+        assert!(!state.reserve_claimed_receive(stale));
+        assert_eq!(state.rx_state.load(Ordering::Acquire), FREE);
+
+        assert!(!link_state_changed(LinkState::Up, LinkState::Up));
+        assert!(link_state_changed(LinkState::Up, LinkState::Down));
+    }
+
+    #[test]
+    fn dropping_unconsumed_embassy_tokens_releases_each_slot() {
+        let state = NetworkState::<8>::new([2, 0, 0, 0, 0, 1]);
+        open_link(&state);
+        state.runner().push_rx(&[1]).unwrap();
+        let mut driver = state.driver();
+        let (rx, tx) = driver.receive(&mut context()).unwrap();
+        drop(rx);
+        assert_eq!(state.rx_state.load(Ordering::Acquire), FREE);
+        assert_eq!(state.tx_state.load(Ordering::Acquire), CLIENT);
+        drop(tx);
+        assert_eq!(state.tx_state.load(Ordering::Acquire), FREE);
+
+        let tx = driver.transmit(&mut context()).unwrap();
+        assert_eq!(state.tx_state.load(Ordering::Acquire), CLIENT);
+        drop(tx);
+        assert_eq!(state.tx_state.load(Ordering::Acquire), FREE);
+    }
+
+    #[test]
+    fn runner_stale_and_ready_helpers_require_both_epoch_conditions() {
+        let state = NetworkState::<8>::new([2, 0, 0, 0, 0, 1]);
+        let epoch = open_link(&state);
+        let stale = epoch.wrapping_add(1);
+        let runner = state.runner();
+        assert!(!runner.discard_stale_tx(epoch));
+
+        state.tx_state.store(READY, Ordering::Release);
+        state.tx_epoch.store(epoch, Ordering::Relaxed);
+        assert!(!runner.discard_stale_tx(epoch));
+        assert!(runner.tx_is_ready());
+        assert!(runner.claimed_tx_is_current(epoch));
+        assert!(!runner.claimed_tx_is_current(stale));
+
+        state.tx_epoch.store(stale, Ordering::Relaxed);
+        assert!(!runner.tx_is_ready());
+        assert!(runner.discard_stale_tx(epoch));
+        assert_eq!(state.tx_state.load(Ordering::Acquire), FREE);
+
+        state.set_authorized_link(false);
+        assert!(!runner.tx_is_ready());
+        state.tx_state.store(PRODUCER, Ordering::Release);
+        state.tx_epoch.store(epoch, Ordering::Relaxed);
+        assert!(!runner.claimed_tx_is_current(epoch));
+    }
+
+    #[test]
+    fn pending_poll_and_registered_waker_do_not_claim_tx() {
+        let state = NetworkState::<8>::new([2, 0, 0, 0, 0, 1]);
+        open_link(&state);
+        let runner = state.runner();
+        let mut cx = context();
+        assert_eq!(runner.poll_tx_ready(&mut cx), Poll::Pending);
+        runner.register_tx_waker(&mut cx);
+        assert_eq!(state.tx_state.load(Ordering::Acquire), FREE);
     }
 
     #[test]
@@ -643,7 +879,6 @@ mod tests {
         let token = TxToken {
             state: &state,
             epoch,
-            consumed: false,
         };
         state.set_authorized_link(false);
         token.consume(1, |buffer| buffer[0] = 7);

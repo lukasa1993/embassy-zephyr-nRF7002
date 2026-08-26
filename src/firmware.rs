@@ -205,42 +205,11 @@ impl<'a> FirmwareBundle<'a> {
         if bytes.len() < PATCH_HEADER_LEN {
             return Err(FirmwareError::TruncatedHeader);
         }
-        let signature = word(bytes, 0);
-        if signature != PATCH_SIGNATURE {
-            return Err(FirmwareError::BadSignature(signature));
-        }
-        let image_count = word(bytes, 4);
-        if image_count != PATCH_IMAGE_COUNT {
-            return Err(FirmwareError::BadImageCount(image_count));
-        }
-        let version = word(bytes, 8);
-        if version != PINNED_PATCH_VERSION {
-            return Err(FirmwareError::IncompatibleVersion(version));
-        }
-        let feature_flags = word(bytes, 12);
-        if feature_flags != FEATURE_SYSTEM_MODE {
-            return Err(FirmwareError::IncompatibleFeatures(feature_flags));
-        }
-        let payload_len = word(bytes, 16);
-        let payload_end = PATCH_HEADER_LEN
-            .checked_add(payload_len as usize)
-            .ok_or(FirmwareError::TruncatedPayload)?;
-        if payload_end > bytes.len() {
-            return Err(FirmwareError::TruncatedPayload);
-        }
-        if payload_end != bytes.len() {
-            return Err(FirmwareError::LengthMismatch);
-        }
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&bytes[20..PATCH_HEADER_LEN]);
+        let header = parse_compatible_header(bytes)?;
+        let payload_end = exact_payload_end(bytes, header.payload_len)?;
         let bundle = Self {
             bytes,
-            header: FirmwareHeader {
-                version,
-                feature_flags,
-                payload_len,
-                hash,
-            },
+            header,
             payload_end,
         };
         bundle.validate_images()?;
@@ -279,15 +248,7 @@ impl<'a> FirmwareBundle<'a> {
     pub fn image(&self, wanted: ImageKind) -> Result<FirmwareImage<'a>, FirmwareError> {
         let mut offset = PATCH_HEADER_LEN;
         for _ in 0..PATCH_IMAGE_COUNT {
-            let kind = ImageKind::from_u32(word(self.bytes, offset))?;
-            let len = word(self.bytes, offset + 4) as usize;
-            let start = offset + IMAGE_HEADER_LEN;
-            let end = start
-                .checked_add(len)
-                .ok_or(FirmwareError::TruncatedImage)?;
-            if end > self.payload_end {
-                return Err(FirmwareError::TruncatedImage);
-            }
+            let (kind, start, end) = self.image_extent(offset)?;
             if kind == wanted {
                 return Ok(FirmwareImage {
                     kind,
@@ -299,33 +260,82 @@ impl<'a> FirmwareBundle<'a> {
         Err(FirmwareError::InvalidImageType(wanted as u32))
     }
 
+    fn image_extent(&self, offset: usize) -> Result<(ImageKind, usize, usize), FirmwareError> {
+        let header_end = offset
+            .checked_add(IMAGE_HEADER_LEN)
+            .ok_or(FirmwareError::TruncatedImage)?;
+        if header_end > self.payload_end {
+            return Err(FirmwareError::TruncatedImage);
+        }
+        let kind = ImageKind::from_u32(word(self.bytes, offset))?;
+        let len = word(self.bytes, offset + 4) as usize;
+        let end = header_end
+            .checked_add(len)
+            .ok_or(FirmwareError::TruncatedImage)?;
+        if end > self.payload_end {
+            return Err(FirmwareError::TruncatedImage);
+        }
+        Ok((kind, header_end, end))
+    }
+
     fn validate_images(&self) -> Result<(), FirmwareError> {
         let mut offset = PATCH_HEADER_LEN;
         let mut seen = 0u8;
         for _ in 0..PATCH_IMAGE_COUNT {
-            if offset + IMAGE_HEADER_LEN > self.payload_end {
-                return Err(FirmwareError::TruncatedImage);
-            }
-            let kind = ImageKind::from_u32(word(self.bytes, offset))?;
+            let (kind, _, end) = self.image_extent(offset)?;
             let mask = 1u8 << kind as u8;
             if seen & mask != 0 {
                 return Err(FirmwareError::InvalidImageType(kind as u32));
             }
             seen |= mask;
-            let len = word(self.bytes, offset + 4) as usize;
-            offset = offset
-                .checked_add(IMAGE_HEADER_LEN)
-                .and_then(|value| value.checked_add(len))
-                .ok_or(FirmwareError::TruncatedImage)?;
-            if offset > self.payload_end {
-                return Err(FirmwareError::TruncatedImage);
-            }
+            offset = end;
         }
         if seen != 0b1111 || offset != self.payload_end {
             return Err(FirmwareError::LengthMismatch);
         }
         Ok(())
     }
+}
+
+fn parse_compatible_header(bytes: &[u8]) -> Result<FirmwareHeader, FirmwareError> {
+    let signature = word(bytes, 0);
+    if signature != PATCH_SIGNATURE {
+        return Err(FirmwareError::BadSignature(signature));
+    }
+    let image_count = word(bytes, 4);
+    if image_count != PATCH_IMAGE_COUNT {
+        return Err(FirmwareError::BadImageCount(image_count));
+    }
+    let version = word(bytes, 8);
+    if version != PINNED_PATCH_VERSION {
+        return Err(FirmwareError::IncompatibleVersion(version));
+    }
+    let feature_flags = word(bytes, 12);
+    if feature_flags != FEATURE_SYSTEM_MODE {
+        return Err(FirmwareError::IncompatibleFeatures(feature_flags));
+    }
+    let payload_len = word(bytes, 16);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&bytes[20..PATCH_HEADER_LEN]);
+    Ok(FirmwareHeader {
+        version,
+        feature_flags,
+        payload_len,
+        hash,
+    })
+}
+
+fn exact_payload_end(bytes: &[u8], payload_len: u32) -> Result<usize, FirmwareError> {
+    let payload_end = PATCH_HEADER_LEN
+        .checked_add(payload_len as usize)
+        .ok_or(FirmwareError::TruncatedPayload)?;
+    if payload_end > bytes.len() {
+        return Err(FirmwareError::TruncatedPayload);
+    }
+    if payload_end != bytes.len() {
+        return Err(FirmwareError::LengthMismatch);
+    }
+    Ok(payload_end)
 }
 
 /// Successful firmware start report.
@@ -352,19 +362,58 @@ where
 {
     trust.verify(bundle)?;
     bundle.verify_hash()?;
-    rpu.reset_processor(Processor::Lmac, delay)
-        .await
-        .map_err(|error| LoadError::Rpu {
-            stage: LoadStage::Reset(Processor::Lmac),
-            error,
-        })?;
-    rpu.reset_processor(Processor::Umac, delay)
-        .await
-        .map_err(|error| LoadError::Rpu {
-            stage: LoadStage::Reset(Processor::Umac),
-            error,
-        })?;
+    run_processor_operation(rpu, delay, ProcessorOperation::Reset).await?;
+    download_images(rpu, bundle).await?;
+    run_processor_operation(rpu, delay, ProcessorOperation::Boot).await?;
 
+    let header = bundle.header();
+    Ok(FirmwareReport {
+        version: header.version,
+        feature_flags: header.feature_flags,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ProcessorOperation {
+    Reset,
+    Boot,
+}
+
+impl ProcessorOperation {
+    fn stage(self, processor: Processor) -> LoadStage {
+        match self {
+            Self::Reset => LoadStage::Reset(processor),
+            Self::Boot => LoadStage::Boot(processor),
+        }
+    }
+}
+
+async fn run_processor_operation<B, D>(
+    rpu: &mut Rpu<B>,
+    delay: &mut D,
+    operation: ProcessorOperation,
+) -> Result<(), LoadError<B::Error>>
+where
+    B: Bus,
+    D: DelayNs,
+{
+    for processor in [Processor::Lmac, Processor::Umac] {
+        let result = match operation {
+            ProcessorOperation::Reset => rpu.reset_processor(processor, delay).await,
+            ProcessorOperation::Boot => boot_processor(rpu, delay, processor).await,
+        };
+        result.map_err(|error| LoadError::Rpu {
+            stage: operation.stage(processor),
+            error,
+        })?;
+    }
+    Ok(())
+}
+
+async fn download_images<B: Bus>(
+    rpu: &mut Rpu<B>,
+    bundle: &FirmwareBundle<'_>,
+) -> Result<(), LoadError<B::Error>> {
     // Nordic downloads UMAC first and LMAC second.
     for kind in [
         ImageKind::UmacPrimary,
@@ -384,25 +433,7 @@ where
         // path is not a reliable write verifier. Both processors must still
         // publish their boot signatures below, which fails a bad download.
     }
-
-    boot_processor(rpu, delay, Processor::Lmac)
-        .await
-        .map_err(|error| LoadError::Rpu {
-            stage: LoadStage::Boot(Processor::Lmac),
-            error,
-        })?;
-    boot_processor(rpu, delay, Processor::Umac)
-        .await
-        .map_err(|error| LoadError::Rpu {
-            stage: LoadStage::Boot(Processor::Umac),
-            error,
-        })?;
-
-    let header = bundle.header();
-    Ok(FirmwareReport {
-        version: header.version,
-        feature_flags: header.feature_flags,
-    })
+    Ok(())
 }
 
 async fn boot_processor<B, D>(
@@ -414,30 +445,65 @@ where
     B: Bus,
     D: DelayNs,
 {
-    let (signature_address, sleep_control, patch_offset, run_register, vectors) = match processor {
-        Processor::Lmac => (
-            RPU_MEM_LMAC_BOOT_SIG,
-            RPU_REG_UCC_SLEEP_CTRL_DATA_0,
-            RPU_MEM_LMAC_PATCH_BIMG - 0x8004_0000,
-            RPU_REG_MIPS_MCU_CONTROL,
-            LMAC_BOOT_VECTOR_REGISTERS,
-        ),
-        Processor::Umac => (
-            RPU_MEM_UMAC_BOOT_SIG,
-            RPU_REG_UCC_SLEEP_CTRL_DATA_1,
-            RPU_MEM_UMAC_PATCH_BIMG - 0x8008_0000,
-            RPU_REG_MIPS_MCU2_CONTROL,
-            UMAC_BOOT_VECTOR_REGISTERS,
-        ),
-    };
+    let config = boot_config(processor);
 
-    rpu.write_u32(processor, signature_address, 0).await?;
-    rpu.write_register(sleep_control, patch_offset).await?;
-    for (address, value) in vectors.into_iter().zip(BOOT_VECTOR_VALUES) {
+    program_boot(rpu, processor, config).await?;
+    wait_for_boot_signature(rpu, delay, processor, config.signature_address).await
+}
+
+#[derive(Clone, Copy)]
+struct BootConfig {
+    signature_address: u32,
+    sleep_control: u32,
+    patch_offset: u32,
+    run_register: u32,
+    vectors: [u32; 4],
+}
+
+const fn boot_config(processor: Processor) -> BootConfig {
+    match processor {
+        Processor::Lmac => BootConfig {
+            signature_address: RPU_MEM_LMAC_BOOT_SIG,
+            sleep_control: RPU_REG_UCC_SLEEP_CTRL_DATA_0,
+            patch_offset: RPU_MEM_LMAC_PATCH_BIMG - 0x8004_0000,
+            run_register: RPU_REG_MIPS_MCU_CONTROL,
+            vectors: LMAC_BOOT_VECTOR_REGISTERS,
+        },
+        Processor::Umac => BootConfig {
+            signature_address: RPU_MEM_UMAC_BOOT_SIG,
+            sleep_control: RPU_REG_UCC_SLEEP_CTRL_DATA_1,
+            patch_offset: RPU_MEM_UMAC_PATCH_BIMG - 0x8008_0000,
+            run_register: RPU_REG_MIPS_MCU2_CONTROL,
+            vectors: UMAC_BOOT_VECTOR_REGISTERS,
+        },
+    }
+}
+
+async fn program_boot<B: Bus>(
+    rpu: &mut Rpu<B>,
+    processor: Processor,
+    config: BootConfig,
+) -> Result<(), RpuError<B::Error>> {
+    rpu.write_u32(processor, config.signature_address, 0)
+        .await?;
+    rpu.write_register(config.sleep_control, config.patch_offset)
+        .await?;
+    for (address, value) in config.vectors.into_iter().zip(BOOT_VECTOR_VALUES) {
         rpu.write_register(address, value).await?;
     }
-    rpu.write_register(run_register, 1).await?;
+    rpu.write_register(config.run_register, 1).await
+}
 
+async fn wait_for_boot_signature<B, D>(
+    rpu: &mut Rpu<B>,
+    delay: &mut D,
+    processor: Processor,
+    signature_address: u32,
+) -> Result<(), RpuError<B::Error>>
+where
+    B: Bus,
+    D: DelayNs,
+{
     for _ in 0..100 {
         if rpu.read_u32(processor, signature_address).await? == BOOT_SIGNATURE {
             return Ok(());
@@ -458,7 +524,63 @@ fn word(bytes: &[u8], offset: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::vec::Vec;
+
+    use crate::memory::{RPU_REG_MIPS_MCU_WAIT_STATUS, RPU_REG_MIPS_MCU2_WAIT_STATUS, host_offset};
+    use crate::test_support::block_on;
+
     use super::*;
+
+    #[derive(Default)]
+    struct FirmwareBus {
+        writes: Vec<(u32, Vec<u8>)>,
+        boot_ready: bool,
+    }
+
+    impl Bus for FirmwareBus {
+        type Error = ();
+
+        async fn read_status(&mut self, _opcode: u8) -> Result<u8, Self::Error> {
+            Ok(0)
+        }
+
+        async fn write_status(&mut self, _opcode: u8, _value: u8) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn read(&mut self, address: u32, data: &mut [u8]) -> Result<(), Self::Error> {
+            data.fill(0);
+            let lmac_wait = host_offset(Processor::Lmac, RPU_REG_MIPS_MCU_WAIT_STATUS).unwrap();
+            let umac_wait = host_offset(Processor::Lmac, RPU_REG_MIPS_MCU2_WAIT_STATUS).unwrap();
+            let lmac_signature = host_offset(Processor::Lmac, RPU_MEM_LMAC_BOOT_SIG).unwrap();
+            let umac_signature = host_offset(Processor::Umac, RPU_MEM_UMAC_BOOT_SIG).unwrap();
+            let value = if address == lmac_wait || address == umac_wait {
+                1
+            } else if self.boot_ready && (address == lmac_signature || address == umac_signature) {
+                BOOT_SIGNATURE
+            } else {
+                0
+            };
+            data.copy_from_slice(&value.to_le_bytes()[..data.len()]);
+            Ok(())
+        }
+
+        async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
+            self.writes.push((address, data.to_vec()));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingDelay {
+        calls: usize,
+    }
+
+    impl DelayNs for CountingDelay {
+        async fn delay_ns(&mut self, _ns: u32) {
+            self.calls += 1;
+        }
+    }
 
     fn bundle_bytes() -> [u8; PATCH_HEADER_LEN + 4 * IMAGE_HEADER_LEN + 4] {
         let mut bytes = [0u8; PATCH_HEADER_LEN + 4 * IMAGE_HEADER_LEN + 4];
@@ -485,8 +607,96 @@ mod tests {
         let bytes = bundle_bytes();
         let bundle = FirmwareBundle::parse(&bytes).unwrap();
         bundle.verify_hash().unwrap();
-        assert_eq!(bundle.image(ImageKind::UmacPrimary).unwrap().data, &[0]);
-        assert_eq!(bundle.image(ImageKind::LmacSecondary).unwrap().data, &[3]);
+        assert_eq!(bundle.as_bytes(), bytes);
+        assert_eq!(bundle.header().version, PINNED_PATCH_VERSION);
+        for (kind, expected, destination) in [
+            (
+                ImageKind::UmacPrimary,
+                0,
+                (Processor::Umac, RPU_MEM_UMAC_PATCH_BIMG),
+            ),
+            (
+                ImageKind::UmacSecondary,
+                1,
+                (Processor::Umac, RPU_MEM_UMAC_PATCH_BIN),
+            ),
+            (
+                ImageKind::LmacPrimary,
+                2,
+                (Processor::Lmac, RPU_MEM_LMAC_PATCH_BIMG),
+            ),
+            (
+                ImageKind::LmacSecondary,
+                3,
+                (Processor::Lmac, RPU_MEM_LMAC_PATCH_BIN),
+            ),
+        ] {
+            assert_eq!(bundle.image(kind).unwrap().data, &[expected]);
+            assert_eq!(kind.destination(), destination);
+            assert_eq!(ImageKind::from_u32(kind as u32), Ok(kind));
+        }
+        assert_eq!(
+            ImageKind::from_u32(4),
+            Err(FirmwareError::InvalidImageType(4))
+        );
+    }
+
+    #[test]
+    fn rejects_every_fixed_header_mismatch() {
+        assert_eq!(
+            FirmwareBundle::parse(&bundle_bytes()[..PATCH_HEADER_LEN - 1]).err(),
+            Some(FirmwareError::TruncatedHeader)
+        );
+        for (offset, replacement, expected) in [
+            (0, 0u32, FirmwareError::BadSignature(0)),
+            (4, 3u32, FirmwareError::BadImageCount(3)),
+            (8, 0u32, FirmwareError::IncompatibleVersion(0)),
+            (
+                12,
+                FEATURE_SYSTEM_WITH_RAW,
+                FirmwareError::IncompatibleFeatures(FEATURE_SYSTEM_WITH_RAW),
+            ),
+        ] {
+            let mut bytes = bundle_bytes();
+            bytes[offset..offset + 4].copy_from_slice(&replacement.to_le_bytes());
+            assert_eq!(FirmwareBundle::parse(&bytes).err(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_repeated_and_trailing_images() {
+        let mut short_header = bundle_bytes().to_vec();
+        short_header.truncate(PATCH_HEADER_LEN + IMAGE_HEADER_LEN - 1);
+        let payload_len = (short_header.len() - PATCH_HEADER_LEN) as u32;
+        short_header[16..20].copy_from_slice(&payload_len.to_le_bytes());
+        assert_eq!(
+            FirmwareBundle::parse(&short_header).err(),
+            Some(FirmwareError::TruncatedImage)
+        );
+
+        let mut short_body = bundle_bytes();
+        short_body[PATCH_HEADER_LEN + 4..PATCH_HEADER_LEN + 8]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            FirmwareBundle::parse(&short_body).err(),
+            Some(FirmwareError::TruncatedImage)
+        );
+
+        let mut repeated = bundle_bytes();
+        repeated[PATCH_HEADER_LEN + 9..PATCH_HEADER_LEN + 13].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            FirmwareBundle::parse(&repeated).err(),
+            Some(FirmwareError::InvalidImageType(0))
+        );
+
+        let mut trailing = bundle_bytes().to_vec();
+        trailing.push(0xaa);
+        let payload_len = (trailing.len() - PATCH_HEADER_LEN) as u32;
+        trailing[16..20].copy_from_slice(&payload_len.to_le_bytes());
+        assert_eq!(
+            FirmwareBundle::parse(&trailing).err(),
+            Some(FirmwareError::LengthMismatch)
+        );
     }
 
     #[test]
@@ -539,5 +749,72 @@ mod tests {
             Err(FirmwareError::IncompatibleFeatures(FEATURE_SYSTEM_WITH_RAW))
         ));
         assert_eq!(policy.verify(&original_bundle), Ok(()));
+    }
+
+    #[test]
+    fn loads_images_and_programs_both_exact_boot_configs() {
+        assert_eq!(
+            ProcessorOperation::Reset.stage(Processor::Lmac),
+            LoadStage::Reset(Processor::Lmac)
+        );
+        assert_eq!(
+            ProcessorOperation::Boot.stage(Processor::Umac),
+            LoadStage::Boot(Processor::Umac)
+        );
+        let bytes = bundle_bytes();
+        let bundle = FirmwareBundle::parse(&bytes).unwrap();
+        let trust = PinnedFirmwareSha256::new(bundle.full_sha256());
+        assert_eq!(trust.expected(), bundle.full_sha256());
+        let mut rpu = Rpu::new(FirmwareBus {
+            boot_ready: true,
+            ..FirmwareBus::default()
+        });
+        let mut delay = CountingDelay::default();
+
+        let report = block_on(load(&mut rpu, &mut delay, &bundle, &trust)).unwrap();
+        assert_eq!(
+            report,
+            FirmwareReport {
+                version: PINNED_PATCH_VERSION,
+                feature_flags: FEATURE_SYSTEM_MODE,
+            }
+        );
+        assert_eq!(delay.calls, 0);
+
+        let bus = rpu.into_inner();
+        for (processor, address, expected) in [
+            (Processor::Umac, RPU_MEM_UMAC_PATCH_BIMG, 0),
+            (Processor::Umac, RPU_MEM_UMAC_PATCH_BIN, 1),
+            (Processor::Lmac, RPU_MEM_LMAC_PATCH_BIMG, 2),
+            (Processor::Lmac, RPU_MEM_LMAC_PATCH_BIN, 3),
+        ] {
+            let host = host_offset(processor, address).unwrap();
+            assert!(
+                bus.writes
+                    .iter()
+                    .any(|(written_address, data)| *written_address == host
+                        && data == &[expected, 0, 0, 0])
+            );
+        }
+        for (address, expected) in [
+            (RPU_REG_UCC_SLEEP_CTRL_DATA_0, 0x0000_bbc0u32),
+            (RPU_REG_UCC_SLEEP_CTRL_DATA_1, 0x0001_b800u32),
+        ] {
+            let host = host_offset(Processor::Lmac, address).unwrap();
+            assert!(bus.writes.iter().any(|(written_address, data)| {
+                *written_address == host && data == &expected.to_le_bytes()
+            }));
+        }
+    }
+
+    #[test]
+    fn boot_signature_wait_is_bounded() {
+        let mut rpu = Rpu::new(FirmwareBus::default());
+        let mut delay = CountingDelay::default();
+        assert!(matches!(
+            block_on(boot_processor(&mut rpu, &mut delay, Processor::Lmac)),
+            Err(RpuError::Timeout)
+        ));
+        assert_eq!(delay.calls, 100);
     }
 }

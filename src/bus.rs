@@ -118,21 +118,60 @@ impl SpiConfig {
         if !self.nordic_memory_map_latency {
             return self.slave_latency_words;
         }
-        match address & !self.address_mask {
-            0x000000..=0x008fff => 1,
-            0x009000..=0x03ffff => 2,
-            0x040000..=0x07ffff => 1,
-            0x080000..=0x092000 => 2,
-            0x0c0000..=0x0f0fff => 0,
-            0x100000..=0x134000
-            | 0x140000..=0x14c000
-            | 0x180000..=0x190000
-            | 0x200000..=0x261800
-            | 0x280000..=0x2a4000
-            | 0x300000..=0x338000 => 1,
-            _ => 0,
-        }
+        memory_map_latency_words(address & !self.address_mask)
     }
+}
+
+fn memory_map_latency_words(address: u32) -> u8 {
+    if address <= 0x0f0fff {
+        return low_memory_latency_words(address);
+    }
+    if is_high_one_word_region(address) {
+        return 1;
+    }
+    0
+}
+
+fn low_memory_latency_words(address: u32) -> u8 {
+    if address <= 0x07ffff {
+        return lowest_memory_latency_words(address);
+    }
+    upper_low_memory_latency_words(address)
+}
+
+fn lowest_memory_latency_words(address: u32) -> u8 {
+    match address {
+        0x000000..=0x008fff => 1,
+        0x009000..=0x03ffff => 2,
+        0x040000..=0x07ffff => 1,
+        _ => 0,
+    }
+}
+
+fn upper_low_memory_latency_words(address: u32) -> u8 {
+    match address {
+        0x080000..=0x092000 => 2,
+        0x0c0000..=0x0f0fff => 0,
+        _ => 0,
+    }
+}
+
+fn is_high_one_word_region(address: u32) -> bool {
+    is_first_high_one_word_region(address) || is_second_high_one_word_region(address)
+}
+
+fn is_first_high_one_word_region(address: u32) -> bool {
+    matches!(
+        address,
+        0x100000..=0x134000 | 0x140000..=0x14c000 | 0x180000..=0x190000
+    )
+}
+
+fn is_second_high_one_word_region(address: u32) -> bool {
+    matches!(
+        address,
+        0x200000..=0x261800 | 0x280000..=0x2a4000 | 0x300000..=0x338000
+    )
 }
 
 impl Default for SpiConfig {
@@ -214,21 +253,10 @@ where
         }
 
         if self.config.nordic_memory_map_latency && self.config.read_latency_words(address) != 0 {
-            for (index, word) in data.chunks_mut(4).enumerate() {
-                let word_address = address + index as u32 * 4;
-                self.read_one(word_address, word, false).await?;
-            }
-            return Ok(());
+            return self.read_word_at_a_time(address, data).await;
         }
 
-        let mut done = 0usize;
-        while done < data.len() {
-            let count = core::cmp::min(MAX_SPI_DATA_LEN, data.len() - done);
-            self.read_one(address + done as u32, &mut data[done..done + count], true)
-                .await?;
-            done += count;
-        }
-        Ok(())
+        self.read_incrementing(address, data).await
     }
 
     async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
@@ -257,6 +285,29 @@ impl<SPI> SpiTransport<SPI>
 where
     SPI: SpiDevice<u8>,
 {
+    async fn read_incrementing(&mut self, address: u32, data: &mut [u8]) -> Result<(), SPI::Error> {
+        let mut done = 0usize;
+        while done < data.len() {
+            let count = core::cmp::min(MAX_SPI_DATA_LEN, data.len() - done);
+            self.read_one(address + done as u32, &mut data[done..done + count], true)
+                .await?;
+            done += count;
+        }
+        Ok(())
+    }
+
+    async fn read_word_at_a_time(
+        &mut self,
+        address: u32,
+        data: &mut [u8],
+    ) -> Result<(), SPI::Error> {
+        for (index, word) in data.chunks_mut(HIGH_LATENCY_READ_WORD_LEN).enumerate() {
+            let word_address = address + index as u32 * HIGH_LATENCY_READ_WORD_LEN as u32;
+            self.read_one(word_address, word, false).await?;
+        }
+        Ok(())
+    }
+
     async fn read_one(
         &mut self,
         address: u32,
@@ -294,7 +345,61 @@ where
 
 #[cfg(test)]
 mod tests {
+    use core::convert::Infallible;
+    use std::collections::VecDeque;
+    use std::vec;
+    use std::vec::Vec;
+
+    use embedded_hal_async::spi::{ErrorType, Operation};
+
+    use crate::test_support::block_on;
+
     use super::*;
+
+    #[derive(Default)]
+    struct FakeSpi {
+        sent: Vec<Vec<u8>>,
+        responses: VecDeque<Vec<u8>>,
+    }
+
+    impl FakeSpi {
+        fn with_responses(responses: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                sent: Vec::new(),
+                responses: responses.into_iter().collect(),
+            }
+        }
+    }
+
+    impl ErrorType for FakeSpi {
+        type Error = Infallible;
+    }
+
+    impl SpiDevice<u8> for FakeSpi {
+        async fn transaction(
+            &mut self,
+            operations: &mut [Operation<'_, u8>],
+        ) -> Result<(), Self::Error> {
+            assert_eq!(operations.len(), 1);
+            match &mut operations[0] {
+                Operation::Write(bytes) => self.sent.push(bytes.to_vec()),
+                Operation::TransferInPlace(bytes) => {
+                    self.sent.push(bytes.to_vec());
+                    let response = self.responses.pop_front().expect("missing SPI response");
+                    assert_eq!(response.len(), bytes.len());
+                    bytes.copy_from_slice(&response);
+                }
+                operation => panic!("unexpected SPI operation: {operation:?}"),
+            }
+            Ok(())
+        }
+    }
+
+    fn read_response(payload: &[u8], latency_words: usize) -> Vec<u8> {
+        let mut response = vec![0; READ_HEADER_LEN + latency_words * 4];
+        response.extend_from_slice(payload);
+        response
+    }
 
     #[test]
     fn nordic_defaults_are_exact() {
@@ -307,24 +412,189 @@ mod tests {
     #[test]
     fn nordic_memory_map_latency_matches_the_pinned_bus_shim() {
         let config = SpiConfig::NORDIC_MEMORY_MAP;
-        assert_eq!(config.read_latency_words(0x000018), 1);
-        assert_eq!(config.read_latency_words(0x009000), 2);
-        assert_eq!(config.read_latency_words(0x048c20), 1);
-        assert_eq!(config.read_latency_words(0x080000), 2);
-        assert_eq!(config.read_latency_words(0x0c5000), 0);
-        assert_eq!(config.read_latency_words(0x143a80), 1);
-        assert_eq!(config.read_latency_words(0x28c000), 1);
+        for (address, latency) in [
+            (0x000000, 1),
+            (0x008fff, 1),
+            (0x009000, 2),
+            (0x03ffff, 2),
+            (0x040000, 1),
+            (0x07ffff, 1),
+            (0x080000, 2),
+            (0x092000, 2),
+            (0x092001, 0),
+            (0x0bffff, 0),
+            (0x0c0000, 0),
+            (0x0f0fff, 0),
+            (0x0f1000, 0),
+            (0x100000, 1),
+            (0x134000, 1),
+            (0x134001, 0),
+            (0x140000, 1),
+            (0x14c000, 1),
+            (0x180000, 1),
+            (0x190000, 1),
+            (0x200000, 1),
+            (0x261800, 1),
+            (0x280000, 1),
+            (0x2a4000, 1),
+            (0x300000, 1),
+            (0x338000, 1),
+            (0x338001, 0),
+            (0xffffff, 0),
+            (INCREMENTING_ADDRESS_MASK | 0x009000, 2),
+        ] {
+            assert_eq!(config.read_latency_words(address), latency, "{address:#x}");
+        }
     }
 
     #[test]
     fn invalid_latency_is_rejected() {
-        assert!(SpiConfig::new(0x80_0000, 8).is_some());
+        let config = SpiConfig::new(0x80_0000, 8).expect("maximum latency is valid");
+        assert_eq!(config.address_mask(), 0x80_0000);
+        assert_eq!(config.slave_latency_words(), 8);
+        assert!(!config.uses_nordic_memory_map_latency());
         assert!(SpiConfig::new(0x80_0000, 9).is_none());
         assert!(SpiConfig::new(0x0100_0000, 0).is_none());
     }
 
     #[test]
+    fn status_register_frames_are_exact() {
+        let mut status_response = vec![0; 6];
+        status_response[1] = 0xa5;
+        let spi = FakeSpi::with_responses([status_response]);
+        let mut transport = SpiTransport::new(spi);
+
+        assert_eq!(
+            block_on(transport.read_status(OPCODE_READ_STATUS_1)),
+            Ok(0xa5)
+        );
+        assert_eq!(
+            block_on(transport.write_status(OPCODE_WRITE_STATUS_2, 0x5a)),
+            Ok(())
+        );
+        assert_eq!(transport.config(), SpiConfig::NORDIC_DEFAULT);
+        assert_eq!(transport.spi_mut().sent.len(), 2);
+
+        let spi = transport.into_inner();
+        assert_eq!(spi.sent[0], [OPCODE_READ_STATUS_1, 0, 0, 0, 0, 0]);
+        assert_eq!(spi.sent[1], [OPCODE_WRITE_STATUS_2, 0x5a]);
+        assert!(spi.responses.is_empty());
+    }
+
+    #[test]
+    fn incrementing_reads_use_exact_headers_and_chunk_boundaries() {
+        let first_payload: Vec<u8> = (0..MAX_SPI_DATA_LEN).map(|index| index as u8).collect();
+        let second_payload = vec![0xde, 0xad];
+        let spi = FakeSpi::with_responses([
+            read_response(&first_payload, 0),
+            read_response(&second_payload, 0),
+        ]);
+        let mut transport = SpiTransport::new(spi);
+        let mut output = vec![0; MAX_SPI_DATA_LEN + second_payload.len()];
+
+        assert_eq!(block_on(transport.read(0x12_3456, &mut output)), Ok(()));
+        assert_eq!(&output[..MAX_SPI_DATA_LEN], first_payload);
+        assert_eq!(&output[MAX_SPI_DATA_LEN..], second_payload);
+
+        let spi = transport.into_inner();
+        assert_eq!(spi.sent.len(), 2);
+        assert_eq!(&spi.sent[0][..5], [OPCODE_FAST_READ, 0x92, 0x34, 0x56, 0]);
+        assert_eq!(spi.sent[0].len(), READ_HEADER_LEN + MAX_SPI_DATA_LEN);
+        assert!(
+            spi.sent[0][READ_HEADER_LEN..]
+                .iter()
+                .all(|byte| *byte == 0xff)
+        );
+        assert_eq!(&spi.sent[1][..5], [OPCODE_FAST_READ, 0x92, 0x44, 0x56, 0]);
+        assert_eq!(spi.sent[1].len(), READ_HEADER_LEN + 2);
+        assert_eq!(&spi.sent[1][READ_HEADER_LEN..], [0xff, 0xff]);
+    }
+
+    #[test]
+    fn memory_map_reads_clock_latency_for_each_nonincrementing_word() {
+        let spi =
+            FakeSpi::with_responses([read_response(&[1, 2, 3, 4], 2), read_response(&[5, 6], 2)]);
+        let mut transport = SpiTransport::with_config(spi, SpiConfig::NORDIC_MEMORY_MAP);
+        let mut output = [0; 6];
+
+        assert_eq!(block_on(transport.read(0x009000, &mut output)), Ok(()));
+        assert_eq!(output, [1, 2, 3, 4, 5, 6]);
+
+        let spi = transport.into_inner();
+        assert_eq!(spi.sent.len(), 2);
+        assert_eq!(&spi.sent[0][..5], [OPCODE_FAST_READ, 0x00, 0x90, 0x00, 0]);
+        assert_eq!(spi.sent[0].len(), READ_HEADER_LEN + 8 + 4);
+        assert!(
+            spi.sent[0][READ_HEADER_LEN..READ_HEADER_LEN + 8]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(&spi.sent[0][READ_HEADER_LEN + 8..], [0xff; 4]);
+        assert_eq!(&spi.sent[1][..5], [OPCODE_FAST_READ, 0x00, 0x90, 0x04, 0]);
+        assert_eq!(spi.sent[1].len(), READ_HEADER_LEN + 8 + 2);
+    }
+
+    #[test]
+    fn fixed_maximum_latency_keeps_one_incrementing_word_transfer() {
+        let payload = vec![0x5a; HIGH_LATENCY_READ_WORD_LEN];
+        let config = SpiConfig::new(INCREMENTING_ADDRESS_MASK, MAX_SLAVE_LATENCY_WORDS as u8)
+            .expect("maximum fixed latency is valid");
+        let spi = FakeSpi::with_responses([read_response(&payload, MAX_SLAVE_LATENCY_WORDS)]);
+        let mut transport = SpiTransport::with_config(spi, config);
+        let mut output = vec![0; HIGH_LATENCY_READ_WORD_LEN];
+
+        assert_eq!(block_on(transport.read(0x12_3456, &mut output)), Ok(()));
+        assert_eq!(output, payload);
+
+        let spi = transport.into_inner();
+        assert_eq!(spi.sent.len(), 1);
+        assert_eq!(&spi.sent[0][..5], [OPCODE_FAST_READ, 0x92, 0x34, 0x56, 0]);
+        assert_eq!(
+            spi.sent[0].len(),
+            READ_HEADER_LEN + MAX_SLAVE_LATENCY_BYTES + HIGH_LATENCY_READ_WORD_LEN
+        );
+        assert!(
+            spi.sent[0][READ_HEADER_LEN..READ_HEADER_LEN + MAX_SLAVE_LATENCY_BYTES]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert!(
+            spi.sent[0][READ_HEADER_LEN + MAX_SLAVE_LATENCY_BYTES..]
+                .iter()
+                .all(|byte| *byte == 0xff)
+        );
+    }
+
+    #[test]
+    fn writes_use_exact_headers_and_chunk_boundaries() {
+        let mut data: Vec<u8> = (0..MAX_SPI_DATA_LEN).map(|index| index as u8).collect();
+        data.extend_from_slice(&[0xde, 0xad]);
+        let mut transport = SpiTransport::new(FakeSpi::default());
+
+        assert_eq!(block_on(transport.write(0x12_3456, &data)), Ok(()));
+
+        let spi = transport.into_inner();
+        assert_eq!(spi.sent.len(), 2);
+        assert_eq!(&spi.sent[0][..4], [OPCODE_WRITE, 0x92, 0x34, 0x56]);
+        assert_eq!(&spi.sent[0][4..], &data[..MAX_SPI_DATA_LEN]);
+        assert_eq!(&spi.sent[1][..4], [OPCODE_WRITE, 0x92, 0x44, 0x56]);
+        assert_eq!(&spi.sent[1][4..], [0xde, 0xad]);
+    }
+
+    #[test]
+    fn empty_transfers_do_not_touch_spi() {
+        let mut transport = SpiTransport::new(FakeSpi::default());
+        assert_eq!(block_on(transport.read(0x1234, &mut [])), Ok(()));
+        assert_eq!(block_on(transport.write(0x1234, &[])), Ok(()));
+        assert!(transport.into_inner().sent.is_empty());
+    }
+
+    #[test]
     fn spi_io_buffer_is_word_aligned() {
+        assert_eq!(
+            SPI_IO_BUFFER_LEN,
+            READ_HEADER_LEN + MAX_SLAVE_LATENCY_WORDS * 4 + MAX_SPI_DATA_LEN
+        );
         let buffer = SpiIoBuffer {
             bytes: [0; SPI_IO_BUFFER_LEN],
         };

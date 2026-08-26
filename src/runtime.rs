@@ -31,6 +31,7 @@ pub const RPU_REG_WATCHDOG_TIMER: u32 = 0xa400_004c;
 pub const RPU_WATCHDOG_BIT: u32 = 1 << 1;
 /// Watchdog timer reload value.
 pub const RPU_WATCHDOG_RELOAD: u32 = 0x00ff_ffff;
+const SYSTEM_INIT_MESSAGE_LEN: usize = SYSTEM_INIT_LEN + HOST_MESSAGE_HEADER_LEN;
 
 /// Top-level driver lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,6 +161,26 @@ pub struct NativeDriver<B, const RX: usize, const TX: usize> {
     configured_mac: Option<[u8; 6]>,
 }
 
+macro_rules! recovery_step {
+    ($result:expr, $map_error:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(error) => return Err($map_error(error)),
+        }
+    };
+}
+
+macro_rules! run_native_station_command {
+    ($driver:ident, $delay:expr, $method:ident $(, $argument:expr)* $(,)?) => {{
+        $driver.require_state(DriverState::Ready)?;
+        $driver
+            .station
+            .$method(&mut $driver.device, $delay $(, $argument)*)
+            .await?;
+        Ok(())
+    }};
+}
+
 impl<B, const RX: usize, const TX: usize> NativeDriver<B, RX, TX> {
     /// Creates one cold driver instance.
     pub fn new(
@@ -229,6 +250,11 @@ impl<B, const RX: usize, const TX: usize> NativeDriver<B, RX, TX> {
         self.state = DriverState::Recovering;
     }
 
+    #[cfg(test)]
+    pub(crate) fn prepare_ready_for_test(&mut self) {
+        self.state = DriverState::Ready;
+    }
+
     /// Releases the low-level bus.
     pub fn into_inner(self) -> B {
         self.device.into_inner()
@@ -261,60 +287,50 @@ where
         self.configured_mac = None;
 
         let result = async {
-            self.validate_system_config(config)
-                .map_err(RecoveryError::Driver)?;
+            recovery_step!(self.validate_system_config(config), RecoveryError::Driver);
             let _ = self.device.disable_interrupts().await;
-            platform
-                .hard_reset(delay)
-                .await
-                .map_err(RecoveryError::Platform)?;
+            recovery_step!(platform.hard_reset(delay).await, RecoveryError::Platform);
             self.device.reset_queue_state();
             self.data.reset_after_rpu_reset();
 
-            platform
-                .prepare_wake_bus()
-                .await
-                .map_err(RecoveryError::Platform)?;
-            self.device
-                .rpu_mut()
-                .wake(delay, DEFAULT_WAKE_ATTEMPTS)
-                .await
-                .map_err(DeviceError::from)
-                .map_err(DriverError::from)?;
-            platform
-                .prepare_data_bus()
-                .await
-                .map_err(RecoveryError::Platform)?;
+            recovery_step!(platform.prepare_wake_bus().await, RecoveryError::Platform);
+            recovery_step!(
+                self.device
+                    .rpu_mut()
+                    .wake(delay, DEFAULT_WAKE_ATTEMPTS)
+                    .await,
+                |error| RecoveryError::Driver(DriverError::Device(DeviceError::from(error)))
+            );
+            recovery_step!(platform.prepare_data_bus().await, RecoveryError::Platform);
 
-            self.device
-                .rpu_mut()
-                .enable_clocks()
-                .await
-                .map_err(DeviceError::from)
-                .map_err(DriverError::from)?;
+            recovery_step!(self.device.rpu_mut().enable_clocks().await, |error| {
+                RecoveryError::Driver(DriverError::Device(DeviceError::from(error)))
+            });
 
-            let report = firmware::load(self.device.rpu_mut(), delay, bundle, trust)
-                .await
-                .map_err(DriverError::from)?;
-            self.device
-                .initialize_queues()
-                .await
-                .map_err(DriverError::from)?;
-            self.data
-                .post_all_rx(&mut self.device)
-                .await
-                .map_err(DriverError::from)?;
-            self.device
-                .enable_interrupts()
-                .await
-                .map_err(DriverError::from)?;
+            let report = recovery_step!(
+                firmware::load(self.device.rpu_mut(), delay, bundle, trust).await,
+                |error| RecoveryError::Driver(DriverError::Firmware(error))
+            );
+            recovery_step!(self.device.initialize_queues().await, |error| {
+                RecoveryError::Driver(DriverError::Device(error))
+            });
+            recovery_step!(self.data.post_all_rx(&mut self.device).await, |error| {
+                RecoveryError::Driver(DriverError::Data(error))
+            });
+            recovery_step!(self.device.enable_interrupts().await, |error| {
+                RecoveryError::Driver(DriverError::Device(error))
+            });
 
-            let mut message = [0u8; SYSTEM_INIT_LEN + HOST_MESSAGE_HEADER_LEN];
-            let len = encode_system_init(&mut message, config).map_err(DriverError::from)?;
-            self.device
-                .send_control_reliable(&message[..len], delay)
-                .await
-                .map_err(DriverError::from)?;
+            let mut message = [0u8; SYSTEM_INIT_MESSAGE_LEN];
+            let len = recovery_step!(encode_system_init(&mut message, config), |error| {
+                RecoveryError::Driver(DriverError::Protocol(error))
+            });
+            recovery_step!(
+                self.device
+                    .send_control_reliable(&message[..len], delay)
+                    .await,
+                |error| RecoveryError::Driver(DriverError::Device(error))
+            );
             Ok(report)
         }
         .await;
@@ -347,10 +363,7 @@ where
         if ifaceindex != self.ifaceindex || self.configured_mac != Some(mac_address) {
             return Err(DriverError::ConfigurationMismatch);
         }
-        self.station
-            .create_interface(&mut self.device, delay, mac_address, interface_name)
-            .await?;
-        Ok(())
+        run_native_station_command!(self, delay, create_interface, mac_address, interface_name)
     }
 
     /// Requests a regulatory country code.
@@ -364,11 +377,7 @@ where
     where
         D: DelayNs,
     {
-        self.require_state(DriverState::Ready)?;
-        self.station
-            .set_regulatory(&mut self.device, delay, country, user_hint_type, force)
-            .await?;
-        Ok(())
+        run_native_station_command!(self, delay, set_regulatory, country, user_hint_type, force)
     }
 
     /// Brings the configured station interface up.
@@ -376,9 +385,7 @@ where
     where
         D: DelayNs,
     {
-        self.require_state(DriverState::Ready)?;
-        self.station.bring_up(&mut self.device, delay).await?;
-        Ok(())
+        run_native_station_command!(self, delay, bring_up)
     }
 
     /// Brings the configured station interface down.
@@ -386,9 +393,7 @@ where
     where
         D: DelayNs,
     {
-        self.require_state(DriverState::Ready)?;
-        self.station.bring_down(&mut self.device, delay).await?;
-        Ok(())
+        run_native_station_command!(self, delay, bring_down)
     }
 
     /// Starts one bounded station scan.
@@ -400,11 +405,7 @@ where
     where
         D: DelayNs,
     {
-        self.require_state(DriverState::Ready)?;
-        self.station
-            .start_scan(&mut self.device, delay, request)
-            .await?;
-        Ok(())
+        run_native_station_command!(self, delay, start_scan, request)
     }
 
     /// Requests the result stream after scan completion.
@@ -416,11 +417,7 @@ where
     where
         D: DelayNs,
     {
-        self.require_state(DriverState::Ready)?;
-        self.station
-            .request_scan_results(&mut self.device, delay, reason)
-            .await?;
-        Ok(())
+        run_native_station_command!(self, delay, request_scan_results, reason)
     }
 
     /// Starts station authentication.
@@ -432,11 +429,7 @@ where
     where
         D: DelayNs,
     {
-        self.require_state(DriverState::Ready)?;
-        self.station
-            .authenticate(&mut self.device, delay, request)
-            .await?;
-        Ok(())
+        run_native_station_command!(self, delay, authenticate, request)
     }
 
     /// Starts station association.
@@ -448,11 +441,7 @@ where
     where
         D: DelayNs,
     {
-        self.require_state(DriverState::Ready)?;
-        self.station
-            .associate(&mut self.device, delay, request)
-            .await?;
-        Ok(())
+        run_native_station_command!(self, delay, associate, request)
     }
 
     /// Enables or disables firmware power save.
@@ -464,11 +453,7 @@ where
     where
         D: DelayNs,
     {
-        self.require_state(DriverState::Ready)?;
-        self.station
-            .set_power_save(&mut self.device, delay, state)
-            .await?;
-        Ok(())
+        run_native_station_command!(self, delay, set_power_save, state)
     }
 
     /// Changes the firmware power-save timeout.
@@ -480,11 +465,7 @@ where
     where
         D: DelayNs,
     {
-        self.require_state(DriverState::Ready)?;
-        self.station
-            .set_power_save_timeout(&mut self.device, delay, timeout_ms)
-            .await?;
-        Ok(())
+        run_native_station_command!(self, delay, set_power_save_timeout, timeout_ms)
     }
 
     /// Starts a station deauthentication sequence.
@@ -496,11 +477,7 @@ where
     where
         D: DelayNs,
     {
-        self.require_state(DriverState::Ready)?;
-        self.station
-            .disconnect(&mut self.device, delay, reason_code)
-            .await?;
-        Ok(())
+        run_native_station_command!(self, delay, disconnect, reason_code)
     }
 
     /// Waits for one host interrupt through the board layer.
@@ -549,62 +526,95 @@ where
         message: HostMessageRef<'a>,
     ) -> Result<DriverEvent<'a>, DriverError<B::Error>> {
         match message.message_type {
-            HostMessageType::System => {
-                let event = parse_system_event(message)?;
-                match event {
-                    SystemEvent::InitDone if self.state == DriverState::WaitingForSystemInit => {
-                        self.station.recovery_complete();
-                        self.state = DriverState::Ready;
-                    }
-                    SystemEvent::InitDone | SystemEvent::DeinitDone => {
-                        let state = self.state;
-                        self.enter_recovery();
-                        return Err(DriverError::UnexpectedEventForState { state });
-                    }
-                    _ => {}
-                }
-                Ok(DriverEvent::System(event))
-            }
-            HostMessageType::Umac => {
-                self.require_state(DriverState::Ready)?;
-                let event = parse_control_event(message)?;
-                if let Err(error) = self.station.handle_control_event(event) {
-                    self.enter_recovery();
-                    return Err(DriverError::Station(error));
-                }
-                Ok(DriverEvent::Control(event))
-            }
-            HostMessageType::Data => {
-                self.require_state(DriverState::Ready)?;
-                let event = classify_data_event(message).map_err(DriverError::DataProtocol)?;
-                match event {
-                    DataEvent::TransmitDone { .. } => {
-                        let transmit_done =
-                            TxDoneEventRef::parse(message).map_err(DriverError::DataProtocol)?;
-                        self.data
-                            .complete_tx(transmit_done.token)
-                            .map_err(DriverError::DataProtocol)?;
-                        return Ok(DriverEvent::TransmitDone(transmit_done));
-                    }
-                    DataEvent::Receive => {
-                        let receive =
-                            RxEventRef::parse(message).map_err(DriverError::DataProtocol)?;
-                        return Ok(DriverEvent::Receive(receive));
-                    }
-                    _ => {
-                        if let Err(error) = self.station.handle_data_event(event) {
-                            self.enter_recovery();
-                            return Err(DriverError::Station(error));
-                        }
-                    }
-                }
-                Ok(DriverEvent::Data(event))
-            }
-            HostMessageType::Supplicant => {
-                self.require_state(DriverState::Ready)?;
-                Ok(DriverEvent::Supplicant(message.payload))
-            }
+            HostMessageType::System => self.dispatch_system_message(message),
+            HostMessageType::Umac => self.dispatch_control_message(message),
+            HostMessageType::Data => self.dispatch_data_message(message),
+            HostMessageType::Supplicant => self.dispatch_supplicant_message(message),
         }
+    }
+
+    fn dispatch_system_message<'a>(
+        &mut self,
+        message: HostMessageRef<'a>,
+    ) -> Result<DriverEvent<'a>, DriverError<B::Error>> {
+        let event = parse_system_event(message)?;
+        match event {
+            SystemEvent::InitDone if self.state == DriverState::WaitingForSystemInit => {
+                self.station.recovery_complete();
+                self.state = DriverState::Ready;
+            }
+            SystemEvent::InitDone | SystemEvent::DeinitDone => {
+                let state = self.state;
+                self.enter_recovery();
+                return Err(DriverError::UnexpectedEventForState { state });
+            }
+            _ => {}
+        }
+        Ok(DriverEvent::System(event))
+    }
+
+    fn dispatch_control_message<'a>(
+        &mut self,
+        message: HostMessageRef<'a>,
+    ) -> Result<DriverEvent<'a>, DriverError<B::Error>> {
+        self.require_state(DriverState::Ready)?;
+        let event = parse_control_event(message)?;
+        if let Err(error) = self.station.handle_control_event(event) {
+            self.enter_recovery();
+            return Err(DriverError::Station(error));
+        }
+        Ok(DriverEvent::Control(event))
+    }
+
+    fn dispatch_data_message<'a>(
+        &mut self,
+        message: HostMessageRef<'a>,
+    ) -> Result<DriverEvent<'a>, DriverError<B::Error>> {
+        self.require_state(DriverState::Ready)?;
+        let event = classify_data_event(message).map_err(DriverError::DataProtocol)?;
+        match event {
+            DataEvent::TransmitDone { .. } => self.dispatch_transmit_done(message),
+            DataEvent::Receive => self.dispatch_receive(message),
+            _ => self.dispatch_station_data(event),
+        }
+    }
+
+    fn dispatch_transmit_done<'a>(
+        &mut self,
+        message: HostMessageRef<'a>,
+    ) -> Result<DriverEvent<'a>, DriverError<B::Error>> {
+        let event = TxDoneEventRef::parse(message).map_err(DriverError::DataProtocol)?;
+        self.data
+            .complete_tx(event.token)
+            .map_err(DriverError::DataProtocol)?;
+        Ok(DriverEvent::TransmitDone(event))
+    }
+
+    fn dispatch_receive<'a>(
+        &mut self,
+        message: HostMessageRef<'a>,
+    ) -> Result<DriverEvent<'a>, DriverError<B::Error>> {
+        let event = RxEventRef::parse(message).map_err(DriverError::DataProtocol)?;
+        Ok(DriverEvent::Receive(event))
+    }
+
+    fn dispatch_station_data<'a>(
+        &mut self,
+        event: DataEvent,
+    ) -> Result<DriverEvent<'a>, DriverError<B::Error>> {
+        if let Err(error) = self.station.handle_data_event(event) {
+            self.enter_recovery();
+            return Err(DriverError::Station(error));
+        }
+        Ok(DriverEvent::Data(event))
+    }
+
+    fn dispatch_supplicant_message<'a>(
+        &self,
+        message: HostMessageRef<'a>,
+    ) -> Result<DriverEvent<'a>, DriverError<B::Error>> {
+        self.require_state(DriverState::Ready)?;
+        Ok(DriverEvent::Supplicant(message.payload))
     }
 
     /// Copies one received packet into caller storage and enforces the controlled port.
@@ -618,6 +628,14 @@ where
             .data
             .receive_packet(&mut self.device, event, packet_index, output)
             .await?;
+        self.validate_received_frame(event, frame)
+    }
+
+    fn validate_received_frame(
+        &mut self,
+        event: &RxEventRef<'_>,
+        frame: ReceivedFrame,
+    ) -> Result<ReceivedFrame, DriverError<B::Error>> {
         if event.wdev_id != self.wdev_id {
             let received = event.wdev_id;
             self.enter_recovery();
@@ -698,20 +716,27 @@ where
         config: &SystemInitConfig,
     ) -> Result<(), DriverError<B::Error>> {
         let mac = config.mac_address;
-        let mac_is_valid = mac != [0; 6] && mac != [0xff; 6] && mac[0] & 1 == 0;
+        let mac_is_valid = [mac != [0; 6], mac != [0xff; 6], mac[0] & 1 == 0]
+            .into_iter()
+            .all(core::convert::identity);
         let pool0 = config.rx_pools[0];
         let extra_pools_are_empty = config.rx_pools[1..]
             .iter()
-            .all(|pool| pool.buffer_size == 0 && pool.buffer_count == 0);
-        if config.wdev_id != self.wdev_id as u32
-            || !mac_is_valid
-            || pool0.buffer_size as usize != self.data.rx_buffer_size()
-            || pool0.buffer_count as usize != RX
-            || !extra_pools_are_empty
-        {
-            return Err(DriverError::ConfigurationMismatch);
+            .all(|pool| pool.buffer_size | pool.buffer_count == 0);
+        let valid = [
+            config.wdev_id == self.wdev_id as u32,
+            mac_is_valid,
+            pool0.buffer_size as usize == self.data.rx_buffer_size(),
+            pool0.buffer_count as usize == RX,
+            extra_pools_are_empty,
+        ]
+        .into_iter()
+        .all(core::convert::identity);
+        if valid {
+            Ok(())
+        } else {
+            Err(DriverError::ConfigurationMismatch)
         }
-        Ok(())
     }
 
     fn require_controlled_port(&self, ether_type: u16) -> Result<(), DriverError<B::Error>> {
@@ -749,13 +774,164 @@ fn ethernet_type(frame: &[u8]) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::protocol::{encode_host_message, parse_host_message};
+    use std::collections::VecDeque;
+    use std::vec::Vec;
+
+    use sha2::{Digest, Sha256};
+
+    use super::super::firmware::{
+        FEATURE_SYSTEM_MODE, FirmwareError, IMAGE_HEADER_LEN, PATCH_HEADER_LEN, PATCH_IMAGE_COUNT,
+        PATCH_SIGNATURE, PINNED_PATCH_VERSION,
+    };
+    use super::super::protocol::{
+        RF_PARAMS_LEN, UMAC_HEADER_LEN, encode_host_message, parse_host_message,
+    };
     use super::super::system::{SYSTEM_HEADER_LEN, SystemEventId};
+    use super::super::test_support::block_on;
     use super::*;
+
+    const MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
+
+    #[derive(Default)]
+    struct TestBus {
+        reads: VecDeque<u32>,
+        writes: Vec<(u32, Vec<u8>)>,
+    }
+
+    impl Bus for TestBus {
+        type Error = ();
+
+        async fn read_status(&mut self, _opcode: u8) -> Result<u8, Self::Error> {
+            Ok(0)
+        }
+
+        async fn write_status(&mut self, _opcode: u8, _value: u8) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn read(&mut self, _address: u32, data: &mut [u8]) -> Result<(), Self::Error> {
+            let value = self.reads.pop_front().unwrap_or(0).to_le_bytes();
+            data.copy_from_slice(&value[..data.len()]);
+            Ok(())
+        }
+
+        async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
+            self.writes.push((address, data.to_vec()));
+            Ok(())
+        }
+    }
+
+    struct NoDelay;
+
+    impl DelayNs for NoDelay {
+        async fn delay_ns(&mut self, _ns: u32) {}
+    }
+
+    #[derive(Default)]
+    struct TestPlatform {
+        fail_hard_reset: bool,
+        hard_reset_calls: usize,
+    }
+
+    impl Platform for TestPlatform {
+        type Error = ();
+
+        async fn hard_reset<D>(&mut self, _delay: &mut D) -> Result<(), Self::Error>
+        where
+            D: DelayNs,
+        {
+            self.hard_reset_calls += 1;
+            if self.fail_hard_reset {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn prepare_wake_bus(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn prepare_data_bus(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn wait_for_interrupt(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    struct AllowFirmware;
+
+    impl FirmwareTrustPolicy for AllowFirmware {
+        fn verify(&self, _bundle: &FirmwareBundle<'_>) -> Result<(), FirmwareError> {
+            Ok(())
+        }
+    }
+
+    fn make_driver() -> NativeDriver<(), 1, 1> {
+        NativeDriver::new((), 64, 64, 1, 0, 0).unwrap()
+    }
+
+    fn test_bus_driver(bus: TestBus) -> NativeDriver<TestBus, 1, 1> {
+        NativeDriver::new(bus, 64, 64, 1, 0, 0).unwrap()
+    }
+
+    fn valid_config() -> SystemInitConfig {
+        let mut config = SystemInitConfig::new(MAC, [0; RF_PARAMS_LEN]);
+        config.rx_pools[0].buffer_size = 64;
+        config.rx_pools[0].buffer_count = 1;
+        config
+    }
+
+    fn bundle_bytes() -> [u8; PATCH_HEADER_LEN + 4 * IMAGE_HEADER_LEN + 4] {
+        let mut bytes = [0u8; PATCH_HEADER_LEN + 4 * IMAGE_HEADER_LEN + 4];
+        bytes[0..4].copy_from_slice(&PATCH_SIGNATURE.to_le_bytes());
+        bytes[4..8].copy_from_slice(&PATCH_IMAGE_COUNT.to_le_bytes());
+        bytes[8..12].copy_from_slice(&PINNED_PATCH_VERSION.to_le_bytes());
+        bytes[12..16].copy_from_slice(&FEATURE_SYSTEM_MODE.to_le_bytes());
+        let payload_len = (bytes.len() - PATCH_HEADER_LEN) as u32;
+        bytes[16..20].copy_from_slice(&payload_len.to_le_bytes());
+        let mut offset = PATCH_HEADER_LEN;
+        for kind in 0u32..4 {
+            bytes[offset..offset + 4].copy_from_slice(&kind.to_le_bytes());
+            bytes[offset + 4..offset + 8].copy_from_slice(&1u32.to_le_bytes());
+            bytes[offset + 8] = kind as u8;
+            offset += IMAGE_HEADER_LEN + 1;
+        }
+        let digest = Sha256::digest(&bytes[PATCH_HEADER_LEN..]);
+        bytes[20..PATCH_HEADER_LEN].copy_from_slice(&digest);
+        bytes
+    }
+
+    fn message<'a>(message_type: HostMessageType, payload: &'a [u8]) -> HostMessageRef<'a> {
+        HostMessageRef {
+            resubmit: false,
+            message_type,
+            payload,
+        }
+    }
+
+    fn data_payload<const N: usize>(command: u32) -> [u8; N] {
+        let mut payload = [0u8; N];
+        payload[..4].copy_from_slice(&command.to_le_bytes());
+        payload[4..8].copy_from_slice(&(N as u32).to_le_bytes());
+        payload
+    }
+
+    fn received(ether_type: u16) -> ReceivedFrame {
+        ReceivedFrame {
+            len: 14,
+            ether_type,
+            descriptor_id: 0,
+            signal_dbm: -40,
+            frequency_mhz: 2412,
+        }
+    }
 
     #[test]
     fn init_done_moves_runtime_to_ready() {
-        let mut driver = NativeDriver::<(), 1, 1>::new((), 64, 64, 1, 0, 0).unwrap();
+        let mut driver = make_driver();
         driver.state = DriverState::WaitingForSystemInit;
         let mut payload = [0u8; SYSTEM_HEADER_LEN];
         payload[0..4].copy_from_slice(&(SystemEventId::InitDone as u32).to_le_bytes());
@@ -769,8 +945,277 @@ mod tests {
     }
 
     #[test]
+    fn system_events_are_state_checked_and_other_events_are_preserved() {
+        let mut driver = make_driver();
+        let mut payload = [0u8; SYSTEM_HEADER_LEN];
+        payload[0..4].copy_from_slice(&(SystemEventId::DeinitDone as u32).to_le_bytes());
+        payload[4..8].copy_from_slice(&(SYSTEM_HEADER_LEN as u32).to_le_bytes());
+        assert!(matches!(
+            driver.dispatch_message(message(HostMessageType::System, &payload)),
+            Err(DriverError::UnexpectedEventForState {
+                state: DriverState::Cold
+            })
+        ));
+        assert_eq!(driver.state(), DriverState::Recovering);
+
+        let mut driver = make_driver();
+        payload[0..4].copy_from_slice(&999u32.to_le_bytes());
+        assert!(matches!(
+            driver.dispatch_message(message(HostMessageType::System, &payload)),
+            Ok(DriverEvent::System(SystemEvent::Other { id: 999, .. }))
+        ));
+        assert_eq!(driver.state(), DriverState::Cold);
+    }
+
+    #[test]
+    fn control_data_and_supplicant_dispatch_cover_success_and_fail_closed_paths() {
+        let mut driver = make_driver();
+        let supplicant = [1, 2, 3];
+        assert!(matches!(
+            driver.dispatch_message(message(HostMessageType::Supplicant, &supplicant)),
+            Err(DriverError::InvalidState { .. })
+        ));
+        driver.prepare_ready_for_test();
+        assert!(matches!(
+            driver.dispatch_message(message(HostMessageType::Supplicant, &supplicant)),
+            Ok(DriverEvent::Supplicant([1, 2, 3]))
+        ));
+
+        let control = [0u8; UMAC_HEADER_LEN];
+        assert!(matches!(
+            driver.dispatch_message(message(HostMessageType::Umac, &control)),
+            Ok(DriverEvent::Control(ControlEvent::Other { .. }))
+        ));
+
+        let other = data_payload::<8>(99);
+        assert!(matches!(
+            driver.dispatch_message(message(HostMessageType::Data, &other)),
+            Ok(DriverEvent::Data(DataEvent::Other(99)))
+        ));
+
+        let receive = data_payload::<24>(3);
+        assert!(matches!(
+            driver.dispatch_message(message(HostMessageType::Data, &receive)),
+            Ok(DriverEvent::Receive(_))
+        ));
+
+        let mut done = data_payload::<23>(2);
+        done[9] = 1;
+        assert!(matches!(
+            driver.dispatch_message(message(HostMessageType::Data, &done)),
+            Err(DriverError::DataProtocol(_))
+        ));
+
+        let mut mismatched_carrier = data_payload::<12>(4);
+        mismatched_carrier[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            driver.dispatch_message(message(HostMessageType::Data, &mismatched_carrier)),
+            Err(DriverError::Station(StationError::Fault(_)))
+        ));
+        assert_eq!(driver.state(), DriverState::Recovering);
+    }
+
+    #[test]
+    fn receive_policy_checks_interface_and_controlled_port_after_data_copy() {
+        let mut driver = make_driver();
+        let event_bytes = data_payload::<24>(3);
+        let event = RxEventRef::parse(message(HostMessageType::Data, &event_bytes)).unwrap();
+        assert!(matches!(
+            driver.validate_received_frame(&event, received(0x0800)),
+            Err(DriverError::ControlledPortClosed {
+                ether_type: 0x0800,
+                ..
+            })
+        ));
+
+        driver.station.prepare_security_for_test(MAC);
+        assert_eq!(
+            driver
+                .validate_received_frame(&event, received(EAPOL_ETHERTYPE))
+                .unwrap(),
+            received(EAPOL_ETHERTYPE)
+        );
+
+        let mut wrong_interface = data_payload::<24>(3);
+        wrong_interface[12] = 1;
+        let event = RxEventRef::parse(message(HostMessageType::Data, &wrong_interface)).unwrap();
+        assert!(matches!(
+            driver.validate_received_frame(&event, received(EAPOL_ETHERTYPE)),
+            Err(DriverError::WrongInterface {
+                expected: 0,
+                received: 1
+            })
+        ));
+        assert_eq!(driver.state(), DriverState::Recovering);
+    }
+
+    #[test]
+    fn transmit_rejects_wrong_interface_short_frames_and_closed_port() {
+        let mut driver = make_driver();
+        assert!(matches!(
+            block_on(driver.transmit(1, &[0; 14], 0)),
+            Err(DriverError::WrongInterface {
+                expected: 0,
+                received: 1
+            })
+        ));
+        assert!(matches!(
+            block_on(driver.transmit(0, &[0; 13], 0)),
+            Err(DriverError::FrameTooShort)
+        ));
+        assert!(matches!(
+            block_on(driver.transmit(0, &[0; 14], 0)),
+            Err(DriverError::ControlledPortClosed { .. })
+        ));
+        assert_eq!(ethernet_type(&[0; 13]), None);
+        let mut frame = [0u8; 14];
+        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        assert_eq!(ethernet_type(&frame), Some(0x0800));
+    }
+
+    #[test]
+    fn station_interface_configuration_requires_ready_exact_identity() {
+        let mut driver = make_driver();
+        let mut delay = NoDelay;
+        assert!(matches!(
+            block_on(driver.create_station_interface(&mut delay, 1, MAC, b"wlan0")),
+            Err(DriverError::InvalidState { .. })
+        ));
+
+        driver.prepare_ready_for_test();
+        driver.configured_mac = Some(MAC);
+        assert!(matches!(
+            block_on(driver.create_station_interface(&mut delay, 2, MAC, b"wlan0")),
+            Err(DriverError::ConfigurationMismatch)
+        ));
+        assert!(matches!(
+            block_on(driver.create_station_interface(&mut delay, 1, [4; 6], b"wlan0")),
+            Err(DriverError::ConfigurationMismatch)
+        ));
+        assert!(block_on(driver.create_station_interface(&mut delay, 1, MAC, b"wlan0")).is_ok());
+    }
+
+    #[test]
+    fn system_configuration_checks_each_runtime_identity_boundary() {
+        let driver = make_driver();
+        assert_eq!(
+            SYSTEM_INIT_MESSAGE_LEN,
+            SYSTEM_INIT_LEN + HOST_MESSAGE_HEADER_LEN
+        );
+        let valid = valid_config();
+        assert!(driver.validate_system_config(&valid).is_ok());
+
+        for invalid in [
+            {
+                let mut value = valid.clone();
+                value.wdev_id = 1;
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value.mac_address = [0; 6];
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value.mac_address = [0xff; 6];
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value.mac_address = [3, 0, 0, 0, 0, 1];
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value.rx_pools[0].buffer_size = 65;
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value.rx_pools[0].buffer_count = 2;
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value.rx_pools[1].buffer_size = 1;
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value.rx_pools[2].buffer_count = 1;
+                value
+            },
+        ] {
+            assert!(matches!(
+                driver.validate_system_config(&invalid),
+                Err(DriverError::ConfigurationMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn recovery_validation_and_platform_failures_end_in_fault() {
+        let bytes = bundle_bytes();
+        let bundle = FirmwareBundle::parse(&bytes).unwrap();
+        let mut delay = NoDelay;
+
+        let mut driver = test_bus_driver(TestBus::default());
+        let mut platform = TestPlatform::default();
+        let invalid = SystemInitConfig::new(MAC, [0; RF_PARAMS_LEN]);
+        assert!(matches!(
+            block_on(driver.recover(&mut platform, &mut delay, &bundle, &AllowFirmware, &invalid,)),
+            Err(RecoveryError::Driver(DriverError::ConfigurationMismatch))
+        ));
+        assert_eq!(driver.state(), DriverState::Fault);
+        assert_eq!(platform.hard_reset_calls, 0);
+
+        let mut driver = test_bus_driver(TestBus::default());
+        let mut platform = TestPlatform {
+            fail_hard_reset: true,
+            hard_reset_calls: 0,
+        };
+        assert!(matches!(
+            block_on(driver.recover(
+                &mut platform,
+                &mut delay,
+                &bundle,
+                &AllowFirmware,
+                &valid_config(),
+            )),
+            Err(RecoveryError::Platform(()))
+        ));
+        assert_eq!(driver.state(), DriverState::Fault);
+        assert_eq!(platform.hard_reset_calls, 1);
+    }
+
+    #[test]
+    fn watchdog_sentinel_rule_and_acknowledgement_are_exact() {
+        let mut bus = TestBus::default();
+        bus.reads.extend([0xaaaa_aaaa, RPU_WATCHDOG_BIT, 0]);
+        let mut driver = test_bus_driver(bus);
+        assert!(block_on(driver.watchdog_pending()).unwrap());
+        assert!(!block_on(driver.watchdog_pending()).unwrap());
+        assert!(block_on(driver.acknowledge_watchdog()).is_ok());
+        assert_eq!(driver.state(), DriverState::Recovering);
+        let bus = driver.into_inner();
+        assert_eq!(bus.writes.len(), 2);
+        assert_eq!(bus.writes[0].1, RPU_WATCHDOG_BIT.to_le_bytes());
+        assert_eq!(bus.writes[1].1, RPU_WATCHDOG_RELOAD.to_le_bytes());
+
+        let mut bus = TestBus::default();
+        bus.reads.extend([0xaaaa_aaaa; 10]);
+        let mut driver = test_bus_driver(bus);
+        assert!(matches!(
+            block_on(driver.watchdog_pending()),
+            Err(DriverError::InvalidWatchdogStatus)
+        ));
+        assert_eq!(driver.state(), DriverState::Fault);
+    }
+
+    #[test]
     fn controlled_port_blocks_normal_data_before_connection() {
-        let driver = NativeDriver::<(), 1, 1>::new((), 64, 64, 1, 0, 0).unwrap();
+        let driver = make_driver();
         assert!(matches!(
             driver.require_controlled_port(0x0800),
             Err(DriverError::ControlledPortClosed {
@@ -782,7 +1227,7 @@ mod tests {
 
     #[test]
     fn controlled_port_allows_eapol_during_key_exchange() {
-        let mut driver = NativeDriver::<(), 1, 1>::new((), 64, 64, 1, 0, 0).unwrap();
+        let mut driver = make_driver();
         driver.station.prepare_security_for_test([1, 2, 3, 4, 5, 6]);
         assert!(driver.require_controlled_port(EAPOL_ETHERTYPE).is_ok());
         assert!(driver.require_controlled_port(0x0800).is_err());

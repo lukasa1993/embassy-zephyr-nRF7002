@@ -39,32 +39,44 @@ pub fn parse_system_event(message: HostMessageRef<'_>) -> Result<SystemEvent<'_>
     if message.message_type != HostMessageType::System {
         return Err(ProtocolError::WrongMessageType);
     }
-    if message.payload.len() < SYSTEM_HEADER_LEN {
+    let (id, body) = validated_event_body(message.payload)?;
+    decode_system_event(id, body)
+}
+
+fn validated_event_body(payload: &[u8]) -> Result<(u32, &[u8]), ProtocolError> {
+    if payload.len() < SYSTEM_HEADER_LEN {
         return Err(ProtocolError::InvalidLength);
     }
-    let id = read_u32(message.payload, 0);
-    let declared = read_u32(message.payload, 4) as usize;
-    if declared < SYSTEM_HEADER_LEN || declared > message.payload.len() {
+    let id = read_u32(payload, 0);
+    let declared = read_u32(payload, 4) as usize;
+    if declared < SYSTEM_HEADER_LEN || declared > payload.len() {
         return Err(ProtocolError::InvalidLength);
     }
-    let body = &message.payload[SYSTEM_HEADER_LEN..declared];
+    Ok((id, &payload[SYSTEM_HEADER_LEN..declared]))
+}
+
+fn decode_system_event(id: u32, body: &[u8]) -> Result<SystemEvent<'_>, ProtocolError> {
+    const POWER_DATA_ID: u32 = SystemEventId::PowerData as u32;
+    const INIT_DONE_ID: u32 = SystemEventId::InitDone as u32;
+    const STATISTICS_ID: u32 = SystemEventId::Statistics as u32;
+    const DEINIT_DONE_ID: u32 = SystemEventId::DeinitDone as u32;
     match id {
-        value if value == SystemEventId::InitDone as u32 => {
-            if !body.is_empty() {
-                return Err(ProtocolError::InvalidLength);
-            }
-            Ok(SystemEvent::InitDone)
-        }
-        value if value == SystemEventId::DeinitDone as u32 => {
-            if !body.is_empty() {
-                return Err(ProtocolError::InvalidLength);
-            }
-            Ok(SystemEvent::DeinitDone)
-        }
-        value if value == SystemEventId::PowerData as u32 => Ok(SystemEvent::PowerData(body)),
-        value if value == SystemEventId::Statistics as u32 => Ok(SystemEvent::Statistics(body)),
+        POWER_DATA_ID => Ok(SystemEvent::PowerData(body)),
+        INIT_DONE_ID => empty_body_event(body, SystemEvent::InitDone),
+        STATISTICS_ID => Ok(SystemEvent::Statistics(body)),
+        DEINIT_DONE_ID => empty_body_event(body, SystemEvent::DeinitDone),
         other => Ok(SystemEvent::Other { id: other, body }),
     }
+}
+
+fn empty_body_event<'a>(
+    body: &'a [u8],
+    event: SystemEvent<'a>,
+) -> Result<SystemEvent<'a>, ProtocolError> {
+    if !body.is_empty() {
+        return Err(ProtocolError::InvalidLength);
+    }
+    Ok(event)
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
@@ -78,34 +90,86 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::protocol::{encode_host_message, parse_host_message};
     use super::*;
 
-    #[test]
-    fn parses_init_done() {
-        let mut payload = [0u8; SYSTEM_HEADER_LEN];
-        payload[0..4].copy_from_slice(&(SystemEventId::InitDone as u32).to_le_bytes());
-        payload[4..8].copy_from_slice(&(SYSTEM_HEADER_LEN as u32).to_le_bytes());
-        let mut message = [0u8; 32];
-        let len =
-            encode_host_message(&mut message, HostMessageType::System, true, &payload).unwrap();
-        let parsed = parse_host_message(&message[..len]).unwrap();
-        assert_eq!(parse_system_event(parsed), Ok(SystemEvent::InitDone));
+    fn message(message_type: HostMessageType, payload: &[u8]) -> HostMessageRef<'_> {
+        HostMessageRef {
+            resubmit: false,
+            message_type,
+            payload,
+        }
+    }
+
+    fn payload(id: u32, body: &[u8], trailing: &[u8]) -> std::vec::Vec<u8> {
+        let declared = SYSTEM_HEADER_LEN + body.len();
+        let mut payload = std::vec::Vec::with_capacity(declared + trailing.len());
+        payload.extend_from_slice(&id.to_le_bytes());
+        payload.extend_from_slice(&(declared as u32).to_le_bytes());
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(trailing);
+        payload
     }
 
     #[test]
-    fn rejects_truncated_system_event() {
-        let mut payload = [0u8; SYSTEM_HEADER_LEN];
-        payload[0..4].copy_from_slice(&(SystemEventId::InitDone as u32).to_le_bytes());
-        payload[4..8].copy_from_slice(&16u32.to_le_bytes());
-        let message = HostMessageRef {
-            resubmit: false,
-            message_type: HostMessageType::System,
-            payload: &payload,
-        };
+    fn parses_every_known_event_shape_and_preserves_unknown_ids() {
+        for (id, body, expected) in [
+            (0, &[0x10, 0x11][..], SystemEvent::PowerData(&[0x10, 0x11])),
+            (1, &[][..], SystemEvent::InitDone),
+            (2, &[0x20][..], SystemEvent::Statistics(&[0x20])),
+            (3, &[][..], SystemEvent::DeinitDone),
+            (
+                12,
+                &[0x30][..],
+                SystemEvent::Other {
+                    id: 12,
+                    body: &[0x30],
+                },
+            ),
+        ] {
+            let bytes = payload(id, body, &[0xaa, 0xbb]);
+            assert_eq!(
+                parse_system_event(message(HostMessageType::System, &bytes)),
+                Ok(expected),
+                "event {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_message_type_and_every_invalid_length_boundary() {
+        let valid = payload(1, &[], &[]);
         assert_eq!(
-            parse_system_event(message),
+            parse_system_event(message(HostMessageType::Umac, &valid)),
+            Err(ProtocolError::WrongMessageType)
+        );
+        assert_eq!(
+            parse_system_event(message(HostMessageType::System, &valid[..7])),
             Err(ProtocolError::InvalidLength)
         );
+
+        let mut below_header = valid.clone();
+        below_header[4..8].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(
+            parse_system_event(message(HostMessageType::System, &below_header)),
+            Err(ProtocolError::InvalidLength)
+        );
+
+        let mut beyond_payload = valid;
+        beyond_payload[4..8].copy_from_slice(&9u32.to_le_bytes());
+        assert_eq!(
+            parse_system_event(message(HostMessageType::System, &beyond_payload)),
+            Err(ProtocolError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn empty_events_reject_a_body() {
+        for id in [1, 3] {
+            let bytes = payload(id, &[0xff], &[]);
+            assert_eq!(
+                parse_system_event(message(HostMessageType::System, &bytes)),
+                Err(ProtocolError::InvalidLength)
+            );
+        }
     }
 }

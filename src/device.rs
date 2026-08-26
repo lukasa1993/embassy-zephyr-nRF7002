@@ -95,6 +95,21 @@ struct PendingEvent {
     discard: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingEventRead {
+    Waiting,
+    Discarded,
+    Complete(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NewEvent {
+    address: u32,
+    declared: usize,
+    first_count: usize,
+    resubmit: bool,
+}
+
 /// Owns the direct RPU access path and firmware-published hardware queues.
 pub struct Device<B> {
     rpu: Rpu<B>,
@@ -175,7 +190,7 @@ impl<B> Device<B> {
         self.recovery_required = false;
     }
 
-    #[cfg(all(test, feature = "wpa2"))]
+    #[cfg(test)]
     pub(crate) fn initialize_for_test(&mut self, queues: HpqmInfo, rx_command_base: u32) {
         self.queues = Some(queues);
         self.rx_command_base = rx_command_base;
@@ -240,17 +255,13 @@ where
             .read(Processor::Umac, RPU_MEM_HPQ_INFO, &mut bytes)
             .await?;
         let queues = HpqmInfo::parse(&bytes)?;
-        if !queue_map_is_valid(&queues) {
-            return Err(DeviceError::InvalidQueueMap);
-        }
+        validate_queue_map(&queues)?;
 
         let rx_command_base = self
             .rpu
             .read_u32(Processor::Lmac, RPU_MEM_RX_CMD_BASE)
             .await?;
-        if rx_command_base == 0 || rx_command_base == 0xaaaa_aaaa {
-            return Err(DeviceError::InvalidQueueMap);
-        }
+        validate_rx_command_base(rx_command_base)?;
 
         // Nordic's pinned HAL uses RPU_MEM_TX_CMD_BASE as the command area
         // itself. It does not read a pointer from that address.
@@ -308,11 +319,7 @@ where
             return Err(DeviceError::CommandNeedsWait);
         }
         let queues = self.queues.ok_or(DeviceError::NotInitialized)?;
-        let address = match self.dequeue(queues.command_available).await {
-            Ok(Some(value)) => value,
-            Ok(None) => return Err(DeviceError::CommandQueueEmpty),
-            Err(_) => return Err(self.mark_delivery_uncertain()),
-        };
+        let address = self.take_command_buffer(queues.command_available).await?;
         self.post_control_fragment(queues, address, message).await
     }
 
@@ -331,44 +338,91 @@ where
     where
         D: DelayNs,
     {
+        let queues = self.prepare_reliable_send(message, attempts)?;
+        self.send_fragments_with_wait(message, queues, delay, attempts, delay_ms)
+            .await
+    }
+
+    fn prepare_reliable_send<E>(
+        &self,
+        message: &[u8],
+        attempts: u16,
+    ) -> Result<HpqmInfo, DeviceError<E>> {
         validate_complete_message(message)?;
         self.ensure_operational()?;
         if attempts == 0 {
             return Err(DeviceError::CommandQueueTimeout);
         }
-        let queues = self.queues.ok_or(DeviceError::NotInitialized)?;
+        self.queues.ok_or(DeviceError::NotInitialized)
+    }
+
+    async fn send_fragments_with_wait<D>(
+        &mut self,
+        message: &[u8],
+        queues: HpqmInfo,
+        delay: &mut D,
+        attempts: u16,
+        delay_ms: u32,
+    ) -> Result<(), DeviceError<B::Error>>
+    where
+        D: DelayNs,
+    {
         let mut posted_any = false;
-
         for fragment in message.chunks(self.command_fragment_len) {
-            let mut address = None;
-            for _ in 0..attempts {
-                match self.dequeue(queues.command_available).await {
-                    Ok(Some(value)) => {
-                        address = Some(value);
-                        break;
-                    }
-                    Ok(None) => delay.delay_ms(delay_ms).await,
-                    Err(_) => return Err(self.mark_delivery_uncertain()),
-                }
-            }
-
-            let Some(address) = address else {
-                if posted_any {
-                    return Err(self.mark_delivery_uncertain());
-                }
-                return Err(DeviceError::CommandQueueTimeout);
-            };
-
-            match self.post_control_fragment(queues, address, fragment).await {
-                Ok(()) => posted_any = true,
-                Err(DeviceError::CommandDeliveryUncertain) => {
-                    self.recovery_required = true;
-                    return Err(DeviceError::CommandDeliveryUncertain);
-                }
-                Err(error) => return Err(error),
-            }
+            let address = self
+                .wait_for_command_buffer(
+                    queues.command_available,
+                    delay,
+                    attempts,
+                    delay_ms,
+                    posted_any,
+                )
+                .await?;
+            self.post_control_fragment(queues, address, fragment)
+                .await?;
+            posted_any = true;
         }
         Ok(())
+    }
+
+    async fn take_command_buffer(
+        &mut self,
+        queue: super::protocol::Hpq,
+    ) -> Result<u32, DeviceError<B::Error>> {
+        match self.dequeue(queue).await {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => Err(DeviceError::CommandQueueEmpty),
+            Err(_) => Err(self.mark_delivery_uncertain()),
+        }
+    }
+
+    async fn wait_for_command_buffer<D>(
+        &mut self,
+        queue: super::protocol::Hpq,
+        delay: &mut D,
+        attempts: u16,
+        delay_ms: u32,
+        posted_any: bool,
+    ) -> Result<u32, DeviceError<B::Error>>
+    where
+        D: DelayNs,
+    {
+        for _ in 0..attempts {
+            match self.dequeue(queue).await {
+                Ok(Some(value)) => return Ok(value),
+                Ok(None) => delay.delay_ms(delay_ms).await,
+                Err(_) => return Err(self.mark_delivery_uncertain()),
+            }
+        }
+        Err(self.command_wait_timeout(posted_any))
+    }
+
+    fn command_wait_timeout<E>(&mut self, posted_any: bool) -> DeviceError<E> {
+        if posted_any {
+            self.mark_delivery_uncertain()
+        } else {
+            DeviceError::CommandQueueTimeout
+        }
     }
 
     /// Sends a complete command with the default one-second queue wait.
@@ -515,113 +569,238 @@ where
     ) -> Result<Option<HostMessageRef<'a>>, DeviceError<B::Error>> {
         self.ensure_operational()?;
         let queues = self.queues.ok_or(DeviceError::NotInitialized)?;
-        loop {
-            if let Some(mut pending) = self.pending_event {
-                if !pending.discard
-                    && (pending.scratch_address != scratch.as_mut_ptr() as usize
-                        || scratch.len() < pending.declared)
-                {
-                    pending.discard = true;
-                    pending.scratch_address = 0;
-                    self.pending_event = Some(pending);
-                    return Err(DeviceError::EventBufferChanged);
-                }
-
-                let mut removed_fragment = false;
-                while pending.copied < pending.declared {
-                    let Some(event_address) = self.dequeue(queues.event_busy).await? else {
-                        self.pending_event = Some(pending);
-                        if removed_fragment {
-                            self.acknowledge_interrupt().await?;
-                        }
-                        return Ok(None);
-                    };
-                    let count =
-                        core::cmp::min(self.event_fragment_len, pending.declared - pending.copied);
-                    if !pending.discard {
-                        self.rpu
-                            .read(
-                                Processor::Umac,
-                                event_address,
-                                &mut scratch[pending.copied..pending.copied + count],
-                            )
-                            .await?;
-                    }
-                    self.release_event_fragment(queues, event_address, pending.resubmit)
-                        .await?;
-                    pending.copied += count;
-                    removed_fragment = true;
-                }
-
-                self.pending_event = None;
-                if removed_fragment {
-                    self.acknowledge_interrupt().await?;
-                }
-                if pending.discard {
-                    continue;
-                }
-                return Ok(Some(parse_host_message(&scratch[..pending.declared])?));
-            }
-
-            let Some(event_address) = self.dequeue(queues.event_busy).await? else {
-                return Ok(None);
-            };
-
-            let mut header = [0u8; HOST_MESSAGE_HEADER_LEN];
-            self.rpu
-                .read(Processor::Umac, event_address, &mut header)
-                .await?;
-            let declared =
-                u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-            let resubmit = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) != 0;
-
-            if declared < HOST_MESSAGE_HEADER_LEN {
-                self.release_event_fragment(queues, event_address, resubmit)
-                    .await?;
-                self.acknowledge_interrupt().await?;
-                return Err(DeviceError::Protocol(ProtocolError::InvalidLength));
-            }
-
-            let first_count = core::cmp::min(self.event_fragment_len, declared);
-            if declared > scratch.len() {
-                self.release_event_fragment(queues, event_address, resubmit)
-                    .await?;
-                if first_count < declared {
-                    self.pending_event = Some(PendingEvent {
-                        declared,
-                        copied: first_count,
-                        resubmit,
-                        scratch_address: 0,
-                        discard: true,
-                    });
-                }
-                self.acknowledge_interrupt().await?;
-                return Err(DeviceError::EventTooLarge {
-                    declared,
-                    capacity: scratch.len(),
-                });
-            }
-
-            self.rpu
-                .read(Processor::Umac, event_address, &mut scratch[..first_count])
-                .await?;
-            self.release_event_fragment(queues, event_address, resubmit)
-                .await?;
-            self.acknowledge_interrupt().await?;
-
-            if first_count == declared {
-                return Ok(Some(parse_host_message(&scratch[..declared])?));
-            }
-
-            self.pending_event = Some(PendingEvent {
-                declared,
-                copied: first_count,
-                resubmit,
-                scratch_address: scratch.as_mut_ptr() as usize,
-                discard: false,
-            });
-            return Ok(None);
+        if self.pending_event.is_some() {
+            return self.read_pending_or_next(queues, scratch).await;
         }
+        self.read_new_event(queues, scratch).await
+    }
+
+    async fn read_pending_or_next<'a>(
+        &mut self,
+        queues: HpqmInfo,
+        scratch: &'a mut [u8],
+    ) -> Result<Option<HostMessageRef<'a>>, DeviceError<B::Error>> {
+        match self.continue_pending_event(queues, scratch).await? {
+            PendingEventRead::Waiting => Ok(None),
+            PendingEventRead::Discarded => self.read_new_event(queues, scratch).await,
+            PendingEventRead::Complete(declared) => {
+                Ok(Some(parse_host_message(&scratch[..declared])?))
+            }
+        }
+    }
+
+    async fn continue_pending_event(
+        &mut self,
+        queues: HpqmInfo,
+        scratch: &mut [u8],
+    ) -> Result<PendingEventRead, DeviceError<B::Error>> {
+        let mut pending = self.pending_event.expect("pending event was checked");
+        if pending_buffer_changed(&pending, scratch) {
+            pending.discard = true;
+            pending.scratch_address = 0;
+            self.pending_event = Some(pending);
+            return Err(DeviceError::EventBufferChanged);
+        }
+        let (pending, removed, complete) = self
+            .drain_pending_fragments(queues, scratch, pending)
+            .await?;
+        self.acknowledge_removed_fragment(removed).await?;
+        Ok(self.finish_pending_event(pending, complete))
+    }
+
+    async fn acknowledge_removed_fragment(
+        &mut self,
+        removed: bool,
+    ) -> Result<(), DeviceError<B::Error>> {
+        if removed {
+            self.acknowledge_interrupt().await?;
+        }
+        Ok(())
+    }
+
+    fn finish_pending_event(&mut self, pending: PendingEvent, complete: bool) -> PendingEventRead {
+        if !complete {
+            self.pending_event = Some(pending);
+            return PendingEventRead::Waiting;
+        }
+        self.pending_event = None;
+        if pending.discard {
+            PendingEventRead::Discarded
+        } else {
+            PendingEventRead::Complete(pending.declared)
+        }
+    }
+
+    async fn drain_pending_fragments(
+        &mut self,
+        queues: HpqmInfo,
+        scratch: &mut [u8],
+        mut pending: PendingEvent,
+    ) -> Result<(PendingEvent, bool, bool), DeviceError<B::Error>> {
+        let mut removed = false;
+        while pending.copied < pending.declared {
+            let Some(event_address) = self.dequeue(queues.event_busy).await? else {
+                return Ok((pending, removed, false));
+            };
+            self.consume_pending_fragment(queues, scratch, &mut pending, event_address)
+                .await?;
+            removed = true;
+        }
+        Ok((pending, removed, true))
+    }
+
+    async fn consume_pending_fragment(
+        &mut self,
+        queues: HpqmInfo,
+        scratch: &mut [u8],
+        pending: &mut PendingEvent,
+        event_address: u32,
+    ) -> Result<(), DeviceError<B::Error>> {
+        let count = core::cmp::min(self.event_fragment_len, pending.declared - pending.copied);
+        if !pending.discard {
+            self.rpu
+                .read(
+                    Processor::Umac,
+                    event_address,
+                    &mut scratch[pending.copied..pending.copied + count],
+                )
+                .await?;
+        }
+        self.release_event_fragment(queues, event_address, pending.resubmit)
+            .await?;
+        pending.copied += count;
+        Ok(())
+    }
+
+    async fn read_new_event<'a>(
+        &mut self,
+        queues: HpqmInfo,
+        scratch: &'a mut [u8],
+    ) -> Result<Option<HostMessageRef<'a>>, DeviceError<B::Error>> {
+        let Some(event) = self.begin_new_event(queues).await? else {
+            return Ok(None);
+        };
+        self.validate_new_event(queues, event, scratch.len())
+            .await?;
+        self.read_initial_event_fragment(queues, event, scratch)
+            .await?;
+        self.finish_new_event(event, scratch)
+    }
+
+    async fn read_initial_event_fragment(
+        &mut self,
+        queues: HpqmInfo,
+        event: NewEvent,
+        scratch: &mut [u8],
+    ) -> Result<(), DeviceError<B::Error>> {
+        self.rpu
+            .read(
+                Processor::Umac,
+                event.address,
+                &mut scratch[..event.first_count],
+            )
+            .await?;
+        self.release_and_acknowledge_event(queues, event.address, event.resubmit)
+            .await?;
+        Ok(())
+    }
+
+    fn finish_new_event<'a>(
+        &mut self,
+        event: NewEvent,
+        scratch: &'a mut [u8],
+    ) -> Result<Option<HostMessageRef<'a>>, DeviceError<B::Error>> {
+        if event.first_count == event.declared {
+            return Ok(Some(parse_host_message(&scratch[..event.declared])?));
+        }
+        self.pending_event = Some(PendingEvent {
+            declared: event.declared,
+            copied: event.first_count,
+            resubmit: event.resubmit,
+            scratch_address: scratch.as_mut_ptr() as usize,
+            discard: false,
+        });
+        Ok(None)
+    }
+
+    async fn begin_new_event(
+        &mut self,
+        queues: HpqmInfo,
+    ) -> Result<Option<NewEvent>, DeviceError<B::Error>> {
+        let Some(address) = self.dequeue(queues.event_busy).await? else {
+            return Ok(None);
+        };
+        let (declared, resubmit) = self.read_event_header(address).await?;
+        Ok(Some(NewEvent {
+            address,
+            declared,
+            first_count: core::cmp::min(self.event_fragment_len, declared),
+            resubmit,
+        }))
+    }
+
+    async fn validate_new_event(
+        &mut self,
+        queues: HpqmInfo,
+        event: NewEvent,
+        capacity: usize,
+    ) -> Result<(), DeviceError<B::Error>> {
+        if event.declared < HOST_MESSAGE_HEADER_LEN {
+            self.release_and_acknowledge_event(queues, event.address, event.resubmit)
+                .await?;
+            return Err(DeviceError::Protocol(ProtocolError::InvalidLength));
+        }
+        if event.declared > capacity {
+            self.reject_oversized_event(queues, event).await?;
+            return Err(DeviceError::EventTooLarge {
+                declared: event.declared,
+                capacity,
+            });
+        }
+        Ok(())
+    }
+
+    async fn read_event_header(
+        &mut self,
+        event_address: u32,
+    ) -> Result<(usize, bool), DeviceError<B::Error>> {
+        let mut header = [0u8; HOST_MESSAGE_HEADER_LEN];
+        self.rpu
+            .read(Processor::Umac, event_address, &mut header)
+            .await?;
+        let declared = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let resubmit = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) != 0;
+        Ok((declared, resubmit))
+    }
+
+    async fn release_and_acknowledge_event(
+        &mut self,
+        queues: HpqmInfo,
+        event_address: u32,
+        resubmit: bool,
+    ) -> Result<(), DeviceError<B::Error>> {
+        self.release_event_fragment(queues, event_address, resubmit)
+            .await?;
+        self.acknowledge_interrupt().await
+    }
+
+    async fn reject_oversized_event(
+        &mut self,
+        queues: HpqmInfo,
+        event: NewEvent,
+    ) -> Result<(), DeviceError<B::Error>> {
+        self.release_and_acknowledge_event(queues, event.address, event.resubmit)
+            .await?;
+        if event.first_count < event.declared {
+            self.pending_event = Some(PendingEvent {
+                declared: event.declared,
+                copied: event.first_count,
+                resubmit: event.resubmit,
+                scratch_address: 0,
+                discard: true,
+            });
+        }
+        Ok(())
     }
 
     async fn release_event_fragment(
@@ -693,6 +872,28 @@ fn queue_map_is_valid(queues: &HpqmInfo) -> bool {
     })
 }
 
+fn pending_buffer_changed(pending: &PendingEvent, scratch: &mut [u8]) -> bool {
+    !pending.discard
+        && (pending.scratch_address != scratch.as_mut_ptr() as usize
+            || scratch.len() < pending.declared)
+}
+
+fn validate_queue_map<E>(queues: &HpqmInfo) -> Result<(), DeviceError<E>> {
+    if queue_map_is_valid(queues) {
+        Ok(())
+    } else {
+        Err(DeviceError::InvalidQueueMap)
+    }
+}
+
+fn validate_rx_command_base<E>(address: u32) -> Result<(), DeviceError<E>> {
+    if address == 0 || address == 0xaaaa_aaaa {
+        Err(DeviceError::InvalidQueueMap)
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_complete_message<E>(message: &[u8]) -> Result<(), DeviceError<E>> {
     if message.len() < HOST_MESSAGE_HEADER_LEN || message.len() > MAX_STATION_MESSAGE_LEN {
         return Err(DeviceError::Protocol(ProtocolError::InvalidLength));
@@ -706,43 +907,536 @@ fn validate_complete_message<E>(message: &[u8]) -> Result<(), DeviceError<E>> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::protocol::{HostMessageType, Hpq, encode_host_message};
-    use super::*;
+    use std::collections::VecDeque;
+    use std::vec;
+    use std::vec::Vec;
 
-    #[test]
-    fn queue_validation_rejects_zero_unaligned_and_sentinel_addresses() {
-        let valid = HpqmInfo {
+    use super::super::memory::host_offset;
+    use super::super::protocol::{HostMessageType, Hpq, RF_PARAMS_LEN, encode_host_message};
+    use super::*;
+    use crate::test_support::block_on;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TestBusError {
+        Read,
+        Write,
+    }
+
+    #[derive(Default)]
+    struct ScriptedBus {
+        reads: VecDeque<Result<Vec<u8>, TestBusError>>,
+        writes: Vec<(u32, Vec<u8>)>,
+        fail_write_at: Option<usize>,
+        write_attempts: usize,
+    }
+
+    impl ScriptedBus {
+        fn with_reads(reads: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                reads: reads.into_iter().map(Ok).collect(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl Bus for ScriptedBus {
+        type Error = TestBusError;
+
+        async fn read_status(&mut self, _opcode: u8) -> Result<u8, Self::Error> {
+            Ok(0)
+        }
+
+        async fn write_status(&mut self, _opcode: u8, _value: u8) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn read(&mut self, _address: u32, data: &mut [u8]) -> Result<(), Self::Error> {
+            match self.reads.pop_front() {
+                Some(Ok(response)) => {
+                    assert_eq!(response.len(), data.len());
+                    data.copy_from_slice(&response);
+                    Ok(())
+                }
+                Some(Err(error)) => Err(error),
+                None => {
+                    data.fill(0);
+                    Ok(())
+                }
+            }
+        }
+
+        async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
+            let attempt = self.write_attempts;
+            self.write_attempts += 1;
+            if self.fail_write_at == Some(attempt) {
+                return Err(TestBusError::Write);
+            }
+            self.writes.push((address, data.to_vec()));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingDelay(usize);
+
+    impl DelayNs for CountingDelay {
+        async fn delay_ns(&mut self, _ns: u32) {
+            self.0 += 1;
+        }
+    }
+
+    fn word(value: u32) -> Vec<u8> {
+        value.to_le_bytes().to_vec()
+    }
+
+    fn valid_queues() -> HpqmInfo {
+        HpqmInfo {
             event_busy: Hpq {
-                enqueue_address: 4,
-                dequeue_address: 8,
+                enqueue_address: 0xa400_6004,
+                dequeue_address: 0xa400_6000,
             },
             event_available: Hpq {
-                enqueue_address: 12,
-                dequeue_address: 16,
+                enqueue_address: 0xa400_6014,
+                dequeue_address: 0xa400_6010,
             },
             command_busy: Hpq {
-                enqueue_address: 20,
-                dequeue_address: 24,
+                enqueue_address: 0xa400_6024,
+                dequeue_address: 0xa400_6020,
             },
             command_available: Hpq {
-                enqueue_address: 28,
-                dequeue_address: 32,
+                enqueue_address: 0xa400_7004,
+                dequeue_address: 0xa400_7000,
             },
             rx_buffer_busy: [
                 Hpq {
-                    enqueue_address: 36,
-                    dequeue_address: 40,
+                    enqueue_address: 0xa400_6034,
+                    dequeue_address: 0xa400_6030,
                 },
                 Hpq {
-                    enqueue_address: 44,
-                    dequeue_address: 48,
+                    enqueue_address: 0xa400_6044,
+                    dequeue_address: 0xa400_6040,
                 },
                 Hpq {
-                    enqueue_address: 52,
-                    dequeue_address: 56,
+                    enqueue_address: 0xa400_6054,
+                    dequeue_address: 0xa400_6050,
                 },
             ],
-        };
+        }
+    }
+
+    fn queue_bytes(queues: HpqmInfo) -> Vec<u8> {
+        let all = [
+            queues.event_busy,
+            queues.event_available,
+            queues.command_busy,
+            queues.command_available,
+            queues.rx_buffer_busy[0],
+            queues.rx_buffer_busy[1],
+            queues.rx_buffer_busy[2],
+        ];
+        let mut bytes = Vec::with_capacity(HPQM_INFO_LEN);
+        for queue in all {
+            bytes.extend_from_slice(&queue.enqueue_address.to_le_bytes());
+            bytes.extend_from_slice(&queue.dequeue_address.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn test_device(bus: ScriptedBus) -> Device<ScriptedBus> {
+        let mut device = Device::new(bus);
+        device.initialize_for_test(valid_queues(), 0xb000_2000);
+        device
+    }
+
+    fn message(payload: &[u8], resubmit: bool) -> Vec<u8> {
+        let mut bytes = vec![0; HOST_MESSAGE_HEADER_LEN + payload.len()];
+        let len =
+            encode_host_message(&mut bytes, HostMessageType::System, resubmit, payload).unwrap();
+        bytes.truncate(len);
+        bytes
+    }
+
+    #[test]
+    fn initializes_exact_queue_map_and_command_bases() {
+        let queues = valid_queues();
+        let bus = ScriptedBus::with_reads([queue_bytes(queues), word(0xb000_2000)]);
+        let mut device = Device::new(bus);
+        assert_eq!(block_on(device.initialize_queues()).unwrap(), queues);
+        assert_eq!(device.queues(), Some(queues));
+        assert_eq!(device.rx_command_base(), Some(0xb000_2000));
+        assert_eq!(device.tx_command_base(), Some(RPU_MEM_TX_CMD_BASE));
+        assert!(!device.recovery_required());
+
+        for invalid_base in [0, 0xaaaa_aaaa] {
+            let bus = ScriptedBus::with_reads([queue_bytes(queues), word(invalid_base)]);
+            let mut device = Device::new(bus);
+            assert!(matches!(
+                block_on(device.initialize_queues()),
+                Err(DeviceError::InvalidQueueMap)
+            ));
+        }
+
+        let mut invalid = queues;
+        invalid.command_busy.enqueue_address = 0;
+        let bus = ScriptedBus::with_reads([queue_bytes(invalid)]);
+        let mut device = Device::new(bus);
+        assert!(matches!(
+            block_on(device.initialize_queues()),
+            Err(DeviceError::InvalidQueueMap)
+        ));
+    }
+
+    #[test]
+    fn interrupt_registers_are_enabled_disabled_and_acknowledged_exactly() {
+        let root = 0x1234_5678;
+        let bus = ScriptedBus::with_reads([word(root), word(root | RPU_INTERRUPT_ROOT_BIT)]);
+        let mut device = test_device(bus);
+        block_on(device.enable_interrupts()).unwrap();
+        block_on(device.disable_interrupts()).unwrap();
+        block_on(device.acknowledge_interrupt()).unwrap();
+        let bus = device.into_inner();
+        let values: Vec<u32> = bus
+            .writes
+            .iter()
+            .filter(|(_, bytes)| bytes.len() == 4)
+            .map(|(_, bytes)| u32::from_le_bytes(bytes.as_slice().try_into().unwrap()))
+            .collect();
+        assert!(values.contains(&(root | RPU_INTERRUPT_ROOT_BIT)));
+        assert!(values.contains(&(root & !RPU_INTERRUPT_ROOT_BIT)));
+        assert!(values.contains(&RPU_INTERRUPT_MCU_BIT));
+        assert!(values.contains(&0));
+
+        let mut blocked = test_device(ScriptedBus::default());
+        blocked.recovery_required = true;
+        assert!(matches!(
+            block_on(blocked.enable_interrupts()),
+            Err(DeviceError::RecoveryRequired)
+        ));
+    }
+
+    #[test]
+    fn single_fragment_control_distinguishes_empty_and_uncertain_queues() {
+        let command_address = 0xb000_5000;
+        let command = message(&[1, 2], false);
+        let mut device = test_device(ScriptedBus::with_reads([word(command_address)]));
+        block_on(device.send_control(&command)).unwrap();
+        assert_eq!(device.command_counter, RPU_COMMAND_COUNTER_START + 1);
+        assert!(!device.recovery_required());
+
+        let mut empty = test_device(ScriptedBus::with_reads([word(0)]));
+        assert!(matches!(
+            block_on(empty.send_control(&command)),
+            Err(DeviceError::CommandQueueEmpty)
+        ));
+        assert!(!empty.recovery_required());
+
+        let mut corrupt = test_device(ScriptedBus::with_reads([word(0xaaaa_aaaa)]));
+        assert!(matches!(
+            block_on(corrupt.send_control(&command)),
+            Err(DeviceError::CommandDeliveryUncertain)
+        ));
+        assert!(corrupt.recovery_required());
+
+        let mut fragmented = test_device(ScriptedBus::default());
+        fragmented
+            .set_fragment_limits(HOST_MESSAGE_HEADER_LEN, DEFAULT_EVENT_FRAGMENT_LEN)
+            .unwrap();
+        assert!(matches!(
+            block_on(fragmented.send_control(&command)),
+            Err(DeviceError::CommandNeedsWait)
+        ));
+    }
+
+    #[test]
+    fn reliable_control_waits_fragments_and_marks_partial_timeout_uncertain() {
+        let command = message(&[1, 2, 3, 4, 5, 6, 7, 8], false);
+        let mut delay = CountingDelay::default();
+
+        let mut zero_attempts = test_device(ScriptedBus::default());
+        assert!(matches!(
+            block_on(zero_attempts.send_control_with_wait(&command, &mut delay, 0, 7)),
+            Err(DeviceError::CommandQueueTimeout)
+        ));
+
+        let mut timeout = test_device(ScriptedBus::with_reads([word(0), word(0)]));
+        assert!(matches!(
+            block_on(timeout.send_control_with_wait(&command, &mut delay, 2, 7)),
+            Err(DeviceError::CommandQueueTimeout)
+        ));
+        assert_eq!(delay.0, 2);
+        assert!(!timeout.recovery_required());
+
+        let first = 0xb000_5000;
+        let second = 0xb000_5100;
+        let mut success = test_device(ScriptedBus::with_reads([word(first), word(second)]));
+        success
+            .set_fragment_limits(HOST_MESSAGE_HEADER_LEN, DEFAULT_EVENT_FRAGMENT_LEN)
+            .unwrap();
+        block_on(success.send_control_with_wait(&command, &mut delay, 2, 7)).unwrap();
+        assert_eq!(success.command_counter, RPU_COMMAND_COUNTER_START + 2);
+        assert!(!success.recovery_required());
+
+        let mut partial = test_device(ScriptedBus::with_reads([word(first), word(0), word(0)]));
+        partial
+            .set_fragment_limits(HOST_MESSAGE_HEADER_LEN, DEFAULT_EVENT_FRAGMENT_LEN)
+            .unwrap();
+        assert!(matches!(
+            block_on(partial.send_control_with_wait(&command, &mut delay, 2, 7)),
+            Err(DeviceError::CommandDeliveryUncertain)
+        ));
+        assert!(partial.recovery_required());
+    }
+
+    #[test]
+    fn control_bus_failures_after_dequeue_require_recovery() {
+        let command = message(&[1, 2], false);
+        let mut bus = ScriptedBus::with_reads([word(0xb000_5000)]);
+        bus.fail_write_at = Some(1);
+        let mut device = test_device(bus);
+        assert!(matches!(
+            block_on(device.send_control(&command)),
+            Err(DeviceError::CommandDeliveryUncertain)
+        ));
+        assert!(device.recovery_required());
+
+        let mut bus = ScriptedBus::default();
+        bus.reads.push_back(Err(TestBusError::Read));
+        let mut device = test_device(bus);
+        assert!(matches!(
+            block_on(device.send_control(&command)),
+            Err(DeviceError::CommandDeliveryUncertain)
+        ));
+        assert!(device.recovery_required());
+    }
+
+    #[test]
+    fn complete_and_missing_events_follow_the_queue_contract() {
+        let event_address = 0xb000_5000;
+        let event = message(&[9, 8, 7, 6], true);
+        let bus = ScriptedBus::with_reads([
+            word(event_address),
+            event[..HOST_MESSAGE_HEADER_LEN].to_vec(),
+            event.clone(),
+        ]);
+        let mut device = test_device(bus);
+        let mut scratch = [0u8; 64];
+        let received = block_on(device.try_read_event(&mut scratch))
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.payload, &[9, 8, 7, 6]);
+        assert!(received.resubmit);
+        assert!(device.pending_event.is_none());
+        let bus = device.into_inner();
+        let written_values: Vec<u32> = bus
+            .writes
+            .iter()
+            .filter(|(_, bytes)| bytes.len() == 4)
+            .map(|(_, bytes)| u32::from_le_bytes(bytes.as_slice().try_into().unwrap()))
+            .collect();
+        assert!(written_values.contains(&event_address));
+        assert!(written_values.contains(&RPU_INTERRUPT_MCU_BIT));
+        let release_address = host_offset(
+            Processor::Umac,
+            valid_queues().event_available.enqueue_address,
+        )
+        .unwrap();
+        assert!(
+            bus.writes.iter().any(
+                |(address, bytes)| *address == release_address && bytes == &word(event_address)
+            )
+        );
+
+        let mut empty = test_device(ScriptedBus::with_reads([word(0)]));
+        assert!(
+            block_on(empty.try_read_event(&mut scratch))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_and_oversized_events_are_released_and_bounded() {
+        let event_address = 0xb000_5000;
+        let mut short_header = [0u8; HOST_MESSAGE_HEADER_LEN];
+        short_header[..4].copy_from_slice(&((HOST_MESSAGE_HEADER_LEN - 1) as u32).to_le_bytes());
+        short_header[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let mut malformed = test_device(ScriptedBus::with_reads([
+            word(event_address),
+            short_header.to_vec(),
+        ]));
+        assert!(matches!(
+            block_on(malformed.try_read_event(&mut [0; 64])),
+            Err(DeviceError::Protocol(ProtocolError::InvalidLength))
+        ));
+
+        let event = message(&[1; 8], false);
+        let mut oversized = test_device(ScriptedBus::with_reads([
+            word(event_address),
+            event[..HOST_MESSAGE_HEADER_LEN].to_vec(),
+        ]));
+        assert!(matches!(
+            block_on(oversized.try_read_event(&mut [0; HOST_MESSAGE_HEADER_LEN + 2])),
+            Err(DeviceError::EventTooLarge {
+                declared,
+                capacity
+            }) if declared == event.len() && capacity == HOST_MESSAGE_HEADER_LEN + 2
+        ));
+        assert!(oversized.pending_event.is_none());
+    }
+
+    #[test]
+    fn fragmented_events_resume_wait_reject_changed_buffers_and_discard() {
+        let first_address = 0xb000_5000;
+        let second_address = 0xb000_5100;
+        let event = message(&[1, 2, 3, 4, 5, 6, 7, 8], true);
+        let first_count = HOST_MESSAGE_HEADER_LEN;
+        let bus = ScriptedBus::with_reads([
+            word(first_address),
+            event[..HOST_MESSAGE_HEADER_LEN].to_vec(),
+            event[..first_count].to_vec(),
+            word(0),
+            word(second_address),
+            event[first_count..].to_vec(),
+        ]);
+        let mut device = test_device(bus);
+        device
+            .set_fragment_limits(DEFAULT_CONTROL_FRAGMENT_LEN, first_count)
+            .unwrap();
+        let mut scratch = [0u8; 64];
+        assert!(
+            block_on(device.try_read_event(&mut scratch))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            block_on(device.try_read_event(&mut scratch))
+                .unwrap()
+                .is_none()
+        );
+        let received = block_on(device.try_read_event(&mut scratch))
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.payload, &[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let bus = ScriptedBus::with_reads([
+            word(first_address),
+            event[..HOST_MESSAGE_HEADER_LEN].to_vec(),
+            event[..first_count].to_vec(),
+        ]);
+        let mut changed = test_device(bus);
+        changed
+            .set_fragment_limits(DEFAULT_CONTROL_FRAGMENT_LEN, first_count)
+            .unwrap();
+        let mut original = [0u8; 64];
+        block_on(changed.try_read_event(&mut original)).unwrap();
+        let mut replacement = [0u8; 64];
+        assert!(matches!(
+            block_on(changed.try_read_event(&mut replacement)),
+            Err(DeviceError::EventBufferChanged)
+        ));
+        assert!(changed.pending_event.unwrap().discard);
+    }
+
+    #[test]
+    fn oversized_fragmented_event_is_discarded_before_the_next_queue_read() {
+        let first_address = 0xb000_5000;
+        let second_address = 0xb000_5100;
+        let event = message(&[1; 20], true);
+        let fragment_len = 16;
+        let bus = ScriptedBus::with_reads([
+            word(first_address),
+            event[..HOST_MESSAGE_HEADER_LEN].to_vec(),
+            word(second_address),
+            word(0),
+        ]);
+        let mut device = test_device(bus);
+        device
+            .set_fragment_limits(DEFAULT_CONTROL_FRAGMENT_LEN, fragment_len)
+            .unwrap();
+        let mut scratch = [0u8; 20];
+        let capacity = scratch.len();
+        assert!(matches!(
+            block_on(device.try_read_event(&mut scratch)),
+            Err(DeviceError::EventTooLarge { declared, capacity: actual })
+                if declared == event.len() && actual == capacity
+        ));
+        assert!(device.pending_event.unwrap().discard);
+        assert!(
+            block_on(device.try_read_event(&mut scratch))
+                .unwrap()
+                .is_none()
+        );
+        assert!(device.pending_event.is_none());
+    }
+
+    #[test]
+    fn pending_fragment_acknowledgement_tracks_actual_queue_removal() {
+        let mut scratch = [0u8; 32];
+        let event = message(&[1, 2, 3, 4], false);
+        scratch[..HOST_MESSAGE_HEADER_LEN].copy_from_slice(&event[..HOST_MESSAGE_HEADER_LEN]);
+
+        let mut waiting = test_device(ScriptedBus::with_reads([word(0)]));
+        waiting.pending_event = Some(PendingEvent {
+            declared: event.len(),
+            copied: HOST_MESSAGE_HEADER_LEN,
+            resubmit: false,
+            scratch_address: scratch.as_mut_ptr() as usize,
+            discard: false,
+        });
+        assert!(
+            block_on(waiting.try_read_event(&mut scratch))
+                .unwrap()
+                .is_none()
+        );
+        assert!(waiting.into_inner().writes.is_empty());
+
+        let event_address = 0xb000_5100;
+        let mut completing = test_device(ScriptedBus::with_reads([
+            word(event_address),
+            event[HOST_MESSAGE_HEADER_LEN..].to_vec(),
+        ]));
+        completing.pending_event = Some(PendingEvent {
+            declared: event.len(),
+            copied: HOST_MESSAGE_HEADER_LEN,
+            resubmit: false,
+            scratch_address: scratch.as_mut_ptr() as usize,
+            discard: false,
+        });
+        assert!(
+            block_on(completing.try_read_event(&mut scratch))
+                .unwrap()
+                .is_some()
+        );
+        let writes = completing.into_inner().writes;
+        assert!(
+            writes
+                .iter()
+                .any(|(_, bytes)| bytes == &word(event_address))
+        );
+        assert!(
+            writes
+                .iter()
+                .any(|(_, bytes)| bytes == &word(RPU_INTERRUPT_MCU_BIT))
+        );
+    }
+
+    #[test]
+    fn constructor_discard_and_system_init_boundaries_are_exact() {
+        let mut fresh = Device::new(ScriptedBus::default());
+        assert!(!fresh.recovery_required());
+        assert!(!fresh.discard_pending_event());
+
+        let config = SystemInitConfig::new([2, 0, 0, 0, 0, 1], [0; RF_PARAMS_LEN]);
+        let mut initialized = test_device(ScriptedBus::default());
+        assert!(matches!(
+            block_on(initialized.send_system_init(&config)),
+            Err(DeviceError::CommandQueueEmpty)
+        ));
+    }
+
+    #[test]
+    fn queue_validation_rejects_zero_unaligned_and_sentinel_addresses() {
+        let valid = valid_queues();
         assert!(queue_map_is_valid(&valid));
         let mut invalid = valid;
         invalid.event_busy.enqueue_address = 0;
@@ -759,6 +1453,11 @@ mod tests {
         let len = encode_host_message(&mut bytes, HostMessageType::System, false, &[1, 2]).unwrap();
         assert!(validate_complete_message::<()>(&bytes[..len]).is_ok());
         assert!(validate_complete_message::<()>(&bytes[..len - 1]).is_err());
+        assert!(validate_complete_message::<()>(&[0; HOST_MESSAGE_HEADER_LEN - 1]).is_err());
+        let mut too_large = vec![0; MAX_STATION_MESSAGE_LEN + 1];
+        let declared = too_large.len() as u32;
+        too_large[..4].copy_from_slice(&declared.to_le_bytes());
+        assert!(validate_complete_message::<()>(&too_large).is_err());
     }
 
     #[test]
