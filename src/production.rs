@@ -587,16 +587,16 @@ impl<E> From<Wpa2RuntimeError<E>> for SecureProductionError<E> {
 
 #[cfg(feature = "wpa2")]
 /// Integrated fail-closed WPA2-Personal station runtime.
-pub struct Wpa2StationDriver<B, const RX: usize, const TX: usize> {
-    driver: MissionCriticalDriver<B, RX, TX>,
+pub struct Wpa2StationDriver<'a, B, const RX: usize, const TX: usize> {
+    driver: &'a mut MissionCriticalDriver<B, RX, TX>,
     security: Wpa2Runtime,
 }
 
 #[cfg(feature = "wpa2")]
-impl<B, const RX: usize, const TX: usize> Wpa2StationDriver<B, RX, TX> {
+impl<'a, B, const RX: usize, const TX: usize> Wpa2StationDriver<'a, B, RX, TX> {
     /// Joins one fail-closed driver and one configured WPA2 supplicant.
     pub fn new(
-        driver: MissionCriticalDriver<B, RX, TX>,
+        driver: &'a mut MissionCriticalDriver<B, RX, TX>,
         supplicant: Wpa2Supplicant,
         wdev_id: u8,
     ) -> Self {
@@ -623,22 +623,22 @@ impl<B, const RX: usize, const TX: usize> Wpa2StationDriver<B, RX, TX> {
 
     /// Returns the fail-closed driver API.
     pub const fn driver(&self) -> &MissionCriticalDriver<B, RX, TX> {
-        &self.driver
+        self.driver
     }
 
     /// Returns the fail-closed driver API for safe high-level commands.
     pub fn driver_mut(&mut self) -> &mut MissionCriticalDriver<B, RX, TX> {
-        &mut self.driver
+        self.driver
     }
 
-    /// Consumes the WPA2 coordinator and returns the fail-closed driver.
-    pub fn into_driver(self) -> MissionCriticalDriver<B, RX, TX> {
+    /// Consumes the WPA2 coordinator and returns the borrowed fail-closed driver.
+    pub fn into_driver(self) -> &'a mut MissionCriticalDriver<B, RX, TX> {
         self.driver
     }
 }
 
 #[cfg(feature = "wpa2")]
-impl<B, const RX: usize, const TX: usize> Wpa2StationDriver<B, RX, TX>
+impl<B, const RX: usize, const TX: usize> Wpa2StationDriver<'_, B, RX, TX>
 where
     B: Bus,
 {
@@ -906,7 +906,9 @@ mod tests {
     }
 
     #[cfg(feature = "wpa2")]
-    fn secure_driver() -> Wpa2StationDriver<NullBus, 1, 1> {
+    fn secure_driver(
+        driver: &mut MissionCriticalDriver<NullBus, 1, 1>,
+    ) -> Wpa2StationDriver<'_, NullBus, 1, 1> {
         const RSN_IE: [u8; 22] = [
             0x30, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0,
         ];
@@ -918,7 +920,7 @@ mod tests {
             &RSN_IE,
         )
         .unwrap();
-        Wpa2StationDriver::new(driver(), supplicant, 0)
+        Wpa2StationDriver::new(driver, supplicant, 0)
     }
 
     #[test]
@@ -1246,7 +1248,8 @@ mod tests {
     #[cfg(feature = "wpa2")]
     #[test]
     fn secure_event_routing_ignores_unexpected_events_fail_closed() {
-        let mut secure = secure_driver();
+        let mut driver = driver();
+        let mut secure = secure_driver(&mut driver);
         let mut delay = NoDelay;
         assert_eq!(
             block_on(
@@ -1298,7 +1301,8 @@ mod tests {
     #[cfg(feature = "wpa2")]
     #[test]
     fn secure_receive_classifies_data_and_wipes_rejected_eapol() {
-        let mut secure = secure_driver();
+        let mut driver = driver();
+        let mut secure = secure_driver(&mut driver);
         let mut delay = NoDelay;
         let mut output = [9u8; 32];
 
@@ -1324,7 +1328,8 @@ mod tests {
     #[cfg(feature = "wpa2")]
     #[test]
     fn secure_deadlines_advance_and_expire_fail_closed() {
-        let mut secure = secure_driver();
+        let mut driver = driver();
+        let mut secure = secure_driver(&mut driver);
         assert!(secure.advance_time(1).is_ok());
         assert_eq!(secure.security.remaining_time_ms(), Some(4_999));
 
